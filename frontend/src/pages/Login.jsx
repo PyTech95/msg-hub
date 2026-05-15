@@ -58,7 +58,7 @@ export default function Login() {
               <Radio className="h-5 w-5" strokeWidth={2.4} />
             </div>
             <div>
-              <div className="text-xl font-black tracking-tight">CPaaS Hub</div>
+              <div className="text-xl font-black tracking-tight">NSTU</div>
               <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-400">Unified Comms Console</div>
             </div>
           </div>
@@ -83,7 +83,7 @@ export default function Login() {
               ))}
             </div>
           </div>
-          <div className="text-[10px] uppercase tracking-[0.15em] text-zinc-500">© 2026 CPaaS Hub · Demo Build</div>
+          <div className="text-[10px] uppercase tracking-[0.15em] text-zinc-500">© 2026 NSTU · Demo Build</div>
         </div>
       </div>
 

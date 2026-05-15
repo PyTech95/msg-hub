@@ -44,7 +44,7 @@ export default function AppLayout() {
             <Radio className="h-4 w-4" strokeWidth={2.2} />
           </div>
           <div className="leading-tight">
-            <div className="text-sm font-bold tracking-tight">CPaaS Hub</div>
+            <div className="text-sm font-bold tracking-tight">NSTU</div>
             <div className="text-[10px] uppercase tracking-[0.15em] text-muted-foreground">Comms Console</div>
           </div>
         </div>
@@ -75,7 +75,7 @@ export default function AppLayout() {
             <div className="h-7 w-7 grid place-items-center rounded-sm bg-primary text-primary-foreground">
               <Radio className="h-4 w-4" />
             </div>
-            <span className="text-sm font-bold">CPaaS Hub</span>
+            <span className="text-sm font-bold">NSTU</span>
           </div>
           <div className="flex-1" />
           <Button variant="ghost" size="icon" onClick={toggle} data-testid="theme-toggle" aria-label="Toggle theme">

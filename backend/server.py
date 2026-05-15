@@ -1,5 +1,5 @@
 """
-CPaaS Hub - FastAPI backend
+NSTU - FastAPI backend
 Multi-channel communications platform (SMS, WhatsApp, RCS, Voice).
 Mock provider adapters allow full end-to-end demo without live credentials.
 """
@@ -40,7 +40,7 @@ ACCESS_TTL_MIN = 60 * 24  # 1 day for demo convenience
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
-app = FastAPI(title="CPaaS Hub API", version="1.0.0")
+app = FastAPI(title="NSTU API", version="1.0.0")
 api = APIRouter(prefix="/api")
 
 app.add_middleware(
@@ -411,7 +411,7 @@ async def seed():
 
     # Templates
     templates = [
-        {"id": new_id(), "name": "Welcome SMS", "channel": "sms", "body": "Hi {{name}}, welcome to CPaaS Hub!", "variables": ["name"], "status": "approved", "category": "utility", "created_at": iso(now_utc())},
+        {"id": new_id(), "name": "Welcome SMS", "channel": "sms", "body": "Hi {{name}}, welcome to NSTU!", "variables": ["name"], "status": "approved", "category": "utility", "created_at": iso(now_utc())},
         {"id": new_id(), "name": "WA Order Update", "channel": "whatsapp", "body": "Hello {{name}}, your order #{{order_id}} has shipped.", "variables": ["name","order_id"], "status": "approved", "category": "utility", "created_at": iso(now_utc())},
         {"id": new_id(), "name": "RCS Diwali Offer", "channel": "rcs", "body": "🪔 {{name}}, enjoy 30% off this Diwali!", "variables": ["name"], "status": "approved", "category": "marketing", "created_at": iso(now_utc())},
         {"id": new_id(), "name": "Voice OTP Verify", "channel": "voice", "body": "Your verification code is {{code}}", "variables": ["code"], "status": "approved", "category": "authentication", "created_at": iso(now_utc())},
@@ -976,6 +976,6 @@ async def dashboard_stats(_: dict = Depends(current_user)):
 # ───────────────────────── Mount ─────────────────────────
 @api.get("/")
 async def root():
-    return {"name": "CPaaS Hub API", "version": "1.0.0", "status": "ok"}
+    return {"name": "NSTU API", "version": "1.0.0", "status": "ok"}
 
 app.include_router(api)
