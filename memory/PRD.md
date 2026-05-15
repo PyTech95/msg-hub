@@ -30,19 +30,23 @@ Build a production-ready full-stack CPaaS-style web application that lets a busi
 users, contacts, contact_lists, templates, campaigns, campaign_recipients, messages, message_events, conversations, call_logs, provider_accounts, webhook_events, usage_records, audit_logs
 
 ## Implemented (Feb 2026)
-- JWT auth + role guard + seeded super admin & agent + **change-password**
-- All 14 collections w/ indexes
+- JWT auth + role guard + seeded super admin & agent + change-password + **token versioning (JWT revoked on pw change)** + **password reset flow** (console-logged token)
+- All 14 collections w/ indexes + new `audit_logs`, `password_reset_tokens`, `system_settings`
 - Full REST API under /api
 - Mock provider adapters with simulated async delivery & inbound replies
+- **Background campaign scheduler** (every 30s, dispatches scheduled campaigns automatically)
+- **Audit Logs** — login/login_failed, user CRUD, campaign created/auto-started, provider credentials updated, markup updated, password changed/reset
 - **Provider Credentials Vault** — masked storage (super_admin only), per-provider schemas (Twilio/Gupshup/Exotel/RBM), reveal toggle, rotate-on-edit, test connection
-- Dashboard, Contacts (+ profile timeline + edit + CSV import/export + bulk delete), **Lists CRUD page**, Templates (+ edit), Campaigns (+ wizard + **detail page** w/ progress/recipients/messages), Conversations, Messages, Calls, Reports, Providers (+ credentials manager), Webhooks, Team, Settings (+ change-password)
+- **Channel Markup config** (super_admin only) + **Monthly Invoices** with base / markup / billable totals + per-month detail + JSON download
+- **CSV exports**: contacts, messages (channel + status filters)
+- Pages: Dashboard (role-aware), Contacts (+ profile timeline + edit + CSV import/export + bulk delete), Lists CRUD, Templates (+ edit), Campaigns (+ wizard + detail page), Conversations, Message Logs (+ export), Calls, Reports, Providers (+ credentials manager), Webhooks, Audit Logs, Invoices, Team, Settings (+ change-password + markup), ForgotPassword + ResetPassword
 - Role-aware sidebar + RoleRoute guards; Agent gets a dedicated inbox-first dashboard
 - Light/dark theme, channel-colored badges, NSTU branding
-- Seed data: 15 contacts, 3 lists, 4 templates, 4 providers, 3 campaigns, ~80 historical messages, 10 calls, 8 webhook events
+- Seed data: 15 contacts, 3 lists, 4 templates, 4 providers, 3 campaigns, ~80 historical messages, 10 calls, 8 webhook events, default markup (20/25/30/15 %)
 
 ## Backlog / Next
-- **P1**: Replace mock adapters with real provider implementations once Super Admin saves API keys
-- **P1**: Token versioning so JWTs invalidate on password change
-- **P1**: Redis queue / APScheduler for production fan-out
-- **P2**: Audit log viewer UI, invoice PDF export, WebSocket inbox push, 2FA, password reset email flow
-- **P2**: Stream CSV export for large tenants
+- **P1**: Replace mock adapters with real provider implementations once Super Admin saves API keys (Twilio SMS/Voice, Gupshup WhatsApp, Google RBM RCS, Exotel Voice)
+- **P1**: Wrap scheduler's run_campaign with try/except + audit failures
+- **P1**: Forgot-password rate limit; password-reset token API access in DEMO_MODE
+- **P2**: WebSocket push for live inbox/campaign progress, 2FA TOTP, streaming CSV for >10k rows, invoice PDF
+- **P2**: Split server.py into modular routers (auth, audit, invoices, campaigns, providers)
