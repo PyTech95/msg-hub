@@ -1,54 +1,52 @@
-import { useEffect } from "react";
+import React from "react";
 import "@/App.css";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
-import axios from "axios";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { AuthProvider } from "@/contexts/AuthContext";
+import { ThemeProvider } from "@/contexts/ThemeContext";
+import ProtectedRoute from "@/components/ProtectedRoute";
+import AppLayout from "@/components/AppLayout";
+import Login from "@/pages/Login";
+import Dashboard from "@/pages/Dashboard";
+import Contacts from "@/pages/Contacts";
+import ContactProfile from "@/pages/ContactProfile";
+import Templates from "@/pages/Templates";
+import Campaigns from "@/pages/Campaigns";
+import Conversations from "@/pages/Conversations";
+import MessageLogs from "@/pages/MessageLogs";
+import Calls from "@/pages/Calls";
+import Reports from "@/pages/Reports";
+import Providers from "@/pages/Providers";
+import Webhooks from "@/pages/Webhooks";
+import Team from "@/pages/Team";
+import Settings from "@/pages/Settings";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-const API = `${BACKEND_URL}/api`;
-
-const Home = () => {
-  const helloWorldApi = async () => {
-    try {
-      const response = await axios.get(`${API}/`);
-      console.log(response.data.message);
-    } catch (e) {
-      console.error(e, `errored out requesting / api`);
-    }
-  };
-
-  useEffect(() => {
-    helloWorldApi();
-  }, []);
-
+export default function App() {
   return (
-    <div>
-      <header className="App-header">
-        <a
-          className="App-link"
-          href="https://emergent.sh"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <img src="https://avatars.githubusercontent.com/in/1201222?s=120&u=2686cf91179bbafbc7a71bfbc43004cf9ae1acea&v=4" />
-        </a>
-        <p className="mt-5">Building something incredible ~!</p>
-      </header>
-    </div>
-  );
-};
-
-function App() {
-  return (
-    <div className="App">
-      <BrowserRouter>
-        <Routes>
-          <Route path="/" element={<Home />}>
-            <Route index element={<Home />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
-    </div>
+    <ThemeProvider>
+      <AuthProvider>
+        <BrowserRouter>
+          <Routes>
+            <Route path="/login" element={<Login />} />
+            <Route element={<ProtectedRoute><AppLayout /></ProtectedRoute>}>
+              <Route path="/" element={<Navigate to="/dashboard" replace />} />
+              <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/contacts" element={<Contacts />} />
+              <Route path="/contacts/:id" element={<ContactProfile />} />
+              <Route path="/templates" element={<Templates />} />
+              <Route path="/campaigns" element={<Campaigns />} />
+              <Route path="/conversations" element={<Conversations />} />
+              <Route path="/messages" element={<MessageLogs />} />
+              <Route path="/calls" element={<Calls />} />
+              <Route path="/reports" element={<Reports />} />
+              <Route path="/providers" element={<Providers />} />
+              <Route path="/webhooks" element={<Webhooks />} />
+              <Route path="/team" element={<Team />} />
+              <Route path="/settings" element={<Settings />} />
+            </Route>
+            <Route path="*" element={<Navigate to="/dashboard" replace />} />
+          </Routes>
+        </BrowserRouter>
+      </AuthProvider>
+    </ThemeProvider>
   );
 }
-
-export default App;
