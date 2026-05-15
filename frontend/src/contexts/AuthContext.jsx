@@ -19,12 +19,13 @@ export function AuthProvider({ children }) {
       .finally(() => setLoading(false));
   }, []);
 
-  const login = useCallback(async (email, password) => {
-    const { data } = await api.post("/auth/login", { email, password });
+  const login = useCallback(async (email, password, otp) => {
+    const { data } = await api.post("/auth/login", { email, password, otp });
+    if (data.otp_required) return { otp_required: true };
     localStorage.setItem("cpaas_token", data.token);
     localStorage.setItem("cpaas_user", JSON.stringify(data.user));
     setUser(data.user);
-    return data.user;
+    return { user: data.user };
   }, []);
 
   const logout = useCallback(async () => {

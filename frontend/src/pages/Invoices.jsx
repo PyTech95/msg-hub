@@ -3,12 +3,19 @@ import api from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { ChannelBadge } from "@/components/Badges";
-import { FileText, Download, ReceiptText } from "lucide-react";
+import { FileText, Download, ReceiptText, FileDown } from "lucide-react";
 
 function downloadJson(name, obj) {
   const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a"); a.href = url; a.download = name + ".json";
+  document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+}
+
+async function downloadInvoiceCSV(month) {
+  const res = await api.get(`/export/invoice/${month}.csv`, { responseType: "blob" });
+  const url = URL.createObjectURL(new Blob([res.data]));
+  const a = document.createElement("a"); a.href = url; a.download = `invoice-${month}.csv`;
   document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
 }
 
@@ -73,8 +80,11 @@ export default function Invoices() {
                     <Button variant="outline" size="sm" className="rounded-sm gap-1" onClick={() => openDetail(inv.month)} data-testid={`view-invoice-${inv.month}`}>
                       <FileText className="h-3 w-3" /> View
                     </Button>
+                    <Button variant="outline" size="sm" className="rounded-sm gap-1" onClick={() => downloadInvoiceCSV(inv.month)} data-testid={`csv-invoice-${inv.month}`}>
+                      <FileDown className="h-3 w-3" /> CSV
+                    </Button>
                     <Button variant="outline" size="sm" className="rounded-sm gap-1" onClick={() => downloadJson(`invoice-${inv.month}`, inv)} data-testid={`download-invoice-${inv.month}`}>
-                      <Download className="h-3 w-3" />
+                      <Download className="h-3 w-3" /> JSON
                     </Button>
                   </td>
                 </tr>

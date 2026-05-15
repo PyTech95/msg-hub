@@ -13,6 +13,8 @@ export default function Login() {
   const nav = useNavigate();
   const [email, setEmail] = useState("admin@cpaas.io");
   const [password, setPassword] = useState("Admin@12345");
+  const [otp, setOtp] = useState("");
+  const [otpRequired, setOtpRequired] = useState(false);
   const [loading, setLoading] = useState(false);
 
   if (user) return <Navigate to="/dashboard" replace />;
@@ -21,9 +23,14 @@ export default function Login() {
     e.preventDefault();
     setLoading(true);
     try {
-      await login(email, password);
-      toast.success("Welcome back");
-      nav("/dashboard");
+      const res = await login(email, password, otp || undefined);
+      if (res.otp_required) {
+        setOtpRequired(true);
+        toast.message("Enter your 6-digit authenticator code");
+      } else {
+        toast.success("Welcome back");
+        nav("/dashboard");
+      }
     } catch (err) {
       const detail = err.response?.data?.detail;
       toast.error(typeof detail === "string" ? detail : "Login failed");
@@ -107,6 +114,15 @@ export default function Login() {
                 <Input id="password" type="password" value={password} onChange={(e)=>setPassword(e.target.value)}
                   required data-testid="login-password-input" className="rounded-sm" />
               </div>
+              {otpRequired && (
+                <div className="space-y-1.5">
+                  <Label htmlFor="otp" className="text-xs uppercase tracking-wider">Authenticator code</Label>
+                  <Input id="otp" type="text" inputMode="numeric" maxLength={6} value={otp}
+                    onChange={e => setOtp(e.target.value.replace(/\D/g,"").slice(0,6))}
+                    required data-testid="login-otp-input" className="rounded-sm font-mono text-center text-lg tracking-widest"
+                    placeholder="000000" autoFocus />
+                </div>
+              )}
               <Button type="submit" disabled={loading} className="w-full rounded-sm gap-2" data-testid="login-submit-button">
                 {loading ? "Signing in…" : "Sign in"}
                 <ArrowRight className="h-4 w-4" />

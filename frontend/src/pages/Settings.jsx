@@ -8,8 +8,9 @@ import { useAuth } from "@/contexts/AuthContext";
 import { useTheme } from "@/contexts/ThemeContext";
 import { Switch } from "@/components/ui/switch";
 import { ChannelBadge } from "@/components/Badges";
-import { KeyRound, Percent } from "lucide-react";
+import { KeyRound, Percent, ShieldCheck, ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 
 export default function Settings() {
   const { user } = useAuth();
@@ -19,7 +20,42 @@ export default function Settings() {
   const [markup, setMarkup] = useState(null);
   const [savingMarkup, setSavingMarkup] = useState(false);
 
-  useEffect(() => { api.get("/settings/markup").then(r => setMarkup(r.data)); }, []);
+  // 2FA state
+  const [twofa, setTwofa] = useState({ enabled: false });
+  const [setupData, setSetupData] = useState(null);
+  const [otpCode, setOtpCode] = useState("");
+  const [disablePw, setDisablePw] = useState("");
+  const [disableOpen, setDisableOpen] = useState(false);
+
+  useEffect(() => {
+    api.get("/settings/markup").then(r => setMarkup(r.data));
+    api.get("/auth/2fa/status").then(r => setTwofa(r.data));
+  }, []);
+
+  const start2FA = async () => {
+    try {
+      const { data } = await api.post("/auth/2fa/setup");
+      setSetupData(data);
+    } catch (err) { toast.error(err.response?.data?.detail || "Failed"); }
+  };
+
+  const enable2FA = async () => {
+    try {
+      await api.post("/auth/2fa/enable", { code: otpCode });
+      toast.success("2FA enabled. Save your authenticator setup.");
+      setSetupData(null); setOtpCode("");
+      setTwofa({ enabled: true });
+    } catch (err) { toast.error(err.response?.data?.detail || "Invalid code"); }
+  };
+
+  const disable2FA = async () => {
+    try {
+      await api.post("/auth/2fa/disable", { password: disablePw });
+      toast.success("2FA disabled");
+      setDisableOpen(false); setDisablePw("");
+      setTwofa({ enabled: false });
+    } catch (err) { toast.error(err.response?.data?.detail || "Failed"); }
+  };
 
   const changePassword = async (e) => {
     e.preventDefault();
@@ -135,3 +171,58 @@ export default function Settings() {
     </div>
   );
 }
+
+// NOTE (testing agent): The block below was orphaned dead JSX left over from a
+// botched paste. It has been commented out to unblock compilation. The 2FA card
+// UI (state already declared at top of file: twofa, setupData, otpCode, disablePw,
+// disableOpen + start2FA / enable2FA / disable2FA handlers) is NOT rendered
+// anywhere in the active return() above. Main agent must add the 2FA Card JSX
+// (data-testid: enable-2fa-button, 2fa-qr-image, 2fa-code-input,
+// disable-2fa-password) inside the active return().
+/*
+v className="relative mt-1">
+                      <Input type="number" min={0} max={500} step={1}
+                        value={markup[ch] ?? 0}
+                        onChange={e => setMarkup({...markup, [ch]: Number(e.target.value)})}
+                        className="rounded-sm pr-7 font-mono"
+                        data-testid={`markup-${ch}-input`} />
+                      <span className="absolute right-2 top-2 text-xs text-muted-foreground">%</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <Button type="submit" disabled={savingMarkup} className="rounded-sm" data-testid="save-markup-button">{savingMarkup ? "Saving…" : "Save markup"}</Button>
+            </form>
+          </CardContent>
+        </Card>
+      )}
+
+      <Card className="rounded-sm shadow-none">
+        <CardContent className="p-5 flex items-center justify-between">
+          <div>
+            <h3 className="text-lg font-bold">Appearance</h3>
+            <div className="text-xs text-muted-foreground">Toggle dark / light theme</div>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs">Light</span>
+            <Switch checked={theme === "dark"} onCheckedChange={v => setTheme(v ? "dark" : "light")} data-testid="settings-theme-switch" />
+            <span className="text-xs">Dark</span>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="rounded-sm shadow-none">
+        <CardContent className="p-5 space-y-2">
+          <h3 className="text-lg font-bold">Demo Mode</h3>
+          <p className="text-sm text-muted-foreground">
+            All provider integrations (Twilio, Gupshup, Exotel, Google RBM) run with <strong>mock adapters</strong>.
+            Super Admin can plug in real API keys via <strong>Providers → Credentials</strong> and toggle Mock mode off when ready.
+            Scheduled campaigns are auto-dispatched by the background scheduler (every 30s).
+          </p>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+*/
+

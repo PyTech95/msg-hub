@@ -22,6 +22,9 @@ from typing import Optional, List, Dict, Any, Literal
 
 import bcrypt
 import jwt
+import pyotp
+import qrcode
+import qrcode.image.svg
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, BackgroundTasks, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -142,6 +145,7 @@ Role = Literal["super_admin", "admin", "agent"]
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
+    otp: Optional[str] = None
 
 class RegisterIn(BaseModel):
     email: EmailStr
@@ -368,6 +372,7 @@ async def on_startup():
     await db.audit_logs.create_index([("created_at", -1)])
     await db.password_reset_tokens.create_index("token", unique=True)
     await db.system_settings.create_index("key", unique=True)
+    await db.login_attempts.create_index("identifier")
     await seed()
     asyncio.create_task(campaign_scheduler_loop())
     log.info("CPaaS backend ready.")
@@ -571,13 +576,52 @@ async def seed():
 # ───────────────────────── Auth routes ─────────────────────────
 @api.post("/auth/login")
 async def login(body: LoginIn, response: Response, request: Request):
-    user = await db.users.find_one({"email": body.email.lower()})
+    email = body.email.lower()
+    ip = request.client.host if request.client else "unknown"
+    ident = f"{ip}:{email}"
+
+    # Brute-force lockout: 5 fails / 15 min
+    attempt = await db.login_attempts.find_one({"identifier": ident})
+    if attempt and attempt.get("fails", 0) >= 5:
+        try:
+            locked_until = datetime.fromisoformat(attempt["locked_until"].replace("Z","+00:00"))
+            if locked_until > now_utc():
+                raise HTTPException(429, f"Too many failed attempts. Try again in {int((locked_until - now_utc()).total_seconds())}s")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    user = await db.users.find_one({"email": email})
     if not user or not verify_pw(body.password, user["password_hash"]):
-        await audit("login_failed", "user", "", None, {"email": body.email.lower(), "ip": request.client.host if request.client else None})
+        await db.login_attempts.update_one(
+            {"identifier": ident},
+            {"$inc": {"fails": 1},
+             "$set": {"locked_until": iso(now_utc() + timedelta(minutes=15)), "last_fail_at": iso(now_utc())}},
+            upsert=True,
+        )
+        await audit("login_failed", "user", "", None, {"email": email, "ip": ip})
         raise HTTPException(401, "Invalid credentials")
+
+    # 2FA challenge: if user has 2FA enabled and no otp provided, ask for it
+    if user.get("totp_enabled") and not body.otp:
+        return {"otp_required": True, "message": "Enter the 6-digit code from your authenticator"}
+    if user.get("totp_enabled"):
+        totp = pyotp.TOTP(user["totp_secret"])
+        if not totp.verify(body.otp or "", valid_window=1):
+            await db.login_attempts.update_one(
+                {"identifier": ident},
+                {"$inc": {"fails": 1}, "$set": {"locked_until": iso(now_utc() + timedelta(minutes=15))}},
+                upsert=True,
+            )
+            await audit("login_failed_otp", "user", user["id"], None, {"email": email})
+            raise HTTPException(401, "Invalid OTP")
+
+    # Success: clear attempts
+    await db.login_attempts.delete_one({"identifier": ident})
     token = make_token({"id": user["id"], "email": user["email"], "role": user["role"], "token_version": user.get("token_version", 1)})
     response.set_cookie("access_token", token, httponly=True, samesite="lax", max_age=ACCESS_TTL_MIN*60, path="/")
-    await audit("login", "user", user["id"], user, {"ip": request.client.host if request.client else None})
+    await audit("login", "user", user["id"], user, {"ip": ip})
     return {"token": token, "user": clean(user)}
 
 @api.post("/auth/register")
@@ -622,7 +666,60 @@ async def change_password(body: ChangePasswordIn, response: Response, user: dict
     await audit("password_changed", "user", user["id"], user)
     return {"ok": True, "token": new_token}
 
-# ───────── Password Reset ─────────
+# ───────── 2FA TOTP ─────────
+class TOTPEnableIn(BaseModel):
+    code: str
+
+class TOTPDisableIn(BaseModel):
+    password: str
+
+@api.post("/auth/2fa/setup")
+async def totp_setup(user: dict = Depends(current_user)):
+    """Generate a TOTP secret + provisioning URI. Does NOT enable until verified."""
+    full = await db.users.find_one({"id": user["id"]})
+    if full and full.get("totp_enabled"):
+        raise HTTPException(400, "2FA already enabled. Disable first to rotate.")
+    secret = pyotp.random_base32()
+    await db.users.update_one({"id": user["id"]}, {"$set": {"totp_secret_pending": secret}})
+    uri = pyotp.TOTP(secret).provisioning_uri(name=user["email"], issuer_name="NSTU")
+    # Render QR as data-URI SVG for inline display
+    img = qrcode.make(uri, image_factory=qrcode.image.svg.SvgImage)
+    buf = io.BytesIO(); img.save(buf)
+    svg = buf.getvalue().decode("utf-8")
+    qr_data_uri = "data:image/svg+xml;base64," + __import__("base64").b64encode(svg.encode()).decode()
+    return {"secret": secret, "provisioning_uri": uri, "qr_data_uri": qr_data_uri}
+
+@api.post("/auth/2fa/enable")
+async def totp_enable(body: TOTPEnableIn, user: dict = Depends(current_user)):
+    full = await db.users.find_one({"id": user["id"]})
+    secret = (full or {}).get("totp_secret_pending")
+    if not secret:
+        raise HTTPException(400, "Run /auth/2fa/setup first")
+    if not pyotp.TOTP(secret).verify(body.code, valid_window=1):
+        raise HTTPException(400, "Invalid code")
+    await db.users.update_one({"id": user["id"]}, {
+        "$set": {"totp_secret": secret, "totp_enabled": True},
+        "$unset": {"totp_secret_pending": ""},
+    })
+    await audit("2fa_enabled", "user", user["id"], user)
+    return {"ok": True}
+
+@api.post("/auth/2fa/disable")
+async def totp_disable(body: TOTPDisableIn, user: dict = Depends(current_user)):
+    full = await db.users.find_one({"id": user["id"]})
+    if not full or not verify_pw(body.password, full["password_hash"]):
+        raise HTTPException(400, "Password incorrect")
+    await db.users.update_one({"id": user["id"]}, {
+        "$set": {"totp_enabled": False},
+        "$unset": {"totp_secret": "", "totp_secret_pending": ""},
+    })
+    await audit("2fa_disabled", "user", user["id"], user)
+    return {"ok": True}
+
+@api.get("/auth/2fa/status")
+async def totp_status(user: dict = Depends(current_user)):
+    full = await db.users.find_one({"id": user["id"]}, {"_id": 0})
+    return {"enabled": bool((full or {}).get("totp_enabled"))}
 class ForgotPasswordIn(BaseModel):
     email: EmailStr
 
@@ -1269,22 +1366,58 @@ async def invoice_detail(month: str, _: dict = Depends(require_roles("super_admi
 @api.get("/export/messages.csv")
 async def export_messages_csv(channel: Optional[Channel] = None, status: Optional[str] = None,
                               _: dict = Depends(current_user)):
-    from fastapi.responses import Response as FastResponse
+    from fastapi.responses import StreamingResponse
     flt: Dict[str, Any] = {}
     if channel: flt["channel"] = channel
     if status: flt["status"] = status
-    msgs = await db.messages.find(flt, {"_id": 0}).sort("created_at", -1).limit(10000).to_list(10000)
+
+    async def row_generator():
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["created_at", "channel", "direction", "contact_id", "body", "status", "provider_message_id", "campaign_id"])
+        yield buf.getvalue()
+        cursor = db.messages.find(flt, {"_id": 0}).sort("created_at", -1)
+        async for m in cursor:
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            w.writerow([
+                m.get("created_at",""), m.get("channel",""), m.get("direction",""),
+                m.get("contact_id",""), (m.get("body","") or "")[:500],
+                m.get("status",""), m.get("provider_message_id",""), m.get("campaign_id","") or "",
+            ])
+            yield buf.getvalue()
+
+    return StreamingResponse(row_generator(), media_type="text/csv",
+                             headers={"Content-Disposition": "attachment; filename=messages.csv"})
+
+@api.get("/export/invoice/{month}.csv")
+async def export_invoice_csv(month: str, _: dict = Depends(require_roles("super_admin","admin"))):
+    from fastapi.responses import Response as FastResponse
+    markup_row = await db.system_settings.find_one({"key": "markup_pct"}, {"_id": 0})
+    markup = (markup_row or {}).get("value", {}) or {}
+    records = await db.usage_records.find(
+        {"created_at": {"$regex": f"^{month}"}}, {"_id": 0}
+    ).sort("created_at", -1).limit(20000).to_list(20000)
+    by_ch: Dict[str, Dict[str, Any]] = {}
+    for r in records:
+        ch = r["channel"]
+        bm = by_ch.setdefault(ch, {"channel": ch, "units": 0, "base": 0, "markup_pct": float(markup.get(ch, 0))})
+        bm["units"] += r["units"]
+        bm["base"] = round(bm["base"] + r["amount"], 2)
+        bm["billable"] = round(bm["base"] * (1 + bm["markup_pct"] / 100.0), 2)
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["created_at", "channel", "direction", "contact_id", "body", "status", "provider_message_id", "campaign_id"])
-    for m in msgs:
-        w.writerow([
-            m.get("created_at",""), m.get("channel",""), m.get("direction",""),
-            m.get("contact_id",""), (m.get("body","") or "")[:500],
-            m.get("status",""), m.get("provider_message_id",""), m.get("campaign_id","") or "",
-        ])
+    w.writerow([f"NSTU Invoice — {month}"])
+    w.writerow([])
+    w.writerow(["channel", "units", "base_INR", "markup_pct", "billable_INR"])
+    total_base, total_bill = 0, 0
+    for c in by_ch.values():
+        w.writerow([c["channel"], c["units"], f"{c['base']:.2f}", c["markup_pct"], f"{c['billable']:.2f}"])
+        total_base += c["base"]; total_bill += c["billable"]
+    w.writerow([])
+    w.writerow(["TOTAL", "", f"{total_base:.2f}", "", f"{total_bill:.2f}"])
     return FastResponse(content=buf.getvalue(), media_type="text/csv",
-                        headers={"Content-Disposition": "attachment; filename=messages.csv"})
+                        headers={"Content-Disposition": f"attachment; filename=invoice-{month}.csv"})
 
 # ───────────────────────── Campaign scheduler loop ─────────────────────────
 async def campaign_scheduler_loop():
@@ -1305,11 +1438,20 @@ async def campaign_scheduler_loop():
                     tpl = await db.templates.find_one({"id": c.get("template_id")}, {"_id": 0})
                     if not tpl:
                         await db.campaigns.update_one({"id": c["id"]}, {"$set": {"status": "failed", "error": "template missing"}})
+                        await audit("campaign_failed", "campaign", c["id"], None, {"reason": "template missing"})
                         continue
                     audience = await resolve_audience(c.get("list_ids", []) or [], c.get("contact_ids", []) or [])
                     await db.campaigns.update_one({"id": c["id"]}, {"$set": {"status": "running"}})
-                    await audit("campaign_auto_started", "campaign", c["id"], None, {"name": c.get("name")})
-                    asyncio.create_task(run_campaign(c["id"], c["channel"], tpl, audience, {}))
+                    await audit("campaign_auto_started", "campaign", c["id"], None, {"name": c.get("name"), "audience_size": len(audience)})
+
+                    async def safe_run(cid=c["id"], ch=c["channel"], t=tpl, aud=audience):
+                        try:
+                            await run_campaign(cid, ch, t, aud, {})
+                        except Exception as e:
+                            log.error(f"run_campaign crashed for {cid}: {e}")
+                            await db.campaigns.update_one({"id": cid}, {"$set": {"status": "failed", "error": str(e)[:300]}})
+                            await audit("campaign_failed", "campaign", cid, None, {"reason": str(e)[:300]})
+                    asyncio.create_task(safe_run())
         except Exception as e:
             log.error(f"scheduler loop error: {e}")
         await asyncio.sleep(30)
@@ -1318,5 +1460,7 @@ async def campaign_scheduler_loop():
 @api.get("/")
 async def root():
     return {"name": "NSTU API", "version": "1.0.0", "status": "ok"}
+
+app.include_router(api)
 
 app.include_router(api)
