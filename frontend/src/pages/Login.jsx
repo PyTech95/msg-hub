@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { useNavigate, Navigate } from "react-router-dom";
+import { useNavigate, Navigate, Link } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -111,6 +111,9 @@ export default function Login() {
                 {loading ? "Signing in…" : "Sign in"}
                 <ArrowRight className="h-4 w-4" />
               </Button>
+              <div className="flex justify-end">
+                <Link to="/forgot-password" className="text-xs text-muted-foreground hover:text-foreground" data-testid="forgot-password-link">Forgot password?</Link>
+              </div>
               <div className="text-xs text-muted-foreground border border-dashed border-border rounded-sm p-3">
                 <div className="font-semibold mb-1">Demo credentials</div>
                 <div className="font-mono">admin@cpaas.io · Admin@12345</div>

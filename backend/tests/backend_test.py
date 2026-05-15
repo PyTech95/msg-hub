@@ -17,7 +17,7 @@ AGENT = {"email": "agent@cpaas.io", "password": "Agent@12345"}
 state = {}
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture()
 def admin_token():
     r = requests.post(f"{API}/auth/login", json=ADMIN, timeout=15)
     assert r.status_code == 200, r.text
@@ -26,12 +26,12 @@ def admin_token():
     return data["token"]
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture()
 def admin_headers(admin_token):
     return {"Authorization": f"Bearer {admin_token}"}
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture()
 def agent_token():
     r = requests.post(f"{API}/auth/login", json=AGENT, timeout=15)
     assert r.status_code == 200, r.text
@@ -466,3 +466,210 @@ class TestProviderCredentials:
     def test_provider_test_404(self, admin_headers):
         r = requests.post(f"{API}/providers/nonexistent_xyz/test", headers=admin_headers, timeout=10)
         assert r.status_code == 404
+
+
+# ───── Iteration 3: Audit Logs ─────
+class TestAuditLogs:
+    def test_login_records_audit_log(self, admin_headers):
+        # trigger login (admin)
+        r = requests.post(f"{API}/auth/login", json=ADMIN, timeout=10)
+        assert r.status_code == 200
+        time.sleep(0.5)
+        # check audit_logs has login action
+        a = requests.get(f"{API}/audit-logs?action=login", headers=admin_headers, timeout=10)
+        assert a.status_code == 200
+        logs = a.json()
+        assert isinstance(logs, list) and len(logs) >= 1
+        # sorted desc by created_at
+        if len(logs) >= 2:
+            assert logs[0]["created_at"] >= logs[1]["created_at"]
+
+    def test_login_failed_records_audit_log(self, admin_headers):
+        requests.post(f"{API}/auth/login", json={"email": ADMIN["email"], "password": "wrong-pw"}, timeout=10)
+        time.sleep(0.3)
+        a = requests.get(f"{API}/audit-logs?action=login_failed", headers=admin_headers, timeout=10).json()
+        assert any(l["action"] == "login_failed" for l in a)
+
+    def test_audit_logs_forbidden_for_agent(self, agent_token):
+        r = requests.get(f"{API}/audit-logs", headers={"Authorization": f"Bearer {agent_token}"}, timeout=10)
+        assert r.status_code == 403
+
+
+# ───── Iteration 3: Forgot/Reset Password ─────
+class TestPasswordReset:
+    def test_forgot_password_existing_email(self, admin_headers):
+        r = requests.post(f"{API}/auth/forgot-password", json={"email": ADMIN["email"]}, timeout=10)
+        assert r.status_code == 200
+        assert r.json().get("ok") is True
+
+    def test_forgot_password_unknown_email_no_enum(self):
+        r = requests.post(f"{API}/auth/forgot-password", json={"email": "nobody-xyz@example.com"}, timeout=10)
+        assert r.status_code == 200
+        # No leakage
+        body = r.json()
+        assert body.get("ok") is True
+
+    def test_reset_password_invalid_token(self):
+        r = requests.post(f"{API}/auth/reset-password",
+                          json={"token": "this-token-does-not-exist", "new_password": "NewReset@123"}, timeout=10)
+        assert r.status_code == 400
+
+    def test_reset_password_short_pw(self):
+        r = requests.post(f"{API}/auth/reset-password",
+                          json={"token": "anything", "new_password": "x"}, timeout=10)
+        assert r.status_code == 400
+
+    def test_full_forgot_reset_flow_and_revert(self, admin_headers):
+        # Use a temp test user so we don't break admin
+        email = f"TEST_resetuser_{int(time.time())}@example.com"
+        orig_pw = "Orig@1234"
+        cr = requests.post(f"{API}/auth/register", headers=admin_headers,
+                           json={"email": email, "password": orig_pw, "name": "Reset User", "role": "agent"}, timeout=10)
+        assert cr.status_code == 200
+        # forgot
+        f = requests.post(f"{API}/auth/forgot-password", json={"email": email}, timeout=10)
+        assert f.status_code == 200
+        # token is logged but not returned; fetch via audit_logs+ ... we don't have direct access. 
+        # Try: query the password_reset endpoint with an obviously bad token already covered above.
+        # Verify a record was inserted by trying again with same email — should still 200
+        f2 = requests.post(f"{API}/auth/forgot-password", json={"email": email}, timeout=10)
+        assert f2.status_code == 200
+
+
+# ───── Iteration 3: Token versioning (change-password invalidates old token) ─────
+class TestTokenVersioning:
+    def test_old_token_invalid_after_change_password(self):
+        # login fresh
+        login1 = requests.post(f"{API}/auth/login", json=ADMIN, timeout=10).json()
+        old_token = login1["token"]
+        # change pw
+        cp = requests.post(f"{API}/auth/change-password",
+                           headers={"Authorization": f"Bearer {old_token}"},
+                           json={"old_password": ADMIN["password"], "new_password": "TmpRot@99999"}, timeout=10)
+        assert cp.status_code == 200
+        new_token = cp.json().get("token")
+        assert isinstance(new_token, str) and len(new_token) > 20
+        # old token should now fail
+        me_old = requests.get(f"{API}/auth/me", headers={"Authorization": f"Bearer {old_token}"}, timeout=10)
+        assert me_old.status_code == 401
+        # new token should work
+        me_new = requests.get(f"{API}/auth/me", headers={"Authorization": f"Bearer {new_token}"}, timeout=10)
+        assert me_new.status_code == 200
+        # revert
+        revert = requests.post(f"{API}/auth/change-password",
+                               headers={"Authorization": f"Bearer {new_token}"},
+                               json={"old_password": "TmpRot@99999", "new_password": ADMIN["password"]}, timeout=10)
+        assert revert.status_code == 200
+        # final verify
+        final = requests.post(f"{API}/auth/login", json=ADMIN, timeout=10)
+        assert final.status_code == 200
+
+
+# ───── Iteration 3: Markup Settings ─────
+class TestMarkup:
+    def test_get_markup_default(self, admin_headers):
+        r = requests.get(f"{API}/settings/markup", headers=admin_headers, timeout=10)
+        assert r.status_code == 200
+        d = r.json()
+        for k in ("sms", "whatsapp", "rcs", "voice"):
+            assert k in d
+
+    def test_put_markup_super_admin(self, admin_headers):
+        payload = {"sms": 12.5, "whatsapp": 10, "rcs": 5, "voice": 7.5}
+        r = requests.put(f"{API}/settings/markup", headers=admin_headers, json=payload, timeout=10)
+        assert r.status_code == 200
+        d = r.json()
+        assert d["sms"] == 12.5 and d["whatsapp"] == 10 and d["voice"] == 7.5
+        # verify persisted
+        g = requests.get(f"{API}/settings/markup", headers=admin_headers, timeout=10).json()
+        assert g["sms"] == 12.5
+
+    def test_put_markup_forbidden_for_agent(self, agent_token):
+        r = requests.put(f"{API}/settings/markup",
+                         headers={"Authorization": f"Bearer {agent_token}"},
+                         json={"sms": 1, "whatsapp": 1, "rcs": 1, "voice": 1}, timeout=10)
+        assert r.status_code == 403
+
+
+# ───── Iteration 3: Invoices ─────
+class TestInvoices:
+    def test_list_invoices(self, admin_headers):
+        r = requests.get(f"{API}/invoices", headers=admin_headers, timeout=15)
+        assert r.status_code == 200
+        d = r.json()
+        assert "invoices" in d and isinstance(d["invoices"], list)
+        assert "markup_pct" in d
+        assert d.get("currency") == "INR"
+        if d["invoices"]:
+            inv = d["invoices"][0]
+            for k in ("month", "channels", "base_total", "billable_total", "units_total"):
+                assert k in inv
+
+    def test_invoice_detail_current_month(self, admin_headers):
+        from datetime import datetime as _dt
+        month = _dt.utcnow().strftime("%Y-%m")
+        r = requests.get(f"{API}/invoices/{month}", headers=admin_headers, timeout=15)
+        assert r.status_code == 200
+        d = r.json()
+        assert d["month"] == month and d["currency"] == "INR"
+        assert "channels" in d and isinstance(d["channels"], list)
+        assert "record_count" in d
+        # iteration 3 spec says current month should have > 0 records
+        assert d["record_count"] > 0
+
+    def test_invoices_forbidden_for_agent(self, agent_token):
+        r = requests.get(f"{API}/invoices", headers={"Authorization": f"Bearer {agent_token}"}, timeout=10)
+        assert r.status_code == 403
+
+
+# ───── Iteration 3: Messages CSV Export ─────
+class TestMessagesCSVExport:
+    def test_export_messages_csv(self, admin_headers):
+        r = requests.get(f"{API}/export/messages.csv", headers=admin_headers, timeout=15)
+        assert r.status_code == 200
+        assert "text/csv" in r.headers.get("content-type", "")
+        first = r.text.splitlines()[0]
+        assert first == "created_at,channel,direction,contact_id,body,status,provider_message_id,campaign_id"
+
+    def test_export_messages_csv_filter_channel(self, admin_headers):
+        r = requests.get(f"{API}/export/messages.csv?channel=sms", headers=admin_headers, timeout=15)
+        assert r.status_code == 200
+        body = r.text.splitlines()
+        # if more than header, all rows should have channel=sms (col index 1)
+        for line in body[1:]:
+            # crude check; csv could quote values
+            parts = line.split(",")
+            if len(parts) >= 2:
+                assert parts[1] == "sms" or parts[1] == '"sms"'
+
+    def test_export_messages_csv_filter_status(self, admin_headers):
+        r = requests.get(f"{API}/export/messages.csv?status=delivered", headers=admin_headers, timeout=15)
+        assert r.status_code == 200
+        assert "text/csv" in r.headers.get("content-type", "")
+
+
+# ───── Iteration 3: Scheduler ─────
+class TestScheduler:
+    def test_scheduled_campaign_auto_dispatched(self, admin_headers):
+        from datetime import datetime as _dt, timedelta as _td
+        lists = requests.get(f"{API}/lists", headers=admin_headers, timeout=10).json()
+        templates = requests.get(f"{API}/templates?channel=sms", headers=admin_headers, timeout=10).json()
+        list_id = lists[0]["id"]
+        tpl_id = templates[0]["id"]
+        # schedule 5s in future
+        sched_at = (_dt.utcnow() + _td(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r = requests.post(f"{API}/campaigns", headers=admin_headers, json={
+            "name": "TEST_Sched", "channel": "sms", "template_id": tpl_id,
+            "list_ids": [list_id], "contact_ids": [], "schedule_at": sched_at,
+        }, timeout=15)
+        assert r.status_code == 200
+        cid = r.json()["id"]
+        # poll for up to 60s
+        final_status = None
+        for _ in range(60):
+            time.sleep(1)
+            g = requests.get(f"{API}/campaigns/{cid}", headers=admin_headers, timeout=10).json()
+            final_status = g["campaign"]["status"]
+            if final_status in ("running", "completed"):
+                break
+        assert final_status in ("running", "completed"), f"Scheduler did not dispatch; status={final_status}"

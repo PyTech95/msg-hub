@@ -75,6 +75,7 @@ def make_token(user: dict) -> str:
         "sub": user["id"],
         "email": user["email"],
         "role": user["role"],
+        "tv": user.get("token_version", 1),
         "exp": now_utc() + timedelta(minutes=ACCESS_TTL_MIN),
         "iat": now_utc(),
     }
@@ -86,6 +87,24 @@ def clean(doc: Optional[dict]) -> Optional[dict]:
     doc.pop("_id", None)
     doc.pop("password_hash", None)
     return doc
+
+async def audit(action: str, target_type: str = "", target_id: str = "",
+                actor: Optional[dict] = None, meta: Optional[dict] = None) -> None:
+    """Record a structured audit event. Best-effort; never raises."""
+    try:
+        await db.audit_logs.insert_one({
+            "id": new_id(),
+            "action": action,
+            "target_type": target_type,
+            "target_id": target_id,
+            "actor_id": (actor or {}).get("id"),
+            "actor_email": (actor or {}).get("email"),
+            "actor_role": (actor or {}).get("role"),
+            "meta": meta or {},
+            "created_at": iso(now_utc()),
+        })
+    except Exception as e:
+        log.warning(f"audit failed: {e}")
 
 # ───────────────────────── Auth Dependencies ─────────────────────────
 async def current_user(request: Request) -> dict:
@@ -105,6 +124,8 @@ async def current_user(request: Request) -> dict:
     user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
     if not user:
         raise HTTPException(401, "User not found")
+    if payload.get("tv", 1) != user.get("token_version", 1):
+        raise HTTPException(401, "Token revoked. Please log in again.")
     return user
 
 def require_roles(*roles: str):
@@ -344,7 +365,11 @@ async def on_startup():
     await db.conversations.create_index([("contact_id", 1), ("channel", 1)], unique=True)
     await db.call_logs.create_index([("contact_id", 1), ("created_at", -1)])
     await db.webhook_events.create_index([("created_at", -1)])
+    await db.audit_logs.create_index([("created_at", -1)])
+    await db.password_reset_tokens.create_index("token", unique=True)
+    await db.system_settings.create_index("key", unique=True)
     await seed()
+    asyncio.create_task(campaign_scheduler_loop())
     log.info("CPaaS backend ready.")
 
 @app.on_event("shutdown")
@@ -360,17 +385,34 @@ async def seed():
     if not existing:
         await db.users.insert_one({
             "id": new_id(), "email": admin_email, "password_hash": hash_pw(admin_pw),
-            "name": "Super Admin", "role": "super_admin", "created_at": iso(now_utc()),
+            "name": "Super Admin", "role": "super_admin", "token_version": 1,
+            "created_at": iso(now_utc()),
         })
     else:
+        upd = {}
         if not verify_pw(admin_pw, existing["password_hash"]):
-            await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_pw(admin_pw)}})
+            upd["password_hash"] = hash_pw(admin_pw)
+        if "token_version" not in existing:
+            upd["token_version"] = 1
+        if upd:
+            await db.users.update_one({"email": admin_email}, {"$set": upd})
 
     agent_email = "agent@cpaas.io"
     if not await db.users.find_one({"email": agent_email}):
         await db.users.insert_one({
             "id": new_id(), "email": agent_email, "password_hash": hash_pw("Agent@12345"),
-            "name": "Ravi Sharma", "role": "agent", "created_at": iso(now_utc()),
+            "name": "Ravi Sharma", "role": "agent", "token_version": 1,
+            "created_at": iso(now_utc()),
+        })
+    # Backfill token_version on legacy users
+    await db.users.update_many({"token_version": {"$exists": False}}, {"$set": {"token_version": 1}})
+
+    # Seed default markup config (super admin can change later)
+    if not await db.system_settings.find_one({"key": "markup_pct"}):
+        await db.system_settings.insert_one({
+            "key": "markup_pct",
+            "value": {"sms": 20, "whatsapp": 25, "rcs": 30, "voice": 15},
+            "updated_at": iso(now_utc()),
         })
 
     # Only seed sample data once
@@ -528,12 +570,14 @@ async def seed():
 
 # ───────────────────────── Auth routes ─────────────────────────
 @api.post("/auth/login")
-async def login(body: LoginIn, response: Response):
+async def login(body: LoginIn, response: Response, request: Request):
     user = await db.users.find_one({"email": body.email.lower()})
     if not user or not verify_pw(body.password, user["password_hash"]):
+        await audit("login_failed", "user", "", None, {"email": body.email.lower(), "ip": request.client.host if request.client else None})
         raise HTTPException(401, "Invalid credentials")
-    token = make_token({"id": user["id"], "email": user["email"], "role": user["role"]})
+    token = make_token({"id": user["id"], "email": user["email"], "role": user["role"], "token_version": user.get("token_version", 1)})
     response.set_cookie("access_token", token, httponly=True, samesite="lax", max_age=ACCESS_TTL_MIN*60, path="/")
+    await audit("login", "user", user["id"], user, {"ip": request.client.host if request.client else None})
     return {"token": token, "user": clean(user)}
 
 @api.post("/auth/register")
@@ -542,9 +586,10 @@ async def register(body: RegisterIn, user: dict = Depends(require_roles("super_a
         raise HTTPException(409, "Email already exists")
     doc = {
         "id": new_id(), "email": body.email.lower(), "password_hash": hash_pw(body.password),
-        "name": body.name, "role": body.role, "created_at": iso(now_utc()),
+        "name": body.name, "role": body.role, "token_version": 1, "created_at": iso(now_utc()),
     }
     await db.users.insert_one(doc)
+    await audit("user_created", "user", doc["id"], user, {"email": doc["email"], "role": doc["role"]})
     return clean(doc)
 
 @api.post("/auth/logout")
@@ -561,13 +606,74 @@ class ChangePasswordIn(BaseModel):
     new_password: str
 
 @api.post("/auth/change-password")
-async def change_password(body: ChangePasswordIn, user: dict = Depends(current_user)):
+async def change_password(body: ChangePasswordIn, response: Response, user: dict = Depends(current_user)):
     full = await db.users.find_one({"id": user["id"]})
     if not full or not verify_pw(body.old_password, full["password_hash"]):
         raise HTTPException(400, "Current password is incorrect")
     if len(body.new_password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters")
-    await db.users.update_one({"id": user["id"]}, {"$set": {"password_hash": hash_pw(body.new_password)}})
+    new_tv = full.get("token_version", 1) + 1
+    await db.users.update_one({"id": user["id"]}, {"$set": {
+        "password_hash": hash_pw(body.new_password),
+        "token_version": new_tv,
+    }})
+    new_token = make_token({"id": user["id"], "email": user["email"], "role": user["role"], "token_version": new_tv})
+    response.set_cookie("access_token", new_token, httponly=True, samesite="lax", max_age=ACCESS_TTL_MIN*60, path="/")
+    await audit("password_changed", "user", user["id"], user)
+    return {"ok": True, "token": new_token}
+
+# ───────── Password Reset ─────────
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+class ResetPasswordIn(BaseModel):
+    token: str
+    new_password: str
+
+@api.post("/auth/forgot-password")
+async def forgot_password(body: ForgotPasswordIn):
+    user = await db.users.find_one({"email": body.email.lower()})
+    # Always return 200 to avoid email-enumeration; only act if user exists
+    if user:
+        token = secrets.token_urlsafe(32)
+        await db.password_reset_tokens.insert_one({
+            "id": new_id(),
+            "user_id": user["id"],
+            "token": token,
+            "used": False,
+            "expires_at": iso(now_utc() + timedelta(hours=1)),
+            "created_at": iso(now_utc()),
+        })
+        reset_link = f"/reset-password?token={token}"
+        log.info(f"PASSWORD RESET for {user['email']} → {reset_link}")
+        await audit("password_reset_requested", "user", user["id"], None, {"email": user["email"]})
+    return {"ok": True, "message": "If the email exists, a reset link has been generated. Check server logs (demo mode)."}
+
+@api.post("/auth/reset-password")
+async def reset_password(body: ResetPasswordIn):
+    if len(body.new_password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    rec = await db.password_reset_tokens.find_one({"token": body.token, "used": False})
+    if not rec:
+        raise HTTPException(400, "Invalid or used token")
+    try:
+        exp = datetime.fromisoformat(rec["expires_at"].replace("Z","+00:00"))
+        if exp < now_utc():
+            raise HTTPException(400, "Token expired")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(400, "Invalid token")
+    user = await db.users.find_one({"id": rec["user_id"]})
+    if not user:
+        raise HTTPException(400, "User not found")
+    new_tv = user.get("token_version", 1) + 1
+    await db.users.update_one({"id": user["id"]}, {"$set": {
+        "password_hash": hash_pw(body.new_password),
+        "token_version": new_tv,
+    }})
+    await db.password_reset_tokens.update_one({"id": rec["id"]}, {"$set": {"used": True}})
+    await audit("password_reset_completed", "user", user["id"])
     return {"ok": True}
 
 # ───────────────────────── Users / Team ─────────────────────────
@@ -580,7 +686,9 @@ async def list_users(_: dict = Depends(current_user)):
 async def delete_user(user_id: str, actor: dict = Depends(require_roles("super_admin"))):
     if user_id == actor["id"]:
         raise HTTPException(400, "Cannot delete yourself")
+    target = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
     await db.users.delete_one({"id": user_id})
+    await audit("user_deleted", "user", user_id, actor, {"target_email": (target or {}).get("email")})
     return {"ok": True}
 
 # ───────────────────────── Contacts ─────────────────────────
@@ -771,10 +879,10 @@ async def create_campaign(body: CampaignIn, background: BackgroundTasks, user: d
         "created_by": user["email"], "created_at": iso(now_utc()),
     }
     await db.campaigns.insert_one(camp)
-    # recipients
     recipients = [{"id": new_id(), "campaign_id": camp["id"], "contact_id": c["id"], "status": "queued", "created_at": iso(now_utc())} for c in audience]
     if recipients:
         await db.campaign_recipients.insert_many(recipients)
+    await audit("campaign_created", "campaign", camp["id"], user, {"name": camp["name"], "channel": camp["channel"], "audience_size": len(audience), "status": status})
     if status == "running":
         background.add_task(run_campaign, camp["id"], body.channel, tpl, audience, body.variables_map)
     return clean(camp)
@@ -950,22 +1058,23 @@ async def get_provider_credentials(provider_id: str, _: dict = Depends(require_r
     }
 
 @api.put("/providers/{provider_id}/credentials")
-async def set_provider_credentials(provider_id: str, body: ProviderCredentialsIn, _: dict = Depends(require_roles("super_admin"))):
+async def set_provider_credentials(provider_id: str, body: ProviderCredentialsIn, user: dict = Depends(require_roles("super_admin"))):
     p = await db.provider_accounts.find_one({"id": provider_id}, {"_id": 0})
     if not p:
         raise HTTPException(404, "Not found")
-    # Merge: any value that equals the masked version is kept as-is (i.e., not rotated)
     existing = p.get("credentials") or {}
     merged = dict(existing)
     masked_view = mask_credentials(existing)
     for k, v in (body.credentials or {}).items():
         if isinstance(v, str) and v == masked_view.get(k):
-            continue  # user didn't change this field
+            continue
         merged[k] = v
     upd = {"credentials": merged}
     if body.mock is not None:
         upd["mock"] = body.mock
     await db.provider_accounts.update_one({"id": provider_id}, {"$set": upd})
+    await audit("provider_credentials_updated", "provider", provider_id, user,
+                {"keys_set": sorted(list(merged.keys())), "mock": upd.get("mock")})
     return {"ok": True}
 
 @api.post("/providers/{provider_id}/test")
@@ -1070,6 +1179,140 @@ async def dashboard_stats(_: dict = Depends(current_user)):
         "channel_split": channel_split,
         "status_split": [{"status": r["_id"], "count": r["count"]} for r in by_status],
     }
+
+# ───────────────────────── Audit Logs ─────────────────────────
+@api.get("/audit-logs")
+async def list_audit_logs(limit: int = 200, action: Optional[str] = None,
+                          _: dict = Depends(require_roles("super_admin","admin"))):
+    flt: Dict[str, Any] = {}
+    if action:
+        flt["action"] = action
+    return await db.audit_logs.find(flt, {"_id": 0}).sort("created_at", -1).limit(limit).to_list(limit)
+
+# ───────────────────────── Settings (markup config) ─────────────────────────
+class MarkupIn(BaseModel):
+    sms: float = 0
+    whatsapp: float = 0
+    rcs: float = 0
+    voice: float = 0
+
+@api.get("/settings/markup")
+async def get_markup(_: dict = Depends(current_user)):
+    row = await db.system_settings.find_one({"key": "markup_pct"}, {"_id": 0})
+    return (row or {}).get("value", {"sms": 0, "whatsapp": 0, "rcs": 0, "voice": 0})
+
+@api.put("/settings/markup")
+async def set_markup(body: MarkupIn, user: dict = Depends(require_roles("super_admin"))):
+    v = body.model_dump()
+    await db.system_settings.update_one(
+        {"key": "markup_pct"},
+        {"$set": {"value": v, "updated_at": iso(now_utc())}},
+        upsert=True,
+    )
+    await audit("markup_updated", "setting", "markup_pct", user, {"value": v})
+    return v
+
+# ───────────────────────── Invoices ─────────────────────────
+@api.get("/invoices")
+async def list_invoices(_: dict = Depends(require_roles("super_admin","admin"))):
+    """Return monthly invoice summaries (last 6 months that have usage)."""
+    markup_row = await db.system_settings.find_one({"key": "markup_pct"}, {"_id": 0})
+    markup = (markup_row or {}).get("value", {}) or {}
+    pipeline = [
+        {"$group": {
+            "_id": {"month": {"$substr": ["$created_at", 0, 7]}, "channel": "$channel"},
+            "units": {"$sum": "$units"},
+            "base": {"$sum": "$amount"},
+        }},
+        {"$sort": {"_id.month": -1}},
+    ]
+    rows = await db.usage_records.aggregate(pipeline).to_list(2000)
+    by_month: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        m = r["_id"]["month"]; ch = r["_id"]["channel"]
+        bm = by_month.setdefault(m, {"month": m, "channels": [], "base_total": 0, "billable_total": 0, "units_total": 0})
+        mk = float(markup.get(ch, 0))
+        billable = round(r["base"] * (1 + mk / 100.0), 2)
+        bm["channels"].append({"channel": ch, "units": r["units"], "base": round(r["base"], 2), "markup_pct": mk, "billable": billable})
+        bm["base_total"] = round(bm["base_total"] + r["base"], 2)
+        bm["billable_total"] = round(bm["billable_total"] + billable, 2)
+        bm["units_total"] += r["units"]
+    invoices = sorted(by_month.values(), key=lambda x: x["month"], reverse=True)
+    return {"invoices": invoices, "markup_pct": markup, "currency": "INR"}
+
+@api.get("/invoices/{month}")
+async def invoice_detail(month: str, _: dict = Depends(require_roles("super_admin","admin"))):
+    """month = YYYY-MM"""
+    markup_row = await db.system_settings.find_one({"key": "markup_pct"}, {"_id": 0})
+    markup = (markup_row or {}).get("value", {}) or {}
+    records = await db.usage_records.find(
+        {"created_at": {"$regex": f"^{month}"}}, {"_id": 0}
+    ).sort("created_at", -1).limit(2000).to_list(2000)
+    by_ch: Dict[str, Dict[str, Any]] = {}
+    for r in records:
+        ch = r["channel"]
+        bm = by_ch.setdefault(ch, {"channel": ch, "units": 0, "base": 0, "markup_pct": float(markup.get(ch, 0))})
+        bm["units"] += r["units"]
+        bm["base"] = round(bm["base"] + r["amount"], 2)
+        bm["billable"] = round(bm["base"] * (1 + bm["markup_pct"] / 100.0), 2)
+    return {
+        "month": month,
+        "channels": list(by_ch.values()),
+        "base_total": round(sum(c["base"] for c in by_ch.values()), 2),
+        "billable_total": round(sum(c["billable"] for c in by_ch.values()), 2),
+        "units_total": sum(c["units"] for c in by_ch.values()),
+        "currency": "INR",
+        "record_count": len(records),
+    }
+
+# ───────────────────────── Messages CSV export ─────────────────────────
+@api.get("/export/messages.csv")
+async def export_messages_csv(channel: Optional[Channel] = None, status: Optional[str] = None,
+                              _: dict = Depends(current_user)):
+    from fastapi.responses import Response as FastResponse
+    flt: Dict[str, Any] = {}
+    if channel: flt["channel"] = channel
+    if status: flt["status"] = status
+    msgs = await db.messages.find(flt, {"_id": 0}).sort("created_at", -1).limit(10000).to_list(10000)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["created_at", "channel", "direction", "contact_id", "body", "status", "provider_message_id", "campaign_id"])
+    for m in msgs:
+        w.writerow([
+            m.get("created_at",""), m.get("channel",""), m.get("direction",""),
+            m.get("contact_id",""), (m.get("body","") or "")[:500],
+            m.get("status",""), m.get("provider_message_id",""), m.get("campaign_id","") or "",
+        ])
+    return FastResponse(content=buf.getvalue(), media_type="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=messages.csv"})
+
+# ───────────────────────── Campaign scheduler loop ─────────────────────────
+async def campaign_scheduler_loop():
+    """Background task: every 30s, run any 'scheduled' campaigns whose schedule_at has passed."""
+    log.info("campaign scheduler started")
+    while True:
+        try:
+            scheduled = await db.campaigns.find({"status": "scheduled"}, {"_id": 0}).to_list(50)
+            for c in scheduled:
+                sat = c.get("schedule_at")
+                if not sat:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(sat.replace("Z","+00:00"))
+                except Exception:
+                    continue
+                if dt <= now_utc():
+                    tpl = await db.templates.find_one({"id": c.get("template_id")}, {"_id": 0})
+                    if not tpl:
+                        await db.campaigns.update_one({"id": c["id"]}, {"$set": {"status": "failed", "error": "template missing"}})
+                        continue
+                    audience = await resolve_audience(c.get("list_ids", []) or [], c.get("contact_ids", []) or [])
+                    await db.campaigns.update_one({"id": c["id"]}, {"$set": {"status": "running"}})
+                    await audit("campaign_auto_started", "campaign", c["id"], None, {"name": c.get("name")})
+                    asyncio.create_task(run_campaign(c["id"], c["channel"], tpl, audience, {}))
+        except Exception as e:
+            log.error(f"scheduler loop error: {e}")
+        await asyncio.sleep(30)
 
 # ───────────────────────── Mount ─────────────────────────
 @api.get("/")

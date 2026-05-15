@@ -21,7 +21,11 @@ import Reports from "@/pages/Reports";
 import Providers from "@/pages/Providers";
 import Webhooks from "@/pages/Webhooks";
 import Team from "@/pages/Team";
+import AuditLogs from "@/pages/AuditLogs";
+import Invoices from "@/pages/Invoices";
 import Settings from "@/pages/Settings";
+import ForgotPassword from "@/pages/ForgotPassword";
+import ResetPassword from "@/pages/ResetPassword";
 
 export default function App() {
   return (
@@ -30,6 +34,8 @@ export default function App() {
         <BrowserRouter>
           <Routes>
             <Route path="/login" element={<Login />} />
+            <Route path="/forgot-password" element={<ForgotPassword />} />
+            <Route path="/reset-password" element={<ResetPassword />} />
             <Route element={<ProtectedRoute><AppLayout /></ProtectedRoute>}>
               <Route path="/" element={<Navigate to="/dashboard" replace />} />
               <Route path="/dashboard" element={<Dashboard />} />
@@ -46,6 +52,8 @@ export default function App() {
               <Route path="/providers" element={<RoleRoute allow={["super_admin","admin"]}><Providers /></RoleRoute>} />
               <Route path="/webhooks" element={<RoleRoute allow={["super_admin","admin"]}><Webhooks /></RoleRoute>} />
               <Route path="/team" element={<RoleRoute allow={["super_admin"]}><Team /></RoleRoute>} />
+              <Route path="/audit-logs" element={<RoleRoute allow={["super_admin","admin"]}><AuditLogs /></RoleRoute>} />
+              <Route path="/invoices" element={<RoleRoute allow={["super_admin","admin"]}><Invoices /></RoleRoute>} />
               <Route path="/settings" element={<Settings />} />
             </Route>
             <Route path="*" element={<Navigate to="/dashboard" replace />} />

@@ -2,7 +2,9 @@ import React, { useEffect, useState } from "react";
 import api from "@/lib/api";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 import { ChannelBadge, StatusBadge } from "@/components/Badges";
+import { Download } from "lucide-react";
 
 export default function MessageLogs() {
   const [msgs, setMsgs] = useState([]);
@@ -12,6 +14,17 @@ export default function MessageLogs() {
   useEffect(() => {
     api.get("/messages", { params: { channel: channel || undefined, status: status || undefined, limit: 300 } }).then(r => setMsgs(r.data));
   }, [channel, status]);
+
+  const exportCSV = async () => {
+    const res = await api.get("/export/messages.csv", {
+      params: { channel: channel || undefined, status: status || undefined },
+      responseType: "blob",
+    });
+    const url = window.URL.createObjectURL(new Blob([res.data]));
+    const a = document.createElement("a"); a.href = url; a.download = "messages.csv";
+    document.body.appendChild(a); a.click(); a.remove();
+    window.URL.revokeObjectURL(url);
+  };
 
   return (
     <div className="space-y-4" data-testid="messages-page">
@@ -34,6 +47,9 @@ export default function MessageLogs() {
             <option value="delivered">delivered</option><option value="failed">failed</option>
             <option value="received">received</option>
           </select>
+          <Button variant="outline" className="rounded-sm gap-2" onClick={exportCSV} data-testid="export-messages-button">
+            <Download className="h-4 w-4" /> Export
+          </Button>
         </div>
       </div>
 

@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import api from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -7,7 +7,8 @@ import { Label } from "@/components/ui/label";
 import { useAuth } from "@/contexts/AuthContext";
 import { useTheme } from "@/contexts/ThemeContext";
 import { Switch } from "@/components/ui/switch";
-import { KeyRound } from "lucide-react";
+import { ChannelBadge } from "@/components/Badges";
+import { KeyRound, Percent } from "lucide-react";
 import { toast } from "sonner";
 
 export default function Settings() {
@@ -15,6 +16,10 @@ export default function Settings() {
   const { theme, setTheme } = useTheme();
   const [pwd, setPwd] = useState({ old_password: "", new_password: "", confirm: "" });
   const [saving, setSaving] = useState(false);
+  const [markup, setMarkup] = useState(null);
+  const [savingMarkup, setSavingMarkup] = useState(false);
+
+  useEffect(() => { api.get("/settings/markup").then(r => setMarkup(r.data)); }, []);
 
   const changePassword = async (e) => {
     e.preventDefault();
@@ -22,13 +27,27 @@ export default function Settings() {
     if (pwd.new_password !== pwd.confirm) return toast.error("Passwords do not match");
     setSaving(true);
     try {
-      await api.post("/auth/change-password", { old_password: pwd.old_password, new_password: pwd.new_password });
-      toast.success("Password updated");
+      const { data } = await api.post("/auth/change-password", { old_password: pwd.old_password, new_password: pwd.new_password });
+      if (data.token) localStorage.setItem("cpaas_token", data.token);
+      toast.success("Password updated — existing sessions on other devices have been signed out");
       setPwd({ old_password: "", new_password: "", confirm: "" });
     } catch (err) {
       toast.error(err.response?.data?.detail || "Failed");
     } finally { setSaving(false); }
   };
+
+  const saveMarkup = async (e) => {
+    e.preventDefault();
+    setSavingMarkup(true);
+    try {
+      await api.put("/settings/markup", markup);
+      toast.success("Markup updated");
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Failed");
+    } finally { setSavingMarkup(false); }
+  };
+
+  const isSuperAdmin = user?.role === "super_admin";
 
   return (
     <div className="space-y-4 max-w-3xl" data-testid="settings-page">
@@ -60,6 +79,35 @@ export default function Settings() {
         </CardContent>
       </Card>
 
+      {isSuperAdmin && markup && (
+        <Card className="rounded-sm shadow-none">
+          <CardContent className="p-5 space-y-3">
+            <div>
+              <h3 className="text-lg font-bold flex items-center gap-2"><Percent className="h-4 w-4" /> Channel Markup</h3>
+              <p className="text-xs text-muted-foreground">Reseller margin applied on top of provider cost when generating invoices.</p>
+            </div>
+            <form onSubmit={saveMarkup} className="space-y-3">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                {["sms","whatsapp","rcs","voice"].map(ch => (
+                  <div key={ch}>
+                    <Label className="flex items-center gap-2"><ChannelBadge channel={ch} /></Label>
+                    <div className="relative mt-1">
+                      <Input type="number" min={0} max={500} step={1}
+                        value={markup[ch] ?? 0}
+                        onChange={e => setMarkup({...markup, [ch]: Number(e.target.value)})}
+                        className="rounded-sm pr-7 font-mono"
+                        data-testid={`markup-${ch}-input`} />
+                      <span className="absolute right-2 top-2 text-xs text-muted-foreground">%</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <Button type="submit" disabled={savingMarkup} className="rounded-sm" data-testid="save-markup-button">{savingMarkup ? "Saving…" : "Save markup"}</Button>
+            </form>
+          </CardContent>
+        </Card>
+      )}
+
       <Card className="rounded-sm shadow-none">
         <CardContent className="p-5 flex items-center justify-between">
           <div>
@@ -78,8 +126,9 @@ export default function Settings() {
         <CardContent className="p-5 space-y-2">
           <h3 className="text-lg font-bold">Demo Mode</h3>
           <p className="text-sm text-muted-foreground">
-            All provider integrations (Twilio, Gupshup, Exotel, Google RBM) run with <strong>mock adapters</strong> in this environment.
+            All provider integrations (Twilio, Gupshup, Exotel, Google RBM) run with <strong>mock adapters</strong>.
             Super Admin can plug in real API keys via <strong>Providers → Credentials</strong> and toggle Mock mode off when ready.
+            Scheduled campaigns are auto-dispatched by the background scheduler (every 30s).
           </p>
         </CardContent>
       </Card>

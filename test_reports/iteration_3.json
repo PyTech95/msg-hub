@@ -1,0 +1,59 @@
+{
+  "summary": "Iteration 3 testing of CPaaS Hub. Backend: 59/59 pytest cases pass (19 new tests for audit logs, password reset, token versioning, markup settings, invoices, messages CSV export, scheduler). Found and fixed 2 CRITICAL frontend runtime errors that would have blocked all role-gated nav + the new password-reset routes: (1) App.js was missing imports for ForgotPassword and ResetPassword components — runtime ReferenceError on /forgot-password and /reset-password routes; (2) AppLayout.jsx referenced ReceiptText and ScrollText lucide icons that were never imported — caused 'Uncaught runtime error: ReceiptText is not defined' on EVERY page render after login, hard-blocking the dashboard for all authenticated users. Both fixed. Frontend Playwright then verified: Forgot-password link from /login → /forgot-password form → confirmation message; /reset-password?token=... form renders & validates; admin login + token stored in localStorage; Audit Logs page loads 105 rows, action filter dropdown present, client-side search filter narrows to 76 rows on 'login'; Invoices page shows markup cards + monthly INR table + View detail; Settings shows Channel Markup card; Message Logs has Export CSV button. The seeded scheduled campaign 'TEST_Sched' (created with schedule_at = now+5s) appeared as 'completed' in dashboard recent campaigns within the 60-second poll window — proving the campaign_scheduler_loop dispatches and runs scheduled campaigns end-to-end.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/auth/forgot-password", "issue": "Reset token is only logged to backend stderr (no SMTP, no API endpoint to retrieve). Acceptable for demo mode but makes the flow untestable end-to-end without DB / log access."},
+      {"endpoint": "/api/auth/reset-password", "issue": "Expired-token branch is reachable but cannot be exercised without time-travel since expires_at=now+1h and the only way to insert a token is via /forgot-password. Consider seeding an expired token in tests if you want coverage."},
+      {"endpoint": "/api/invoices", "issue": "Aggregation does not paginate (.to_list(2000)) — tenants with >2000 channel-months will silently truncate."},
+      {"endpoint": "/api/export/messages.csv", "issue": "No streaming; loads up to 10k rows in memory and CSV-escapes only via csv.writer. body[:500] truncation is silent — recipient won't know."},
+      {"endpoint": "campaign_scheduler_loop", "issue": "asyncio.create_task(run_campaign(...)) is fire-and-forget without exception handling — a crashed run_campaign call will be swallowed; consider wrapping with try/except + audit('campaign_failed')."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "App.js", "issue": "Missing imports for ForgotPassword and ResetPassword — would crash /forgot-password and /reset-password routes. FIXED by testing agent.", "selector": "n/a", "priority": "CRITICAL"},
+      {"component": "AppLayout.jsx", "issue": "ReceiptText and ScrollText icons referenced in NAV array were never imported from lucide-react — caused 'Uncaught runtime error: ReceiptText is not defined' on EVERY authenticated page. FIXED by testing agent.", "selector": "n/a", "priority": "CRITICAL"},
+      {"component": "Invoices.jsx", "issue": "Download button not located at row-level; appears to live inside the detail panel. Spec says 'Download creates a JSON blob' — works but not visually obvious at list level.", "selector": "button:has-text('Download')", "priority": "LOW"},
+      {"component": "Sidebar (carry-over)", "issue": "Pre-existing typo 'Conversatinns' may still exist — check AppLayout.jsx label.", "selector": "n/a", "priority": "LOW"},
+      {"component": "ResetPassword toasts", "issue": "Client-side validation messages (min length, mismatch) shown via sonner toast which auto-dismisses — UX-wise OK but not surfaced inline near the input.", "selector": "[data-testid='reset-new-password']", "priority": "LOW"}
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Audit Logs", "issues": ["Sorts desc by created_at as expected; row badges use color-tone map for known actions only, unknown actions fall back to grey — fine."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Verify the two CRITICAL frontend fixes (App.js imports + AppLayout.jsx lucide icon imports) — both applied by testing agent.",
+    "Consider exposing the password-reset token in the /forgot-password response when DEMO_MODE=true (env-gated) so the flow is testable without server-log access.",
+    "Add try/except around asyncio.create_task(run_campaign(...)) inside campaign_scheduler_loop to surface scheduler failures.",
+    "Add row-level Download button on Invoices list (currently only inside detail view).",
+    "Carry-over: fix sidebar typo 'Conversatinns' → 'Conversations'.",
+    "Carry-over: Recharts ResponsiveContainer width(-1) warning; add aria-describedby to Radix Dialogs."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now ~1322 lines — strongly recommend splitting into routers (auth, audit, invoices, settings, scheduler, etc.).",
+    "audit() helper writes synchronously inside every request handler — consider buffering for high-volume endpoints (login under brute-force, message send).",
+    "token_version check in current_user (line ~127) correctly invalidates old JWTs on password change/reset, but does NOT invalidate on /auth/logout (no token revocation). Acceptable but worth documenting.",
+    "/auth/forgot-password rate-limit: there is none — same email can spam unlimited reset tokens which all stay valid for 1h. Add per-email throttling (e.g. 1 token per 60s).",
+    "/auth/reset-password does not invalidate other un-used tokens for the same user after a successful reset — older outstanding tokens remain consumable until expiry.",
+    "Invoices aggregation uses {'$substr': ['$created_at', 0, 7]} which depends on ISO string formatting — switch to a real datetime field to avoid future bugs.",
+    "campaign_scheduler_loop sleeps 30s between ticks — schedule_at granularity is therefore ~30s. Mention this in API docs."
+  ],
+  "updated_files": [
+    "/app/backend/tests/backend_test.py (extended with 19 new iteration-3 tests; fixture scope changed from session to function to handle token_version invalidation across tests)",
+    "/app/frontend/src/App.js (added missing ForgotPassword + ResetPassword imports)",
+    "/app/frontend/src/components/AppLayout.jsx (added missing ReceiptText + ScrollText lucide imports)"
+  ],
+  "success_rate": {"backend": "100% (59/59)", "frontend": "100% on tested flows after the 2 critical fixes; all 8 new UI surfaces verified visually + via selectors"},
+  "test_credentials": "admin@cpaas.io / Admin@12345 (super_admin), agent@cpaas.io / Agent@12345 (agent). TestTokenVersioning + TestChangePassword temporarily rotate admin pw and revert at end.",
+  "seed_data_creation": "Auto-seeded on startup. Test suite creates TEST_-prefixed contacts/lists/templates/campaigns/users (including a TEST_Sched campaign with schedule_at=now+5s to exercise the scheduler). All creations are visible in the dashboard 'Recent Campaigns' section.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend regression suite now covers 59 tests across Auth, Audit Logs, Password Reset (forgot+reset+invalid+short), Token Versioning (old token invalid after change-password, new token works), Markup Settings (GET/PUT/role-gating), Invoices (list/detail/role-gating), Messages CSV Export (header+channel+status filters), Scheduler (creates a campaign with schedule_at=now+5s and polls for status transition to running/completed). Run: pytest /app/backend/tests/backend_test.py -v. Important: admin_token / admin_headers / agent_token fixtures are NOW FUNCTION-SCOPED (not session) because token_version bumps on change-password / reset-password would invalidate session-scoped tokens. Frontend data-testids added in iteration 3: audit-logs-page, audit-action-filter, audit-search-input, refresh-audit, audit-row-{id}, forgot-password-form, forgot-email-input, forgot-submit-button, reset-password-form, reset-new-password, reset-confirm-password, reset-submit-button. The two critical frontend import bugs were introduced when iteration-3 added /invoices + /audit-logs nav items and new routes but missed updating App.js and AppLayout.jsx imports — main agent should add a pre-commit lint step (eslint no-undef) to catch this class of bug, since it slipped past webpack compile (only ESLint warnings).",
+  "rca of the issue": "Two CRITICAL frontend regressions found and fixed by testing agent: (1) App.js declared <ForgotPassword /> and <ResetPassword /> in route elements but the corresponding `import ForgotPassword from '@/pages/ForgotPassword'` and `import ResetPassword from '@/pages/ResetPassword'` lines were never added — webpack compiled (treats unknown JSX identifiers as global refs) but the page crashed at runtime with ReferenceError as soon as the route was navigated to. (2) AppLayout.jsx NAV array referenced `ReceiptText` (Invoices icon) and `ScrollText` (Audit Logs icon) but the lucide-react import only included `Radio, ListChecks` from iteration-2 — caused 'Uncaught runtime error: ReceiptText is not defined' on EVERY authenticated page (the NAV array is module-scoped so the error fires before any route renders). Fix applied: added the two missing imports in App.js and ReceiptText+ScrollText in AppLayout.jsx. Verified by reloading and seeing the full dashboard, sidebar with all 14 nav items, and successful navigation to /audit-logs and /invoices. Also fixed backend test infra: changed admin_token/admin_headers/agent_token fixtures from session-scope to function-scope so the new token-versioning feature (which invalidates old JWTs on password change) doesn't cascade 401s through downstream tests."
+}
