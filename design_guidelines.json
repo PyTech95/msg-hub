@@ -1,0 +1,98 @@
+{
+  "theme": "light_and_dark",
+  "archetype": "Archetype 4: Swiss & High-Contrast",
+  "emotional_tone": "Authoritative, precise, high-performance, clear.",
+  "typography": {
+    "fonts": {
+      "headings": "Chivo",
+      "body": "IBM Plex Sans",
+      "mono": "IBM Plex Mono"
+    },
+    "scale": {
+      "h1": "text-3xl font-black tracking-tighter",
+      "h2": "text-2xl font-bold tracking-tight",
+      "h3": "text-xl font-semibold tracking-tight",
+      "h4": "text-lg font-semibold",
+      "body": "text-sm",
+      "data_dense": "text-xs font-medium",
+      "labels": "text-[10px] uppercase tracking-[0.1em] font-semibold"
+    },
+    "installation": "Add Google fonts: Chivo, IBM Plex Sans, IBM Plex Mono"
+  },
+  "colors": {
+    "light": {
+      "background": "#FFFFFF",
+      "surface": "#F9FAFB",
+      "surface_hover": "#F3F4F6",
+      "border": "#E5E7EB",
+      "text_primary": "#111827",
+      "text_secondary": "#6B7280",
+      "primary": "#0055FF",
+      "primary_hover": "#0044CC",
+      "danger": "#DC2626",
+      "success": "#16A34A",
+      "warning": "#D97706"
+    },
+    "dark": {
+      "background": "#0A0A0A",
+      "surface": "#171717",
+      "surface_hover": "#262626",
+      "border": "#27272A",
+      "text_primary": "#F9FAFB",
+      "text_secondary": "#A1A1AA",
+      "primary": "#3B82F6",
+      "primary_hover": "#60A5FA",
+      "danger": "#EF4444",
+      "success": "#22C55E",
+      "warning": "#F59E0B"
+    },
+    "channel_colors": {
+      "sms": {"bg": "bg-blue-100 dark:bg-blue-900/30", "text": "text-blue-700 dark:text-blue-400", "border": "border-blue-200 dark:border-blue-800", "hex": "#3B82F6"},
+      "whatsapp": {"bg": "bg-green-100 dark:bg-green-900/30", "text": "text-green-700 dark:text-green-400", "border": "border-green-200 dark:border-green-800", "hex": "#25D366"},
+      "rcs": {"bg": "bg-orange-100 dark:bg-orange-900/30", "text": "text-orange-700 dark:text-orange-400", "border": "border-orange-200 dark:border-orange-800", "hex": "#F97316"},
+      "voice": {"bg": "bg-stone-100 dark:bg-stone-800", "text": "text-stone-700 dark:text-stone-300", "border": "border-stone-200 dark:border-stone-700", "hex": "#57534E"}
+    }
+  },
+  "spacing_and_layout": {
+    "general": "High-density data architecture. Dense paddings in tables, ample whitespace in page headers.",
+    "border_radius": "rounded-sm (2px to 4px max) for a sharp, technical look.",
+    "dashboard_grid": "grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4",
+    "sidebar": "w-64 fixed left-0 top-0 h-screen border-r border-border bg-surface",
+    "main_content": "ml-64 p-6 or p-8 min-h-screen",
+    "tables": "Dense layout: px-3 py-2 cells. Sticky header. Horizontal scroll for large datasets. Hover row states. Avoid pagination if virtualized, else simple previous/next."
+  },
+  "components": {
+    "buttons": "Flat, no shadow. rounded-sm. Explicit hover states. focus-visible:ring-2.",
+    "cards": "bg-background border border-border rounded-sm shadow-none. Hover: shadow-sm.",
+    "inputs": "bg-background border border-border rounded-sm px-3 py-2 text-sm focus:border-primary focus:ring-1 focus:ring-primary outline-none transition-colors.",
+    "kpi_cards": "Use 'Control Room' style. Grid layout. Metric text-3xl font-mono. Include small sparkline (recharts) aligned right. Status indicator (green arrow up, red arrow down).",
+    "campaign_wizard": "Horizontal step indicator with strict validation per step. Step 1: Audience, Step 2: Channel, Step 3: Template, Step 4: Schedule, Step 5: Review.",
+    "timeline_ui": "Vertical border-l-2 border-border. Each event is a dot colored by channel. Flex column for message content. Click-to-call icon adjacent to Voice events.",
+    "chat_bubbles": "SMS: Gray/Blue combo. WA: Standard light green. RCS: Orange/White. Use text-sm, rounded-md with tail.",
+    "icons": "lucide-react. Use stroke-width: 1.5 or 2 for clarity at small sizes."
+  },
+  "media": {
+    "image_urls": {
+      "login_bg_light": {
+        "url": "https://static.prod-images.emergentagent.com/jobs/c8da227a-fd20-4da8-bec9-b2bc2e39d532/images/1f122e4ba0b2db3dcda26732dd26ecdf719728feae32d079491740af820902c2.png",
+        "description": "Light mode login background. Abstract Swiss geometric."
+      },
+      "login_bg_dark": {
+        "url": "https://static.prod-images.emergentagent.com/jobs/c8da227a-fd20-4da8-bec9-b2bc2e39d532/images/cf45aa9a4e13b975dd978b123cb96c0b2761192af02a1c21d85f0f3203bb1f5f.png",
+        "description": "Dark mode login background. Deep obsidian abstract."
+      }
+    }
+  },
+  "testing": {
+    "data_testid_rules": "All interactive elements (buttons, inputs, links, tabs, dialog triggers, table rows, menu items) MUST have a data-testid attribute in kebab-case specifying their role. E.g. data-testid='create-campaign-button', data-testid='contact-row-123'."
+  },
+  "instructions_to_main_agent": [
+    "Use raw HTML/Tailwind for structural layouts where Shadcn is too rigid, but use Shadcn extensively for Tables, Dialogs, Selects, and Tabs.",
+    "Install Google Fonts in index.css using @import.",
+    "Strictly follow the color tokens. Avoid generic purple or teal gradients.",
+    "For tables, implement column filters and a top bar for bulk actions (e.g. Export, Delete).",
+    "Use Recharts for the analytics charts. Ensure lines/bars use the 'primary' or 'channel_colors' hex codes for consistency.",
+    "Implement the 'Control Room' bento grid for the Dashboard overview.",
+    "Ensure the Sidebar collapses or stays hidden on mobile (use Shadcn Sheet for mobile nav)."
+  ]
+}
