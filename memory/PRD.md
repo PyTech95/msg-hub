@@ -30,18 +30,19 @@ Build a production-ready full-stack CPaaS-style web application that lets a busi
 users, contacts, contact_lists, templates, campaigns, campaign_recipients, messages, message_events, conversations, call_logs, provider_accounts, webhook_events, usage_records, audit_logs
 
 ## Implemented (Feb 2026)
-- JWT auth + role guard + seeded super admin & agent
+- JWT auth + role guard + seeded super admin & agent + **change-password**
 - All 14 collections w/ indexes
 - Full REST API under /api
 - Mock provider adapters with simulated async delivery & inbound replies
-- Dashboard, Contacts (+ profile timeline), Templates, Campaigns (+ wizard), Conversations, Messages, Calls, Reports, Providers, Webhooks, Team, Settings pages
-- Light/dark theme, sidebar layout, channel-colored badges
-- Seed data: 15 contacts, 4 templates, 3 campaigns, 50 messages, 10 calls, 4 providers
+- **Provider Credentials Vault** — masked storage (super_admin only), per-provider schemas (Twilio/Gupshup/Exotel/RBM), reveal toggle, rotate-on-edit, test connection
+- Dashboard, Contacts (+ profile timeline + edit + CSV import/export + bulk delete), **Lists CRUD page**, Templates (+ edit), Campaigns (+ wizard + **detail page** w/ progress/recipients/messages), Conversations, Messages, Calls, Reports, Providers (+ credentials manager), Webhooks, Team, Settings (+ change-password)
+- Role-aware sidebar + RoleRoute guards; Agent gets a dedicated inbox-first dashboard
+- Light/dark theme, channel-colored badges, NSTU branding
+- Seed data: 15 contacts, 3 lists, 4 templates, 4 providers, 3 campaigns, ~80 historical messages, 10 calls, 8 webhook events
 
 ## Backlog / Next
-- **P1**: Real provider integrations (Twilio SMS, Gupshup WA, Exotel Voice, RBM RCS)
-- **P1**: Rate-limit + queue (Redis/BullMQ equivalent via APScheduler)
-- **P2**: Audit log viewer UI
-- **P2**: Invoice PDF export
-- **P2**: WebSocket for live inbox updates
-- **P2**: 2FA, password reset email flow
+- **P1**: Replace mock adapters with real provider implementations once Super Admin saves API keys
+- **P1**: Token versioning so JWTs invalidate on password change
+- **P1**: Redis queue / APScheduler for production fan-out
+- **P2**: Audit log viewer UI, invoice PDF export, WebSocket inbox push, 2FA, password reset email flow
+- **P2**: Stream CSV export for large tenants
