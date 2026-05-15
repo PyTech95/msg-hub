@@ -9,7 +9,9 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, Dialog
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
-import { Plus, Search, Upload, Trash2, Phone, Mail, BanIcon } from "lucide-react";
+import { Plus, Search, Upload, Trash2, Phone, Mail, BanIcon, Pencil, Download } from "lucide-react";
+
+const blank = { name: "", phone: "", email: "", tags: "", dnd: false, opted_out: false };
 
 export default function Contacts() {
   const [contacts, setContacts] = useState([]);
@@ -18,7 +20,8 @@ export default function Contacts() {
   const [listFilter, setListFilter] = useState("");
   const [selected, setSelected] = useState(new Set());
   const [open, setOpen] = useState(false);
-  const [form, setForm] = useState({ name: "", phone: "", email: "", tags: "" });
+  const [editing, setEditing] = useState(null);
+  const [form, setForm] = useState(blank);
   const fileRef = useRef(null);
 
   const load = async () => {
@@ -32,15 +35,31 @@ export default function Contacts() {
   const toggleAll = () => setSelected(allSelected ? new Set() : new Set(contacts.map(c => c.id)));
   const toggleOne = (id) => setSelected(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
-  const createContact = async (e) => {
+  const openCreate = () => { setEditing(null); setForm(blank); setOpen(true); };
+  const openEdit = (c) => {
+    setEditing(c);
+    setForm({ name: c.name, phone: c.phone, email: c.email || "", tags: (c.tags || []).join(", "), dnd: !!c.dnd, opted_out: !!c.opted_out });
+    setOpen(true);
+  };
+
+  const saveContact = async (e) => {
     e.preventDefault();
-    await api.post("/contacts", {
+    const payload = {
       name: form.name, phone: form.phone, email: form.email || null,
       tags: form.tags.split(",").map(s => s.trim()).filter(Boolean),
-    });
-    toast.success("Contact added");
-    setOpen(false); setForm({ name: "", phone: "", email: "", tags: "" });
-    load();
+      dnd: form.dnd, opted_out: form.opted_out,
+    };
+    try {
+      if (editing) {
+        await api.patch(`/contacts/${editing.id}`, payload);
+        toast.success("Contact updated");
+      } else {
+        await api.post("/contacts", payload);
+        toast.success("Contact added");
+      }
+      setOpen(false); setForm(blank); setEditing(null);
+      load();
+    } catch (err) { toast.error(err.response?.data?.detail || "Failed"); }
   };
 
   const bulkDelete = async () => {
@@ -59,6 +78,15 @@ export default function Contacts() {
     load();
   };
 
+  const exportCSV = async () => {
+    const res = await api.get("/export/contacts.csv", { responseType: "blob" });
+    const url = window.URL.createObjectURL(new Blob([res.data]));
+    const a = document.createElement("a");
+    a.href = url; a.download = "contacts.csv";
+    document.body.appendChild(a); a.click(); a.remove();
+    window.URL.revokeObjectURL(url);
+  };
+
   return (
     <div className="space-y-4" data-testid="contacts-page">
       <div className="flex items-end justify-between flex-wrap gap-3">
@@ -68,21 +96,26 @@ export default function Contacts() {
         </div>
         <div className="flex items-center gap-2">
           <input ref={fileRef} type="file" accept=".csv" className="hidden" onChange={e => e.target.files?.[0] && importCSV(e.target.files[0])} />
+          <Button variant="outline" className="rounded-sm gap-2" onClick={exportCSV} data-testid="export-contacts-button">
+            <Download className="h-4 w-4" /> Export
+          </Button>
           <Button variant="outline" className="rounded-sm gap-2" onClick={() => fileRef.current?.click()} data-testid="import-contacts-button">
             <Upload className="h-4 w-4" /> Import CSV
           </Button>
+          <Button className="rounded-sm gap-2" onClick={openCreate} data-testid="add-contact-button"><Plus className="h-4 w-4" /> New Contact</Button>
           <Dialog open={open} onOpenChange={setOpen}>
-            <DialogTrigger asChild>
-              <Button className="rounded-sm gap-2" data-testid="add-contact-button"><Plus className="h-4 w-4" /> New Contact</Button>
-            </DialogTrigger>
             <DialogContent className="rounded-sm">
-              <DialogHeader><DialogTitle>Add Contact</DialogTitle></DialogHeader>
-              <form onSubmit={createContact} className="space-y-3">
+              <DialogHeader><DialogTitle>{editing ? "Edit Contact" : "Add Contact"}</DialogTitle></DialogHeader>
+              <form onSubmit={saveContact} className="space-y-3">
                 <div><Label>Name</Label><Input required value={form.name} onChange={e => setForm({...form, name: e.target.value})} className="rounded-sm" data-testid="contact-name-input" /></div>
                 <div><Label>Phone</Label><Input required value={form.phone} onChange={e => setForm({...form, phone: e.target.value})} className="rounded-sm" data-testid="contact-phone-input" placeholder="+91..." /></div>
                 <div><Label>Email</Label><Input type="email" value={form.email} onChange={e => setForm({...form, email: e.target.value})} className="rounded-sm" data-testid="contact-email-input" /></div>
                 <div><Label>Tags (comma)</Label><Input value={form.tags} onChange={e => setForm({...form, tags: e.target.value})} className="rounded-sm" placeholder="vip, customer" data-testid="contact-tags-input" /></div>
-                <DialogFooter><Button type="submit" className="rounded-sm" data-testid="save-contact-button">Save</Button></DialogFooter>
+                <div className="flex items-center gap-6 pt-1">
+                  <label className="text-xs flex items-center gap-2"><Checkbox checked={form.dnd} onCheckedChange={v => setForm({...form, dnd: !!v})} data-testid="contact-dnd-checkbox" /> DND</label>
+                  <label className="text-xs flex items-center gap-2"><Checkbox checked={form.opted_out} onCheckedChange={v => setForm({...form, opted_out: !!v})} data-testid="contact-optout-checkbox" /> Opted out</label>
+                </div>
+                <DialogFooter><Button type="submit" className="rounded-sm" data-testid="save-contact-button">{editing ? "Save" : "Add"}</Button></DialogFooter>
               </form>
             </DialogContent>
           </Dialog>

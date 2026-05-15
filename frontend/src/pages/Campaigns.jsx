@@ -52,7 +52,7 @@ export default function Campaigns() {
             <tbody>
               {campaigns.map(c => (
                 <tr key={c.id} className="border-t border-border hover:bg-accent/40" data-testid={`campaign-row-${c.id}`}>
-                  <td className="px-3 py-2 font-medium"><Link to={`/messages?campaign=${c.id}`} className="hover:underline">{c.name}</Link></td>
+                  <td className="px-3 py-2 font-medium"><Link to={`/campaigns/${c.id}`} className="hover:underline" data-testid={`campaign-detail-link-${c.id}`}>{c.name}</Link></td>
                   <td className="px-3 py-2"><ChannelBadge channel={c.channel} /></td>
                   <td className="px-3 py-2"><StatusBadge status={c.status} /></td>
                   <td className="px-3 py-2 text-right font-mono">{c.stats?.queued ?? 0}</td>

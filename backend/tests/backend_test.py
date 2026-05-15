@@ -318,3 +318,151 @@ class TestUsage:
         assert r.status_code == 200
         d = r.json()
         assert "by_channel" in d and "total_amount" in d
+
+
+
+# --- Change Password ---
+class TestChangePassword:
+    def test_wrong_old_password_rejected(self, admin_headers):
+        r = requests.post(f"{API}/auth/change-password", headers=admin_headers,
+                          json={"old_password": "wrong-pw", "new_password": "NewPass@123"}, timeout=10)
+        assert r.status_code == 400
+
+    def test_short_new_password_rejected(self, admin_headers):
+        r = requests.post(f"{API}/auth/change-password", headers=admin_headers,
+                          json={"old_password": ADMIN["password"], "new_password": "abc"}, timeout=10)
+        assert r.status_code == 400
+
+    def test_change_and_revert(self, admin_headers):
+        # change
+        r1 = requests.post(f"{API}/auth/change-password", headers=admin_headers,
+                           json={"old_password": ADMIN["password"], "new_password": "Temp@99999"}, timeout=10)
+        assert r1.status_code == 200
+        # login with new
+        r2 = requests.post(f"{API}/auth/login", json={"email": ADMIN["email"], "password": "Temp@99999"}, timeout=10)
+        assert r2.status_code == 200
+        new_token = r2.json()["token"]
+        # revert
+        r3 = requests.post(f"{API}/auth/change-password",
+                           headers={"Authorization": f"Bearer {new_token}"},
+                           json={"old_password": "Temp@99999", "new_password": ADMIN["password"]}, timeout=10)
+        assert r3.status_code == 200
+        # verify old works again
+        r4 = requests.post(f"{API}/auth/login", json=ADMIN, timeout=10)
+        assert r4.status_code == 200
+
+
+# --- List PATCH ---
+class TestListPatch:
+    def test_patch_list(self, admin_headers):
+        c = requests.post(f"{API}/lists", headers=admin_headers,
+                          json={"name": "TEST_PatchList", "description": "orig"}, timeout=10)
+        assert c.status_code == 200
+        lid = c.json()["id"]
+        p = requests.patch(f"{API}/lists/{lid}", headers=admin_headers,
+                           json={"name": "TEST_PatchList2", "description": "updated"}, timeout=10)
+        assert p.status_code == 200
+        body = p.json()
+        assert body["name"] == "TEST_PatchList2"
+        assert body["description"] == "updated"
+        # cleanup
+        requests.delete(f"{API}/lists/{lid}", headers=admin_headers, timeout=10)
+
+
+# --- Export Contacts CSV ---
+class TestExportCSV:
+    def test_export_csv_format(self, admin_headers):
+        r = requests.get(f"{API}/export/contacts.csv", headers=admin_headers, timeout=15)
+        assert r.status_code == 200
+        assert "text/csv" in r.headers.get("content-type", "")
+        body = r.text
+        first_line = body.splitlines()[0]
+        assert first_line == "name,phone,email,tags,dnd,opted_out,city,created_at"
+        # at least 2 rows (header + 1)
+        assert len(body.splitlines()) >= 2
+
+
+# --- Campaign Detail ---
+class TestCampaignDetail:
+    def test_get_campaign_returns_campaign_and_recipients(self, admin_headers):
+        camps = requests.get(f"{API}/campaigns", headers=admin_headers, timeout=10).json()
+        assert len(camps) >= 1
+        cid = camps[0]["id"]
+        r = requests.get(f"{API}/campaigns/{cid}", headers=admin_headers, timeout=10)
+        assert r.status_code == 200
+        data = r.json()
+        assert "campaign" in data and "recipients" in data
+        assert isinstance(data["recipients"], list)
+        assert data["campaign"]["id"] == cid
+
+    def test_get_campaign_404(self, admin_headers):
+        r = requests.get(f"{API}/campaigns/nonexistent_xyz", headers=admin_headers, timeout=10)
+        assert r.status_code == 404
+
+
+# --- Provider Credentials ---
+class TestProviderCredentials:
+    def _get_provider(self, headers):
+        providers = requests.get(f"{API}/providers", headers=headers, timeout=10).json()
+        # use twilio one if available
+        for p in providers:
+            if p["provider_key"] == "twilio":
+                return p
+        return providers[0]
+
+    def test_get_credentials_masked(self, admin_headers):
+        p = self._get_provider(admin_headers)
+        pid = p["id"]
+        # First set creds with sensitive keys
+        set_r = requests.put(f"{API}/providers/{pid}/credentials", headers=admin_headers,
+                             json={"credentials": {"account_sid": "ACSECRET12345678", "auth_token": "TOKVERYSECRET999", "from": "+15005550006"}}, timeout=10)
+        assert set_r.status_code == 200
+        # GET
+        g = requests.get(f"{API}/providers/{pid}/credentials", headers=admin_headers, timeout=10)
+        assert g.status_code == 200
+        d = g.json()
+        assert d["credentials_set"] is True
+        assert d["credentials"]["account_sid"].startswith("•")
+        assert d["credentials"]["account_sid"].endswith("5678")
+        assert d["credentials"]["auth_token"].endswith("t999".upper()) or d["credentials"]["auth_token"].endswith("T999")
+        # 'from' is not sensitive => should be plain
+        assert d["credentials"]["from"] == "+15005550006"
+
+    def test_put_credentials_preserves_when_masked_value_sent(self, admin_headers):
+        p = self._get_provider(admin_headers)
+        pid = p["id"]
+        # set initial
+        requests.put(f"{API}/providers/{pid}/credentials", headers=admin_headers,
+                     json={"credentials": {"account_sid": "ORIGINAL_SID_AAAA", "auth_token": "ORIGINAL_TOKEN_BBB"}}, timeout=10)
+        # get masked view
+        g = requests.get(f"{API}/providers/{pid}/credentials", headers=admin_headers, timeout=10).json()
+        masked_sid = g["credentials"]["account_sid"]
+        # send back masked sid + new token
+        requests.put(f"{API}/providers/{pid}/credentials", headers=admin_headers,
+                     json={"credentials": {"account_sid": masked_sid, "auth_token": "NEW_TOKEN_CCCCCC"}}, timeout=10)
+        # fetch again
+        g2 = requests.get(f"{API}/providers/{pid}/credentials", headers=admin_headers, timeout=10).json()
+        # sid should still mask original (ends in AAAA)
+        assert g2["credentials"]["account_sid"].endswith("AAAA")
+        # token should be new (ends in CCCC)
+        assert g2["credentials"]["auth_token"].endswith("CCCC")
+
+    def test_put_credentials_forbidden_for_agent(self, agent_token):
+        providers = requests.get(f"{API}/providers", headers={"Authorization": f"Bearer {agent_token}"}, timeout=10).json()
+        pid = providers[0]["id"]
+        r = requests.put(f"{API}/providers/{pid}/credentials",
+                         headers={"Authorization": f"Bearer {agent_token}"},
+                         json={"credentials": {"key": "x"}}, timeout=10)
+        assert r.status_code == 403
+
+    def test_provider_test_mock_succeeds(self, admin_headers):
+        p = self._get_provider(admin_headers)
+        r = requests.post(f"{API}/providers/{p['id']}/test", headers=admin_headers, timeout=10)
+        assert r.status_code == 200
+        d = r.json()
+        assert d["ok"] is True
+        assert "latency_ms" in d
+
+    def test_provider_test_404(self, admin_headers):
+        r = requests.post(f"{API}/providers/nonexistent_xyz/test", headers=admin_headers, timeout=10)
+        assert r.status_code == 404

@@ -1,0 +1,46 @@
+{
+  "summary": "Iteration 2 testing of CPaaS Hub new features. Backend: 40/40 pytest cases pass (12 new tests added for change-password, list PATCH, /export/contacts.csv, campaign detail, provider credentials GET masked / PUT merge-preserve / agent forbidden / mock test / 404). Frontend: 13/13 Playwright assertions pass — Lists CRUD as super_admin, Contacts CSV export download, Contacts/Templates edit dialog prefill, Providers credentials dialog (twilio schema account_sid+auth_token+from, reveal toggle, save+mask-on-reopen showing ••••9999, mock test connection succeeds), Campaign detail page navigation, Settings change-password validation (mismatched confirm + wrong current pwd both surface errors), agent role correctly hides Lists/Team sidebar links and Credentials buttons on Providers.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/auth/register", "issue": "Returns 200 (not 201) for creation — acceptable but not REST-idiomatic"},
+      {"endpoint": "/api/auth/change-password", "issue": "After password rotation existing JWTs remain valid until expiry — no token revocation on password change"}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Sidebar nav (AppLayout.jsx)", "issue": "Pre-existing typo 'Conversatinns' (carried over from iteration 1)", "selector": "a:has-text('Conversatinns')", "priority": "LOW"},
+      {"component": "Dashboard Recharts ResponsiveContainer", "issue": "Pre-existing console warning width(-1)/height(-1) on initial render", "selector": ".recharts-responsive-container", "priority": "LOW"},
+      {"component": "Multiple Dialogs (Lists, Providers, Contacts, Templates, CredentialsDialog)", "issue": "Radix DialogContent emits 'Missing Description or aria-describedby' warnings — accessibility nit", "selector": "[role='dialog']", "priority": "LOW"}
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Optional: invalidate active JWTs server-side when /auth/change-password succeeds (track token version per user)",
+    "Optional: add aria-describedby / <DialogDescription> to all Radix dialogs to silence a11y warnings",
+    "Carry-over: fix sidebar typo 'Conversatinns' → 'Conversations'",
+    "Carry-over: set fixed height or minWidth/minHeight on Dashboard Recharts ResponsiveContainer to silence width(-1) warnings"
+  ],
+  "critical_code_review_comments": [
+    "server.py is now ~1080 lines — increasingly hard to maintain. Strong recommendation to split into routers (auth.py, contacts.py, lists.py, templates.py, campaigns.py, providers.py, messages.py, dashboard.py).",
+    "SENSITIVE_KEYS uses substring matching on the field key name (any key containing 'key','secret','token','password','sid','auth'). The substring 'key' is broad — e.g. 'monkey_field' would be masked. Consider exact-match or a configurable allow-list per provider schema.",
+    "PUT /providers/{id}/credentials does a merge keyed by sent fields only — there is no way to delete an existing credential field via API (only overwrite). Add explicit unset support if needed.",
+    "GET /providers/{id}/credentials returns mask using bullet char '•' but the masked length equals original secret length (could leak length information). Consider a fixed mask like '••••XXXX' regardless of length.",
+    "/api/export/contacts.csv has no row limit beyond .to_list(10000) and no streaming — large tenants could OOM. Consider StreamingResponse with chunked CSV writer.",
+    "CSV export does not escape custom_fields.city safely if it contains commas — csv.writer handles quoting but tags list is joined with ',' inside a single cell which may be ambiguous to consumers.",
+    "Change-password endpoint enforces min length 6 only — no complexity rules; carry-over from iteration 1."
+  ],
+  "updated_files": ["/app/backend/tests/backend_test.py"],
+  "success_rate": {"backend": "100% (40/40)", "frontend": "100% (13/13 on new flows)"},
+  "test_credentials": "admin@cpaas.io / Admin@12345 (super_admin), agent@cpaas.io / Agent@12345 (agent) — both verified working. Note: tests temporarily change admin password and revert at end of TestChangePassword class.",
+  "seed_data_creation": "Auto-seeded on startup (unchanged from iteration 1). Test-suite creates and self-cleans TEST_ prefixed contacts/lists/templates/providers. Provider credentials are written onto seeded Twilio (Mock) provider during tests — values left masked but harmless since mock=True.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend regression suite at /app/backend/tests/backend_test.py now covers 40 tests across Auth, ChangePassword, Dashboard, Contacts, Lists (incl. PATCH), Export CSV, Templates, Campaigns (incl. detail + 404), Messages, Conversations, Calls, Providers (incl. credentials GET masked / PUT merge-preserve / agent 403 / mock test / 404), Webhooks, Usage. Run: pytest /app/backend/tests/backend_test.py -v. All data-testid attributes are present on Lists, Providers (incl. cred-{field}, reveal-{field}, cred-test-button, cred-save-button), Settings (old/new/confirm-password-input, save-password-button), Contacts (export-contacts-button), Templates, CampaignDetail. Provider credentials are masked with bullet char '•' (Unicode) — last 4 chars preserved. Sending back masked value in PUT preserves existing secret (verified). Mock provider /test always returns ok=true with random latency_ms.",
+  "rca of the issue": "N/A — all features tested working as specified. Frontend false-negatives in first Playwright run were caused by overly specific href= selectors and a fragile twilio-card detection heuristic; switched to text-based selectors and confirmed all flows work."
+}

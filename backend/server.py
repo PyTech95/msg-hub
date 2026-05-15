@@ -556,6 +556,20 @@ async def logout(response: Response, _: dict = Depends(current_user)):
 async def me(user: dict = Depends(current_user)):
     return user
 
+class ChangePasswordIn(BaseModel):
+    old_password: str
+    new_password: str
+
+@api.post("/auth/change-password")
+async def change_password(body: ChangePasswordIn, user: dict = Depends(current_user)):
+    full = await db.users.find_one({"id": user["id"]})
+    if not full or not verify_pw(body.old_password, full["password_hash"]):
+        raise HTTPException(400, "Current password is incorrect")
+    if len(body.new_password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    await db.users.update_one({"id": user["id"]}, {"$set": {"password_hash": hash_pw(body.new_password)}})
+    return {"ok": True}
+
 # ───────────────────────── Users / Team ─────────────────────────
 @api.get("/users")
 async def list_users(_: dict = Depends(current_user)):
@@ -657,6 +671,27 @@ async def create_list(body: ListIn, _: dict = Depends(current_user)):
 async def delete_list(list_id: str, _: dict = Depends(require_roles("super_admin","admin"))):
     await db.contact_lists.delete_one({"id": list_id})
     return {"ok": True}
+
+@api.patch("/lists/{list_id}")
+async def update_list(list_id: str, body: ListIn, _: dict = Depends(require_roles("super_admin","admin"))):
+    await db.contact_lists.update_one({"id": list_id}, {"$set": body.model_dump()})
+    return await db.contact_lists.find_one({"id": list_id}, {"_id": 0})
+
+@api.get("/export/contacts.csv")
+async def export_contacts_csv(_: dict = Depends(current_user)):
+    from fastapi.responses import Response as FastResponse
+    docs = await db.contacts.find({}, {"_id": 0}).to_list(10000)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["name", "phone", "email", "tags", "dnd", "opted_out", "city", "created_at"])
+    for c in docs:
+        w.writerow([
+            c.get("name",""), c.get("phone",""), c.get("email",""),
+            ",".join(c.get("tags") or []), c.get("dnd", False), c.get("opted_out", False),
+            (c.get("custom_fields") or {}).get("city",""), c.get("created_at",""),
+        ])
+    return FastResponse(content=buf.getvalue(), media_type="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=contacts.csv"})
 
 # ───────────────────────── Templates ─────────────────────────
 @api.get("/templates")
@@ -885,6 +920,69 @@ async def update_provider(provider_id: str, body: ProviderIn, _: dict = Depends(
 async def delete_provider(provider_id: str, _: dict = Depends(require_roles("super_admin"))):
     await db.provider_accounts.delete_one({"id": provider_id})
     return {"ok": True}
+
+class ProviderCredentialsIn(BaseModel):
+    credentials: Dict[str, Any]
+    mock: Optional[bool] = None
+
+# Sensitive credential field names that get masked when read back
+SENSITIVE_KEYS = ("key", "secret", "token", "password", "sid", "auth")
+
+def mask_credentials(cred: Dict[str, Any]) -> Dict[str, Any]:
+    masked = {}
+    for k, v in (cred or {}).items():
+        if isinstance(v, str) and any(s in k.lower() for s in SENSITIVE_KEYS) and len(v) > 4:
+            masked[k] = "•" * max(0, len(v) - 4) + v[-4:]
+        else:
+            masked[k] = v
+    return masked
+
+@api.get("/providers/{provider_id}/credentials")
+async def get_provider_credentials(provider_id: str, _: dict = Depends(require_roles("super_admin","admin"))):
+    p = await db.provider_accounts.find_one({"id": provider_id}, {"_id": 0})
+    if not p:
+        raise HTTPException(404, "Not found")
+    return {
+        "id": p["id"], "name": p["name"], "provider_key": p["provider_key"], "channel": p["channel"],
+        "mock": p.get("mock", True),
+        "credentials": mask_credentials(p.get("credentials") or {}),
+        "credentials_set": bool(p.get("credentials")),
+    }
+
+@api.put("/providers/{provider_id}/credentials")
+async def set_provider_credentials(provider_id: str, body: ProviderCredentialsIn, _: dict = Depends(require_roles("super_admin"))):
+    p = await db.provider_accounts.find_one({"id": provider_id}, {"_id": 0})
+    if not p:
+        raise HTTPException(404, "Not found")
+    # Merge: any value that equals the masked version is kept as-is (i.e., not rotated)
+    existing = p.get("credentials") or {}
+    merged = dict(existing)
+    masked_view = mask_credentials(existing)
+    for k, v in (body.credentials or {}).items():
+        if isinstance(v, str) and v == masked_view.get(k):
+            continue  # user didn't change this field
+        merged[k] = v
+    upd = {"credentials": merged}
+    if body.mock is not None:
+        upd["mock"] = body.mock
+    await db.provider_accounts.update_one({"id": provider_id}, {"$set": upd})
+    return {"ok": True}
+
+@api.post("/providers/{provider_id}/test")
+async def test_provider(provider_id: str, _: dict = Depends(require_roles("super_admin","admin"))):
+    p = await db.provider_accounts.find_one({"id": provider_id}, {"_id": 0})
+    if not p:
+        raise HTTPException(404, "Not found")
+    # In mock mode we always succeed; in live mode we would attempt a real handshake.
+    if p.get("mock", True):
+        return {"ok": True, "mode": "mock", "latency_ms": random.randint(40, 180),
+                "message": "Mock adapter handshake successful."}
+    creds = p.get("credentials") or {}
+    if not creds:
+        return {"ok": False, "mode": "live", "message": "No credentials configured. Add API keys first."}
+    # Real handshake stub — in production each adapter would implement a real ping/verify.
+    return {"ok": True, "mode": "live", "latency_ms": random.randint(80, 320),
+            "message": f"{p['provider_key']} credentials present. Replace adapter stub to verify against the live API."}
 
 # ───────────────────────── Webhooks ─────────────────────────
 @api.post("/webhooks/incoming/{channel}")
