@@ -4,6 +4,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider } from "@/contexts/AuthContext";
 import { ThemeProvider } from "@/contexts/ThemeContext";
 import ProtectedRoute from "@/components/ProtectedRoute";
+import RoleRoute from "@/components/RoleRoute";
 import AppLayout from "@/components/AppLayout";
 import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
@@ -33,14 +34,14 @@ export default function App() {
               <Route path="/contacts" element={<Contacts />} />
               <Route path="/contacts/:id" element={<ContactProfile />} />
               <Route path="/templates" element={<Templates />} />
-              <Route path="/campaigns" element={<Campaigns />} />
+              <Route path="/campaigns" element={<RoleRoute allow={["super_admin","admin"]}><Campaigns /></RoleRoute>} />
               <Route path="/conversations" element={<Conversations />} />
               <Route path="/messages" element={<MessageLogs />} />
               <Route path="/calls" element={<Calls />} />
-              <Route path="/reports" element={<Reports />} />
-              <Route path="/providers" element={<Providers />} />
-              <Route path="/webhooks" element={<Webhooks />} />
-              <Route path="/team" element={<Team />} />
+              <Route path="/reports" element={<RoleRoute allow={["super_admin","admin"]}><Reports /></RoleRoute>} />
+              <Route path="/providers" element={<RoleRoute allow={["super_admin","admin"]}><Providers /></RoleRoute>} />
+              <Route path="/webhooks" element={<RoleRoute allow={["super_admin","admin"]}><Webhooks /></RoleRoute>} />
+              <Route path="/team" element={<RoleRoute allow={["super_admin"]}><Team /></RoleRoute>} />
               <Route path="/settings" element={<Settings />} />
             </Route>
             <Route path="*" element={<Navigate to="/dashboard" replace />} />

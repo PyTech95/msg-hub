@@ -15,20 +15,23 @@ import {
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Toaster } from "@/components/ui/sonner";
 
+// roles allowed to see each nav item. super_admin always sees all.
 const NAV = [
-  { to: "/dashboard",   label: "Dashboard",     icon: LayoutDashboard },
-  { to: "/contacts",    label: "Contacts",      icon: Users },
-  { to: "/templates",   label: "Templates",     icon: FileText },
-  { to: "/campaigns",   label: "Campaigns",     icon: Megaphone },
-  { to: "/conversations", label: "Conversations", icon: Inbox },
-  { to: "/messages",    label: "Message Logs",  icon: MessageSquare },
-  { to: "/calls",       label: "Voice Calls",   icon: Phone },
-  { to: "/reports",     label: "Reports",       icon: BarChart3 },
-  { to: "/providers",   label: "Providers",     icon: Plug },
-  { to: "/webhooks",    label: "Webhooks",      icon: Webhook },
-  { to: "/team",        label: "Team",          icon: UserCog },
-  { to: "/settings",    label: "Settings",      icon: Settings },
+  { to: "/dashboard",     label: "Dashboard",     icon: LayoutDashboard, roles: ["super_admin","admin","agent"] },
+  { to: "/contacts",      label: "Contacts",      icon: Users,           roles: ["super_admin","admin","agent"] },
+  { to: "/templates",     label: "Templates",     icon: FileText,        roles: ["super_admin","admin","agent"] },
+  { to: "/campaigns",     label: "Campaigns",     icon: Megaphone,       roles: ["super_admin","admin"] },
+  { to: "/conversations", label: "Conversations", icon: Inbox,           roles: ["super_admin","admin","agent"] },
+  { to: "/messages",      label: "Message Logs",  icon: MessageSquare,   roles: ["super_admin","admin","agent"] },
+  { to: "/calls",         label: "Voice Calls",   icon: Phone,           roles: ["super_admin","admin","agent"] },
+  { to: "/reports",       label: "Reports",       icon: BarChart3,       roles: ["super_admin","admin"] },
+  { to: "/providers",     label: "Providers",     icon: Plug,            roles: ["super_admin","admin"] },
+  { to: "/webhooks",      label: "Webhooks",      icon: Webhook,         roles: ["super_admin","admin"] },
+  { to: "/team",          label: "Team",          icon: UserCog,         roles: ["super_admin"] },
+  { to: "/settings",      label: "Settings",      icon: Settings,        roles: ["super_admin","admin","agent"] },
 ];
+
+export const ROLE_NAV = NAV;
 
 export default function AppLayout() {
   const { user, logout } = useAuth();
@@ -50,7 +53,7 @@ export default function AppLayout() {
         </div>
 
         <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5">
-          {NAV.map((item) => (
+          {NAV.filter(item => item.roles.includes(user?.role)).map((item) => (
             <NavLink
               key={item.to}
               to={item.to}

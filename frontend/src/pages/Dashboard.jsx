@@ -1,4 +1,6 @@
 import React, { useEffect, useState } from "react";
+import { useAuth } from "@/contexts/AuthContext";
+import AgentDashboard from "./AgentDashboard";
 import api from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import {
@@ -33,13 +35,17 @@ const KPI = ({ title, value, icon: Icon, delta, tone = "default", testid }) => (
 const CHANNEL_COLORS = { sms: "#3B82F6", whatsapp: "#22C55E", rcs: "#F97316", voice: "#57534E" };
 
 export default function Dashboard() {
+  const { user } = useAuth();
   const [stats, setStats] = useState(null);
   const [campaigns, setCampaigns] = useState([]);
 
   useEffect(() => {
+    if (user?.role === "agent") return; // agent sees a different dashboard
     api.get("/dashboard/stats").then(r => setStats(r.data));
     api.get("/campaigns").then(r => setCampaigns(r.data.slice(0, 5)));
-  }, []);
+  }, [user]);
+
+  if (user?.role === "agent") return <AgentDashboard user={user} />;
 
   if (!stats) return <div className="text-sm text-muted-foreground">Loading dashboard…</div>;
   const k = stats.kpis;
@@ -49,7 +55,7 @@ export default function Dashboard() {
     <div className="space-y-6" data-testid="dashboard-page">
       <div className="flex items-end justify-between flex-wrap gap-3">
         <div>
-          <div className="text-[10px] uppercase tracking-[0.15em] text-muted-foreground">Overview</div>
+          <div className="text-[10px] uppercase tracking-[0.15em] text-muted-foreground">Overview · {user?.role}</div>
           <h1 className="text-3xl font-black tracking-tighter">Control Room</h1>
         </div>
         <div className="text-xs text-muted-foreground font-mono">Delivery rate: <span className="text-foreground font-semibold">{deliveryRate}%</span></div>
