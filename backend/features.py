@@ -434,4 +434,214 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
         calls = await db.call_logs.find({"voice_campaign_id": camp_id}, {"_id": 0}).sort("created_at", -1).limit(500).to_list(500)
         return {"campaign": c, "calls": calls}
 
+    # =====================================================================
+    # FEATURE 4 — SMART REMINDER AUTOMATION
+    # Auto-escalates: T-7 days → SMS, T-3 days → WhatsApp, T-1 day → AI Voice call
+    # =====================================================================
+    DEFAULT_STEPS = [
+        {"days_before": 7, "channel": "sms",
+         "template": "Reminder: Hi {{name}}, your property bill #{{property_id}} for INR {{amount}} is due on {{due_date}}. Please pay to avoid penalty."},
+        {"days_before": 3, "channel": "whatsapp",
+         "template": "⏰ Hi {{name}}, just 3 days left to pay your property bill #{{property_id}} (INR {{amount}}). Due {{due_date}}."},
+        {"days_before": 1, "channel": "voice",
+         "template": "Hello {{name}}, this is an urgent automated reminder. Your property bill of INR {{amount}} for property {{property_id}} is due tomorrow on {{due_date}}. Please pay immediately to avoid penalty."},
+    ]
+
+    class EnableRemindersIn(BaseModel):
+        bill_ids: List[str]
+        steps: Optional[List[Dict[str, Any]]] = None  # override default
+
+    @router.post("/bills/enable-reminders")
+    async def enable_reminders(body: EnableRemindersIn, user: dict = Depends(current_user)):
+        steps = body.steps or DEFAULT_STEPS
+        bills = await db.bills.find({"id": {"$in": body.bill_ids}}, {"_id": 0}).to_list(len(body.bill_ids))
+        created = 0; skipped = 0
+        for b in bills:
+            dd = (b.get("due_date") or "").strip()
+            if not dd:
+                skipped += 1; continue
+            try:
+                due_dt = datetime.fromisoformat(dd + "T09:00:00+00:00")
+            except Exception:
+                try:
+                    due_dt = datetime.strptime(dd, "%Y-%m-%d").replace(hour=9, tzinfo=timezone.utc)
+                except Exception:
+                    skipped += 1; continue
+            # remove any existing pending schedules for this bill
+            await db.reminder_schedules.delete_many({"bill_id": b["id"], "status": "pending"})
+            for idx, step in enumerate(steps):
+                fire_at = due_dt - timedelta(days=int(step["days_before"]))
+                await db.reminder_schedules.insert_one({
+                    "id": _new_id(),
+                    "bill_id": b["id"],
+                    "step_index": idx,
+                    "days_before": int(step["days_before"]),
+                    "channel": step["channel"],
+                    "template": step["template"],
+                    "scheduled_at": _iso(fire_at),
+                    "status": "pending",  # pending | fired | skipped | cancelled
+                    "fired_at": None,
+                    "created_at": _iso(_now()),
+                })
+                created += 1
+            await db.bills.update_one({"id": b["id"]}, {"$set": {"auto_remind": True}})
+        await audit("reminders_enabled", "bills", "", user, {"bills": len(bills), "created": created})
+        return {"created": created, "skipped": skipped, "bills_enabled": len(bills) - skipped}
+
+    @router.post("/bills/{bill_id}/mark-paid")
+    async def mark_bill_paid(bill_id: str, user: dict = Depends(current_user)):
+        await db.bills.update_one({"id": bill_id}, {"$set": {"paid": True, "paid_at": _iso(_now())}})
+        result = await db.reminder_schedules.update_many(
+            {"bill_id": bill_id, "status": "pending"},
+            {"$set": {"status": "cancelled"}},
+        )
+        await audit("bill_marked_paid", "bill", bill_id, user, {"cancelled_schedules": result.modified_count})
+        return {"ok": True, "cancelled": result.modified_count}
+
+    @router.get("/bills/{bill_id}/schedules")
+    async def list_bill_schedules(bill_id: str, _: dict = Depends(current_user)):
+        return await db.reminder_schedules.find({"bill_id": bill_id}, {"_id": 0}).sort("scheduled_at", 1).to_list(50)
+
+    @router.get("/reminders/upcoming")
+    async def list_upcoming_reminders(_: dict = Depends(current_user)):
+        rows = await db.reminder_schedules.find({"status": "pending"}, {"_id": 0}).sort("scheduled_at", 1).limit(200).to_list(200)
+        # enrich with bill
+        bill_ids = list({r["bill_id"] for r in rows})
+        bs = await db.bills.find({"id": {"$in": bill_ids}}, {"_id": 0}).to_list(len(bill_ids))
+        bmap = {b["id"]: b for b in bs}
+        for r in rows:
+            b = bmap.get(r["bill_id"]) or {}
+            r["bill"] = {"name": b.get("name"), "property_id": b.get("property_id"), "amount": b.get("amount"), "phone": b.get("phone"), "email": b.get("email"), "paid": b.get("paid", False)}
+        return rows
+
+    async def reminder_loop():
+        """Background task: every 60s, fire any pending reminders whose scheduled_at <= now."""
+        log.info("reminder scheduler started")
+        while True:
+            try:
+                now = _now()
+                pending = await db.reminder_schedules.find({"status": "pending"}, {"_id": 0}).to_list(500)
+                for r in pending:
+                    try:
+                        when = datetime.fromisoformat(r["scheduled_at"].replace("Z","+00:00"))
+                    except Exception:
+                        continue
+                    if when > now:
+                        continue
+                    bill = await db.bills.find_one({"id": r["bill_id"]}, {"_id": 0})
+                    if not bill or bill.get("paid"):
+                        await db.reminder_schedules.update_one({"id": r["id"]}, {"$set": {"status": "skipped", "fired_at": _iso(now)}})
+                        continue
+                    ch = r["channel"]
+                    rendered = _render(r["template"], bill)
+                    recipient = bill.get("email") if ch == "email" else bill.get("phone")
+                    if not recipient:
+                        await db.reminder_schedules.update_one({"id": r["id"]}, {"$set": {"status": "skipped", "fired_at": _iso(now), "reason": "no_recipient"}})
+                        continue
+                    if ch == "voice":
+                        # use voice adapter
+                        cid = _new_id()
+                        await db.call_logs.insert_one({
+                            "id": cid, "contact_id": bill["id"], "direction": "outbound", "status": "initiated",
+                            "duration_sec": 0, "recording_url": None,
+                            "provider_call_id": f"mock_{secrets.token_hex(6)}",
+                            "notes": f"Auto-reminder T-{r['days_before']}d: {rendered[:200]}",
+                            "voice_campaign_id": None,
+                            "started_at": _iso(now), "ended_at": None,
+                            "created_at": _iso(now),
+                        })
+                        await db.usage_records.insert_one({
+                            "id": _new_id(), "channel": "voice", "message_id": cid, "units": 1,
+                            "amount": 1.20, "currency": "INR", "created_at": _iso(now),
+                        })
+                        adapter = ADAPTERS.get("voice")
+                        if adapter:
+                            asyncio.create_task(_deliver(cid, "voice", adapter))
+                    else:
+                        adapter = ADAPTERS.get(ch)
+                        if not adapter: continue
+                        mid = _new_id()
+                        await db.messages.insert_one({
+                            "id": mid, "channel": ch, "contact_id": bill["id"], "direction": "outbound",
+                            "body": rendered, "status": "queued", "provider_message_id": None,
+                            "campaign_id": None,
+                            "meta": {"reminder": True, "bill_id": bill["id"], "days_before": r["days_before"]},
+                            "created_at": _iso(now), "updated_at": _iso(now),
+                        })
+                        try:
+                            resp = await adapter.send(recipient, rendered, None)
+                            await db.messages.update_one({"id": mid}, {"$set": {"provider_message_id": resp.get("provider_message_id")}})
+                            asyncio.create_task(_deliver(mid, ch, adapter))
+                        except Exception as e:
+                            log.error(f"reminder send failed: {e}")
+                    await db.reminder_schedules.update_one({"id": r["id"]}, {"$set": {"status": "fired", "fired_at": _iso(now)}})
+                    await audit("reminder_fired", "bill", r["bill_id"], None, {"channel": ch, "days_before": r["days_before"]})
+            except Exception as e:
+                log.error(f"reminder loop error: {e}")
+            await asyncio.sleep(60)
+
+    asyncio.create_task(reminder_loop())
+
+    # =====================================================================
+    # FEATURE 5 — Invoice PDF download (WeasyPrint)
+    # =====================================================================
+    @router.get("/export/invoice/{month}.pdf")
+    async def export_invoice_pdf(month: str, _: dict = Depends(require_roles("super_admin","admin"))):
+        markup_row = await db.system_settings.find_one({"key": "markup_pct"}, {"_id": 0})
+        markup = (markup_row or {}).get("value", {}) or {}
+        records = await db.usage_records.find(
+            {"created_at": {"$regex": f"^{month}"}}, {"_id": 0}
+        ).limit(20000).to_list(20000)
+        by_ch: Dict[str, Dict[str, Any]] = {}
+        for r in records:
+            ch = r["channel"]
+            bm = by_ch.setdefault(ch, {"channel": ch, "units": 0, "base": 0, "markup_pct": float(markup.get(ch, 0))})
+            bm["units"] += r["units"]
+            bm["base"] = round(bm["base"] + r["amount"], 2)
+            bm["billable"] = round(bm["base"] * (1 + bm["markup_pct"] / 100.0), 2)
+
+        total_base = round(sum(c["base"] for c in by_ch.values()), 2)
+        total_bill = round(sum(c["billable"] for c in by_ch.values()), 2)
+        total_units = sum(c["units"] for c in by_ch.values())
+
+        rows_html = ""
+        for c in by_ch.values():
+            rows_html += f"<tr><td>{c['channel'].upper()}</td><td style='text-align:right'>{c['units']}</td><td style='text-align:right'>₹{c['base']:.2f}</td><td style='text-align:right'>{c['markup_pct']}%</td><td style='text-align:right'><b>₹{c['billable']:.2f}</b></td></tr>"
+
+        html = f"""<!doctype html><html><body style="font-family: Georgia, serif; padding: 48px; color: #111; max-width: 800px;">
+          <div style="border-bottom: 4px solid #000; padding-bottom: 12px; margin-bottom: 32px; display:flex; justify-content:space-between; align-items:flex-end;">
+            <div>
+              <div style="text-transform: uppercase; letter-spacing: 0.2em; font-size: 11px; color:#666;">NSTU · Communications Platform</div>
+              <h1 style="margin: 4px 0 0; font-size: 32px; letter-spacing:-0.02em;">INVOICE</h1>
+            </div>
+            <div style="text-align:right;">
+              <div style="font-size: 24px; font-family: 'IBM Plex Mono', monospace; font-weight: bold;">{month}</div>
+              <div style="font-size: 11px; color: #666;">Generated {_iso(_now())[:10]}</div>
+            </div>
+          </div>
+          <table style="width:100%; border-collapse: collapse; margin-bottom: 24px;">
+            <thead><tr style="background:#000; color:#fff;">
+              <th style="padding:10px; text-align:left;">Channel</th>
+              <th style="padding:10px; text-align:right;">Units</th>
+              <th style="padding:10px; text-align:right;">Base (INR)</th>
+              <th style="padding:10px; text-align:right;">Markup</th>
+              <th style="padding:10px; text-align:right;">Billable (INR)</th>
+            </tr></thead>
+            <tbody>{rows_html}</tbody>
+            <tfoot><tr style="background:#f3f3f3; font-weight:bold;">
+              <td style="padding:10px;">TOTAL</td>
+              <td style="padding:10px; text-align:right;">{total_units}</td>
+              <td style="padding:10px; text-align:right;">₹{total_base:.2f}</td>
+              <td style="padding:10px;"></td>
+              <td style="padding:10px; text-align:right; font-size:18px;">₹{total_bill:.2f}</td>
+            </tr></tfoot>
+          </table>
+          <div style="font-size: 11px; color: #666; border-top: 1px solid #ddd; padding-top: 16px;">
+            Records: {len(records)} · Currency: INR · This invoice reflects billable communications usage during {month}.
+          </div>
+        </body></html>"""
+        pdf = _html_to_pdf_bytes(html)
+        return FastResponse(content=pdf, media_type="application/pdf",
+                            headers={"Content-Disposition": f"attachment; filename=invoice-{month}.pdf"})
+
     return router
