@@ -20,7 +20,7 @@ from typing import List, Optional, Dict, Any
 import pdfplumber
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response as FastResponse
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
 log = logging.getLogger("nstu.features")
 
@@ -448,7 +448,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
     ]
 
     class EnableRemindersIn(BaseModel):
-        bill_ids: List[str]
+        bill_ids: List[str] = Field(..., min_length=1)
         steps: Optional[List[Dict[str, Any]]] = None  # override default
 
     @router.post("/bills/enable-reminders")
@@ -490,6 +490,9 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
 
     @router.post("/bills/{bill_id}/mark-paid")
     async def mark_bill_paid(bill_id: str, user: dict = Depends(current_user)):
+        existing = await db.bills.find_one({"id": bill_id}, {"_id": 0, "id": 1})
+        if not existing:
+            raise HTTPException(404, "Bill not found")
         await db.bills.update_one({"id": bill_id}, {"$set": {"paid": True, "paid_at": _iso(_now())}})
         result = await db.reminder_schedules.update_many(
             {"bill_id": bill_id, "status": "pending"},
