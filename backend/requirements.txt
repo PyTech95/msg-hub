@@ -27,3 +27,5 @@ typer>=0.9.0
 emergentintegrations==0.1.0
 pyotp==2.9.0
 qrcode==8.2
+pdfplumber==0.11.10
+weasyprint==69.0

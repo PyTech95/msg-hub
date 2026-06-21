@@ -3,7 +3,7 @@ import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import {
   LayoutDashboard, Users, FileText, Megaphone, MessageSquare, Phone,
   BarChart3, Plug, Webhook, UserCog, Settings, Inbox, Sun, Moon, LogOut,
-  Radio, ListChecks, ReceiptText, ScrollText
+  Radio, ListChecks, ReceiptText, ScrollText, Sparkles, BotMessageSquare
 } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { useTheme } from "@/contexts/ThemeContext";
@@ -21,7 +21,10 @@ const NAV = [
   { to: "/contacts",      label: "Contacts",      icon: Users,           roles: ["super_admin","admin","agent"] },
   { to: "/lists",         label: "Lists",         icon: ListChecks,      roles: ["super_admin","admin"] },
   { to: "/templates",     label: "Templates",     icon: FileText,        roles: ["super_admin","admin","agent"] },
+  { to: "/bills",         label: "Bills (AI)",    icon: Sparkles,        roles: ["super_admin","admin","agent"] },
+  { to: "/notices",       label: "Notices",       icon: ScrollText,      roles: ["super_admin","admin"] },
   { to: "/campaigns",     label: "Campaigns",     icon: Megaphone,       roles: ["super_admin","admin"] },
+  { to: "/voice-campaigns", label: "Voice AI",    icon: BotMessageSquare, roles: ["super_admin","admin","agent"] },
   { to: "/conversations", label: "Conversations", icon: Inbox,           roles: ["super_admin","admin","agent"] },
   { to: "/messages",      label: "Message Logs",  icon: MessageSquare,   roles: ["super_admin","admin","agent"] },
   { to: "/calls",         label: "Voice Calls",   icon: Phone,           roles: ["super_admin","admin","agent"] },

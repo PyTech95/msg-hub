@@ -283,14 +283,22 @@ class VoiceAdapter(BaseAdapter):
             await db.call_logs.update_one({"id": message_id}, {"$set": {"status": result, "ended_at": iso(now_utc())}})
             await emit_event(message_id, result)
 
-ADAPTERS: Dict[Channel, BaseAdapter] = {
+class EmailAdapter(BaseAdapter):
+    """Mock email adapter; swap with Resend/SendGrid later (creds via Providers UI)."""
+    channel = "email"  # type: ignore
+    async def send(self, to: str, body: str, media_url=None):
+        log.info(f"[mock email] to={to} body={(body or '')[:80]} attachment={media_url}")
+        return {"provider_message_id": f"email_{secrets.token_hex(8)}", "accepted": True}
+
+ADAPTERS: Dict[str, BaseAdapter] = {
     "sms": SMSAdapter(),
     "whatsapp": WhatsAppAdapter(),
     "rcs": RCSAdapter(),
     "voice": VoiceAdapter(),
+    "email": EmailAdapter(),
 }
 
-PRICING = {"sms": 0.25, "whatsapp": 0.40, "rcs": 0.50, "voice": 1.20}  # INR per unit (msg or min)
+PRICING = {"sms": 0.25, "whatsapp": 0.40, "rcs": 0.50, "voice": 1.20, "email": 0.10}  # INR per unit (msg or min)
 
 async def emit_event(message_id: str, event_type: str, **extra):
     evt = {
@@ -578,7 +586,8 @@ async def seed():
 async def login(body: LoginIn, response: Response, request: Request):
     email = body.email.lower()
     ip = request.client.host if request.client else "unknown"
-    ident = f"{ip}:{email}"
+    # Use email-only identifier (K8s ingress IP is unreliable behind proxy)
+    ident = email
 
     # Brute-force lockout: 5 fails / 15 min
     attempt = await db.login_attempts.find_one({"identifier": ident})
@@ -730,8 +739,18 @@ class ResetPasswordIn(BaseModel):
 @api.post("/auth/forgot-password")
 async def forgot_password(body: ForgotPasswordIn):
     user = await db.users.find_one({"email": body.email.lower()})
-    # Always return 200 to avoid email-enumeration; only act if user exists
     if user:
+        recent = await db.password_reset_tokens.find_one(
+            {"user_id": user["id"], "used": False},
+            sort=[("created_at", -1)],
+        )
+        if recent:
+            try:
+                created = datetime.fromisoformat(recent["created_at"].replace("Z","+00:00"))
+                if (now_utc() - created).total_seconds() < 60:
+                    return {"ok": True, "message": "If the email exists, a reset link has been generated."}
+            except Exception:
+                pass
         token = secrets.token_urlsafe(32)
         await db.password_reset_tokens.insert_one({
             "id": new_id(),
@@ -1463,4 +1482,9 @@ async def root():
 
 app.include_router(api)
 
-app.include_router(api)
+# ───────────────────────── Extended features (PDF bills, Notices, AI Voice) ──────────
+from features import build_features_router
+app.include_router(build_features_router(
+    db=db, current_user=current_user, require_roles=require_roles,
+    audit=audit, emit_event=emit_event, ADAPTERS=ADAPTERS,
+))

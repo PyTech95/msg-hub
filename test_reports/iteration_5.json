@@ -1,0 +1,48 @@
+{
+  "summary": "Iteration 5 testing: 3 new features (PDF Bill Splitter, Notice Templates, AI Voice Campaigns) + iter-4 bug fixes verified. Created /app/backend/tests/test_iteration5.py with 16 pytest cases. Result: 14 PASS, 2 XFAIL (LLM budget exhausted — env issue, not code bug). Frontend smoke-tested: all 3 new nav items render, Settings 2FA + Markup + Change-password cards render, Voice Campaigns table shows the test-created campaign with completed status (2 targets, 2 initiated, 2 completed).",
+  "backend_issues": {
+    "critical": [
+      {"endpoint": "POST /api/bills/upload", "issue": "EMERGENT_LLM_KEY budget exhausted in this preview env — LiteLLM returns 'Budget has been exceeded! Current cost: 0.005298, Max budget: 0.001'. The endpoint silently returns 200 with bill_count=0 (LLM exception is caught and an empty list is returned). User sees an apparently-successful upload that extracts zero bills with no error feedback. This makes Feature 1 unusable end-to-end via the UI in this environment. Code-wise the fallback is graceful, but UX needs an explicit error path (return 502/500 or include {error: 'llm_failed'} in the response). Once the EMERGENT_LLM_KEY budget is increased the feature should work as designed (we verified the rest of the pipeline by seeding bills directly).", "priority": "HIGH"}
+    ],
+    "minor": [
+      {"endpoint": "POST /api/bills/upload", "issue": "Loop uses asyncio.get_event_loop() in tests; not a server bug but worth noting — features.py LLM error is logged but not surfaced to client. Consider adding an 'llm_error' field to the response."},
+      {"endpoint": "POST /api/notices/send", "issue": "PDF stored base64 inside MongoDB ('pdf_b64' in notice_pdfs collection). Fine for demo, but document size limit (16MB) will bite at scale. Move to GridFS / object storage for production."},
+      {"endpoint": "POST /api/voice-campaigns", "issue": "When targets list is empty the campaign is immediately marked 'completed' with stats=queued:0 — UI should probably reject this earlier (400) rather than create an empty completed row."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Settings (Markup card)", "issues": ["Card flashes in ~1-2s after page load because data is loaded via separate /settings/markup fetch; consider a skeleton loader to avoid layout shift."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration5.py",
+    "/app/test_reports/pytest/iteration5_results.xml"
+  ],
+  "action_items": [
+    "Surface LLM failures in POST /api/bills/upload — return non-200 OR include {warning:'llm_extracted_zero'} so the UI can show 'PDF parsing failed' instead of a silent zero-bill success. Currently the user gets a green checkmark with no bills.",
+    "Increase EMERGENT_LLM_KEY budget for this preview env so the real Claude PDF-split flow can be tested end-to-end (current cap is $0.001).",
+    "Consider GridFS / S3 for notice PDFs (currently base64-stored in MongoDB).",
+    "Reject empty-targets voice campaigns with 400 instead of creating an empty 'completed' campaign row."
+  ],
+  "critical_code_review_comments": [
+    "features.py llm_split_bills catches the LLM error and returns []. This is graceful but creates silent failures — the upload endpoint should distinguish between 'PDF had no text' (400) and 'LLM call failed' (502).",
+    "PDF bytes stored as base64 inside MongoDB documents — fine for demo but unscalable. Already flagged in code comment.",
+    "server.py is now ~1491 lines — strongly recommend splitting into auth/audit/exports/scheduler routers; features.py is a great model.",
+    "Hardcoded /api prefix in features.py router — consistent with main api router but should ideally share a constant.",
+    "No retries for LLM call — a single transient failure costs the user the whole PDF upload.",
+    "Notice template HTML is rendered with simple replace() instead of a proper templating engine (Jinja2) — risks XSS if user-supplied templates contain unsafe markup and the system later sends HTML email. Currently fine because output → PDF."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration5.py (NEW — 16 pytest cases covering all 3 features + 2 auth re-verifications)"
+  ],
+  "success_rate": {"backend": "87.5% (14/16 pass, 2 xfailed due to env LLM budget — not code defect)", "frontend": "100% smoke (login, all 3 new nav items render, Settings 2FA+Markup+ChangePW render, Voice Campaigns table shows test row)"},
+  "test_credentials": "admin@cpaas.io / Admin@12345 (super_admin), agent@cpaas.io / Agent@12345 (agent). Fixture autouse-clears db.login_attempts before & after each test.",
+  "seed_data_creation": "TEST_voice_campaign created and left in db.voice_campaigns + db.call_logs (mock data — safe to leave). Bills seeded into MongoDB during send/notice/voice tests are cleaned up by fixture teardown. TEST_notice_tpl template is created and deleted within the same class.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "All 3 iteration-5 features are wired correctly. The ONLY environmental blocker is EMERGENT_LLM_KEY budget exhaustion ($0.001 cap reached). When tested end-to-end via direct DB seed, every endpoint behaves correctly: bills.sent.{channel}=true updates, notice_pdfs are inserted with media_url=/api/notices/download/{key}, voice campaign stats reach completed:N==target_count, audit_log rows for bills_uploaded / notices_sent / voice_campaign_started present. Iteration-4 fixes confirmed: (a) brute-force lockout fires at 6th wrong attempt for same email — ip dropped from identifier ✓ (b) forgot-password 60s rate-limit works (count stays at 1 across two rapid calls) ✓ (c) duplicate include_router removed (only line 1483 now) ✓ (d) EmailAdapter mock present in ADAPTERS['email'] ✓ (e) Settings 2FA card renders with all six data-testids ✓.",
+  "rca of the issue": "Only one substantive issue: EMERGENT_LLM_KEY budget exhausted. Repro: POST /api/bills/upload with a multi-bill PDF → backend logs show 'litellm.BadRequestError: OpenAIException - Budget has been exceeded! Current cost: 0.005298, Max budget: 0.001'. features.py:86 catches the exception and returns []. The endpoint then responds 200 with bill_count=0. Mitigation: (1) raise the budget for EMERGENT_LLM_KEY in this preview env, or (2) surface the LLM failure to the client (HTTP 502 or warning payload) so users know parsing failed. We proved every downstream feature works by seeding 3 bills directly into MongoDB and exercising /bills/send (whatsapp+email), /notices/send, /voice-campaigns end-to-end."
+}
