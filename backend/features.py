@@ -44,16 +44,14 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
     # =====================================================================
     EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 
-    async def llm_split_bills(text: str) -> List[Dict[str, Any]]:
-        """Use Claude (via emergentintegrations) to extract individual bills from raw PDF text."""
+    async def llm_split_bills(text: str) -> Dict[str, Any]:
+        """Use Claude (via emergentintegrations) to extract bills. Returns {bills, error}."""
         if not EMERGENT_LLM_KEY:
-            log.warning("EMERGENT_LLM_KEY not set; returning empty bill list")
-            return []
+            return {"bills": [], "error": "EMERGENT_LLM_KEY not configured"}
         try:
             from emergentintegrations.llm.chat import LlmChat, UserMessage
         except Exception as e:
-            log.error(f"emergentintegrations import failed: {e}")
-            return []
+            return {"bills": [], "error": f"emergentintegrations import failed: {e}"}
 
         prompt = (
             "You are extracting individual property bills from a multi-bill PDF. "
@@ -75,17 +73,16 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
             ).with_model("anthropic", "claude-sonnet-4-5-20250929")
             resp = await chat.send_message(UserMessage(text=prompt))
             text_resp = (resp or "").strip()
-            # strip code fences if present
             if text_resp.startswith("```"):
                 text_resp = text_resp.split("```", 2)[1]
                 if text_resp.startswith("json"):
                     text_resp = text_resp[4:]
                 text_resp = text_resp.rsplit("```", 1)[0].strip()
             data = json.loads(text_resp)
-            return data.get("bills", []) or []
+            return {"bills": data.get("bills", []) or [], "error": None}
         except Exception as e:
             log.error(f"LLM bill split failed: {e}")
-            return []
+            return {"bills": [], "error": str(e)[:300]}
 
     @router.post("/bills/upload")
     async def upload_bill_pdf(file: UploadFile = File(...), user: dict = Depends(current_user)):
@@ -101,7 +98,9 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
             raise HTTPException(400, "PDF has no extractable text (scanned image?)")
 
         batch_id = _new_id()
-        bills = await llm_split_bills(text)
+        result = await llm_split_bills(text)
+        bills = result["bills"]
+        llm_error = result["error"]
         rows = []
         for b in bills:
             rows.append({
@@ -127,10 +126,13 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
             "page_count": page_count,
             "bill_count": len(rows),
             "uploaded_by": user.get("email"),
+            "llm_error": llm_error,
             "created_at": _iso(_now()),
         })
-        await audit("bills_uploaded", "bill_batch", batch_id, user, {"filename": file.filename, "bills": len(rows)})
-        return {"batch_id": batch_id, "bill_count": len(rows), "page_count": page_count}
+        await audit("bills_uploaded", "bill_batch", batch_id, user, {"filename": file.filename, "bills": len(rows), "llm_error": llm_error})
+        if llm_error and not rows:
+            raise HTTPException(502, f"AI extraction failed: {llm_error}. PDF text was readable but no bills were parsed. The batch was not saved.")
+        return {"batch_id": batch_id, "bill_count": len(rows), "page_count": page_count, "warning": llm_error}
 
     @router.get("/bills/batches")
     async def list_bill_batches(_: dict = Depends(current_user)):
@@ -371,6 +373,9 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
             targets = [{"id": r["id"], "phone": r.get("phone",""), "vars": r} for r in rows if r.get("phone")]
         else:
             raise HTTPException(400, "Provide bill_ids or contact_ids")
+
+        if not targets:
+            raise HTTPException(400, "No targets resolved (all rows missing phone numbers?)")
 
         camp_id = _new_id()
         await db.voice_campaigns.insert_one({

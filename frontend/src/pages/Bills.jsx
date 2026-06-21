@@ -44,11 +44,16 @@ export default function Bills() {
     const fd = new FormData(); fd.append("file", file);
     try {
       const { data } = await api.post("/bills/upload", fd, { headers: { "Content-Type": "multipart/form-data" } });
-      toast.success(`PDF parsed: ${data.bill_count} bills extracted from ${data.page_count} pages`);
+      if (data.warning) {
+        toast.warning(`Partial parse: ${data.warning.slice(0, 120)}`);
+      } else {
+        toast.success(`PDF parsed: ${data.bill_count} bills extracted from ${data.page_count} pages`);
+      }
       setBatchFilter(data.batch_id);
       loadAll();
     } catch (err) {
-      toast.error(err.response?.data?.detail || "Upload failed");
+      const detail = err.response?.data?.detail || "Upload failed";
+      toast.error(typeof detail === "string" ? detail.slice(0, 200) : "Upload failed");
     } finally { setUploading(false); }
   };
 
