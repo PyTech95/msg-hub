@@ -9,7 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { ChannelBadge } from "@/components/Badges";
-import { Upload, FileText, Send, Mail, MessageCircle, MessageSquare, Trash2, Loader2, Sparkles } from "lucide-react";
+import { Upload, FileText, Send, Mail, MessageCircle, MessageSquare, Trash2, Loader2, Sparkles, AlarmClock, CheckCircle2 } from "lucide-react";
 import { toast } from "sonner";
 
 const DEFAULT_TPL = "Dear {{name}}, your property bill #{{property_id}} for INR {{amount}} is due {{due_date}}. Please pay at the earliest.";
@@ -87,6 +87,26 @@ export default function Bills() {
     finally { setSending(false); }
   };
 
+  const enableReminders = async () => {
+    if (selected.size === 0) return toast.error("Select bills first");
+    if (!window.confirm(`Enable auto-reminders for ${selected.size} bill(s)?\n\n• T-7 days → SMS\n• T-3 days → WhatsApp\n• T-1 day → AI Voice call`)) return;
+    try {
+      const { data } = await api.post("/bills/enable-reminders", { bill_ids: Array.from(selected) });
+      toast.success(`Auto-reminders enabled on ${data.bills_enabled} bill(s) · ${data.created} schedule(s) created${data.skipped ? ` · ${data.skipped} skipped (no due date)` : ""}`);
+      setSelected(new Set());
+      loadAll();
+    } catch (err) { toast.error(err.response?.data?.detail || "Failed to enable reminders"); }
+  };
+
+  const markPaid = async (billId) => {
+    if (!window.confirm("Mark this bill as paid and cancel any pending reminders?")) return;
+    try {
+      const { data } = await api.post(`/bills/${billId}/mark-paid`);
+      toast.success(`Bill paid · cancelled ${data.cancelled} pending reminder(s)`);
+      loadAll();
+    } catch (err) { toast.error(err.response?.data?.detail || "Failed to mark paid"); }
+  };
+
   return (
     <div className="space-y-4" data-testid="bills-page">
       <div className="flex items-end justify-between flex-wrap gap-3">
@@ -143,6 +163,10 @@ export default function Bills() {
               onClick={() => { setSendChannel("email"); setSendOpen(true); }} data-testid="bills-send-email-button">
               <Mail className="h-4 w-4 text-amber-600" /> Email ({selected.size})
             </Button>
+            <Button variant="outline" disabled={selected.size === 0} className="rounded-sm gap-2"
+              onClick={enableReminders} data-testid="bills-enable-reminders-button">
+              <AlarmClock className="h-4 w-4 text-violet-600" /> Auto-Remind ({selected.size})
+            </Button>
           </div>
         </CardContent>
         <div className="overflow-x-auto">
@@ -156,6 +180,8 @@ export default function Bills() {
                 <th className="px-3 py-2">Due</th>
                 <th className="px-3 py-2">Phone / Email</th>
                 <th className="px-3 py-2">Sent</th>
+                <th className="px-3 py-2">Status</th>
+                <th className="px-3 py-2"></th>
               </tr>
             </thead>
             <tbody>
@@ -175,9 +201,25 @@ export default function Bills() {
                     {b.sent?.whatsapp && <Badge variant="outline" className="rounded-sm text-[10px] border-green-300 text-green-700">WA</Badge>}
                     {b.sent?.email && <Badge variant="outline" className="rounded-sm text-[10px] border-amber-300 text-amber-700">EMAIL</Badge>}
                   </td>
+                  <td className="px-3 py-2">
+                    {b.paid
+                      ? <Badge variant="outline" className="rounded-sm text-[10px] border-emerald-300 text-emerald-700">PAID</Badge>
+                      : b.auto_remind
+                        ? <Badge variant="outline" className="rounded-sm text-[10px] border-violet-300 text-violet-700">AUTO-REMIND</Badge>
+                        : <span className="text-[10px] text-muted-foreground">—</span>
+                    }
+                  </td>
+                  <td className="px-3 py-2 text-right">
+                    {!b.paid && (
+                      <Button size="sm" variant="ghost" className="rounded-sm h-7 px-2 gap-1 text-emerald-700 hover:text-emerald-800"
+                        onClick={() => markPaid(b.id)} data-testid={`bill-mark-paid-${b.id}`}>
+                        <CheckCircle2 className="h-3 w-3" /> Paid
+                      </Button>
+                    )}
+                  </td>
                 </tr>
               ))}
-              {bills.length === 0 && <tr><td colSpan={7} className="text-center text-muted-foreground py-10">No bills yet. Upload a PDF to extract them.</td></tr>}
+              {bills.length === 0 && <tr><td colSpan={9} className="text-center text-muted-foreground py-10">No bills yet. Upload a PDF to extract them.</td></tr>}
             </tbody>
           </table>
         </div>

@@ -19,6 +19,13 @@ async function downloadInvoiceCSV(month) {
   document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
 }
 
+async function downloadInvoicePDF(month) {
+  const res = await api.get(`/export/invoice/${month}.pdf`, { responseType: "blob" });
+  const url = URL.createObjectURL(new Blob([res.data], { type: "application/pdf" }));
+  const a = document.createElement("a"); a.href = url; a.download = `invoice-${month}.pdf`;
+  document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+}
+
 export default function Invoices() {
   const [data, setData] = useState(null);
   const [detail, setDetail] = useState(null);
@@ -82,6 +89,9 @@ export default function Invoices() {
                     </Button>
                     <Button variant="outline" size="sm" className="rounded-sm gap-1" onClick={() => downloadInvoiceCSV(inv.month)} data-testid={`csv-invoice-${inv.month}`}>
                       <FileDown className="h-3 w-3" /> CSV
+                    </Button>
+                    <Button variant="outline" size="sm" className="rounded-sm gap-1" onClick={() => downloadInvoicePDF(inv.month)} data-testid={`pdf-invoice-${inv.month}`}>
+                      <FileText className="h-3 w-3" /> PDF
                     </Button>
                     <Button variant="outline" size="sm" className="rounded-sm gap-1" onClick={() => downloadJson(`invoice-${inv.month}`, inv)} data-testid={`download-invoice-${inv.month}`}>
                       <Download className="h-3 w-3" /> JSON

@@ -3,7 +3,7 @@ import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import {
   LayoutDashboard, Users, FileText, Megaphone, MessageSquare, Phone,
   BarChart3, Plug, Webhook, UserCog, Settings, Inbox, Sun, Moon, LogOut,
-  Radio, ListChecks, ReceiptText, ScrollText, Sparkles, BotMessageSquare
+  Radio, ListChecks, ReceiptText, ScrollText, Sparkles, BotMessageSquare, AlarmClock
 } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { useTheme } from "@/contexts/ThemeContext";
@@ -25,6 +25,7 @@ const NAV = [
   { to: "/notices",       label: "Notices",       icon: ScrollText,      roles: ["super_admin","admin"] },
   { to: "/campaigns",     label: "Campaigns",     icon: Megaphone,       roles: ["super_admin","admin"] },
   { to: "/voice-campaigns", label: "Voice AI",    icon: BotMessageSquare, roles: ["super_admin","admin","agent"] },
+  { to: "/reminders",     label: "Reminders",     icon: AlarmClock,      roles: ["super_admin","admin"] },
   { to: "/conversations", label: "Conversations", icon: Inbox,           roles: ["super_admin","admin","agent"] },
   { to: "/messages",      label: "Message Logs",  icon: MessageSquare,   roles: ["super_admin","admin","agent"] },
   { to: "/calls",         label: "Voice Calls",   icon: Phone,           roles: ["super_admin","admin","agent"] },

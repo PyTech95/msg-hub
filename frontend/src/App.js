@@ -17,6 +17,7 @@ import Lists from "@/pages/Lists";
 import Bills from "@/pages/Bills";
 import Notices from "@/pages/Notices";
 import VoiceCampaigns from "@/pages/VoiceCampaigns";
+import SmartReminders from "@/pages/SmartReminders";
 import Conversations from "@/pages/Conversations";
 import MessageLogs from "@/pages/MessageLogs";
 import Calls from "@/pages/Calls";
@@ -51,6 +52,7 @@ export default function App() {
               <Route path="/bills" element={<Bills />} />
               <Route path="/notices" element={<RoleRoute allow={["super_admin","admin"]}><Notices /></RoleRoute>} />
               <Route path="/voice-campaigns" element={<VoiceCampaigns />} />
+              <Route path="/reminders" element={<RoleRoute allow={["super_admin","admin"]}><SmartReminders /></RoleRoute>} />
               <Route path="/conversations" element={<Conversations />} />
               <Route path="/messages" element={<MessageLogs />} />
               <Route path="/calls" element={<Calls />} />

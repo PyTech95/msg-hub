@@ -1,0 +1,40 @@
+{
+  "summary": "Iteration 6 testing: Smart Reminder Automation (T-7 SMS / T-3 WhatsApp / T-1 Voice) and Invoice PDF download. Created /app/backend/tests/test_iteration6.py with 15 pytest cases covering Smart Reminders happy path, no-due-date skip, schedule listing, upcoming enrichment, mark-paid cancellation, Invoice PDF (admin allowed / agent forbidden / CSV regression), and auth + bills/notices/voice/invoices regression. ALL 15 BACKEND TESTS PASS (3.23s). Frontend smoke-tested: /reminders renders with smart-reminders-page testid + cadence card showing T-7 / T-3 / T-1; empty-state shown when no pending reminders; Bills page shows Status column + Auto-Remind button (disabled when nothing selected, enables on row selection); Invoices page renders pdf-invoice-{month} button alongside CSV+JSON; nav-reminders visible to super_admin and HIDDEN to agent role.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/bills/upload", "issue": "Pre-existing from iter5 — EMERGENT_LLM_KEY budget exhausted in preview env causes silent zero-bill upload; endpoint exists and returns proper 422 when file missing. Not a regression; flagged in iter5 already."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration6.py",
+    "/app/test_reports/pytest/iteration6_results.xml"
+  ],
+  "action_items": [
+    "No blocking action items. The full backend contract for Smart Reminders and Invoice PDF is correctly implemented and matches the frontend wiring. Optional: surface LLM failures in /bills/upload (iter5 follow-up)."
+  ],
+  "critical_code_review_comments": [
+    "features.py is now ~648 lines covering 5 features + a background reminder_loop — getting close to the 700-line guideline. Consider splitting reminders + invoice-pdf into their own modules.",
+    "reminder_loop() in features.py runs as an unbounded asyncio.create_task; if the FastAPI app reloads under hot-reload the previous task is not cancelled, so two scheduler loops can run concurrently in dev. Use a lifespan event or an asyncio task registry for clean shutdown.",
+    "GET /api/reminders/upcoming is unbounded (limit 200 hard-coded) but does not paginate or filter by date range — at scale this should accept ?from=&to=&limit= parameters.",
+    "POST /api/bills/{id}/mark-paid does not verify the bill exists before flipping fields — calling with a fake id silently returns ok:true cancelled:0. Should 404 when bill not found.",
+    "POST /api/bills/enable-reminders returns 200 even when bill_ids is empty; UI guards this but the API itself should validate min_length=1 via Pydantic.",
+    "Invoice PDF HTML is built with raw string concatenation; channel names and markup come from settings so XSS risk is low, but consider Jinja2 with autoescape for safety.",
+    "EnableRemindersIn.steps optional override accepts arbitrary dict — no schema validation. A malformed step (missing channel/template/days_before) will crash the loop with KeyError mid-iteration, leaving partial schedules created. Validate via a pydantic submodel."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration6.py (NEW — 15 pytest cases)"
+  ],
+  "success_rate": {"backend": "100% (15/15 pass)", "frontend": "100% smoke (Reminders nav role-gated, Smart Reminders page with cadence + empty-state, Bills Status column + Auto-Remind + mark-paid buttons rendered, Invoices PDF buttons rendered alongside CSV/JSON)"},
+  "test_credentials": "admin@cpaas.io / Admin@12345 (super_admin), agent@cpaas.io / Agent@12345 (agent). Same as /app/memory/test_credentials.md.",
+  "seed_data_creation": "Test bills inserted into MongoDB cpaas_database.bills with id prefix TEST_ are cleaned up by the seeded_bill fixture teardown (also clears reminder_schedules for the bill). Two test no-due-date bills cleaned up inline. No residual test data left.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Smart Reminders + Invoice PDF backend (features.py lines 437-645) is fully working. Frontend wiring at /app/frontend/src/pages/SmartReminders.jsx, Bills.jsx, Invoices.jsx, AppLayout.jsx (nav item), App.js (RoleRoute) is correct. The reminder_schedules collection now holds 3 docs per enabled bill in pending state with the correct channels (sms/whatsapp/voice) and scheduled_at = due_date - {7,3,1} days. /api/export/invoice/{month}.pdf returns ~5-12KB application/pdf for admin and 403 for agent. CSV export unchanged. Bills.jsx UI was added one tiny note: the new 'Mark Paid' inline button only renders when !b.paid, and the Status column shows PAID / AUTO-REMIND / em-dash badges — all verified in browser test. Mock provider adapters still in use (no real Twilio/Gupshup). EMERGENT_LLM_KEY budget is still exhausted ($0.001 cap) — same env-issue from iter5; not a regression.",
+  "rca of the issue": "No new bugs identified in this iteration. All tested endpoints behave per spec. Code-review surfaced two improvement candidates worth tracking: (a) mark-paid should 404 when bill not found, (b) reminder_loop lacks lifespan-managed shutdown so hot-reload may run duplicate schedulers in dev."
+}
