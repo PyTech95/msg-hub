@@ -1290,7 +1290,7 @@ async def airtel_sms_dlr(request: _FRequest):
         raise HTTPException(401, "Invalid signature")
     airtel_id = payload.get("messageId") or payload.get("message_id")
     status_raw = (payload.get("status") or "").upper()
-    internal = _AIQ_SMS_MAP.get(status_raw, "delivered")
+    internal = _AIQ_SMS_MAP.get(status_raw, "sent")  # unknown → 'sent' (safe intermediate), not 'delivered'
     if airtel_id:
         msg = await db.messages.find_one({"provider_message_id": str(airtel_id)}, {"_id": 0})
         if msg:
@@ -1318,7 +1318,7 @@ async def airtel_whatsapp_inbound(request: _FRequest):
     if airtel_id and status_raw:
         msg = await db.messages.find_one({"provider_message_id": str(airtel_id)}, {"_id": 0})
         if msg:
-            await emit_event(msg["id"], _AIQ_SMS_MAP.get(status_raw, "delivered"),
+            await emit_event(msg["id"], _AIQ_SMS_MAP.get(status_raw, "sent"),
                              source="airtel_iq_whatsapp", raw_status=status_raw)
             return {"ok": True}
     # Case 2: inbound customer message
