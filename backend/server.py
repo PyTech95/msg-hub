@@ -43,7 +43,7 @@ ACCESS_TTL_MIN = 60 * 24  # 1 day for demo convenience
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
-app = FastAPI(title="NSTU API", version="1.0.0")
+app = FastAPI(title="tezsandesh.digital API", version="1.0.0")
 api = APIRouter(prefix="/api")
 
 app.add_middleware(
@@ -466,7 +466,7 @@ async def seed():
 
     # Templates
     templates = [
-        {"id": new_id(), "name": "Welcome SMS", "channel": "sms", "body": "Hi {{name}}, welcome to NSTU!", "variables": ["name"], "status": "approved", "category": "utility", "created_at": iso(now_utc())},
+        {"id": new_id(), "name": "Welcome SMS", "channel": "sms", "body": "Hi {{name}}, welcome to tezsandesh.digital!", "variables": ["name"], "status": "approved", "category": "utility", "created_at": iso(now_utc())},
         {"id": new_id(), "name": "WA Order Update", "channel": "whatsapp", "body": "Hello {{name}}, your order #{{order_id}} has shipped.", "variables": ["name","order_id"], "status": "approved", "category": "utility", "created_at": iso(now_utc())},
         {"id": new_id(), "name": "RCS Diwali Offer", "channel": "rcs", "body": "🪔 {{name}}, enjoy 30% off this Diwali!", "variables": ["name"], "status": "approved", "category": "marketing", "created_at": iso(now_utc())},
         {"id": new_id(), "name": "Voice OTP Verify", "channel": "voice", "body": "Your verification code is {{code}}", "variables": ["code"], "status": "approved", "category": "authentication", "created_at": iso(now_utc())},
@@ -690,7 +690,7 @@ async def totp_setup(user: dict = Depends(current_user)):
         raise HTTPException(400, "2FA already enabled. Disable first to rotate.")
     secret = pyotp.random_base32()
     await db.users.update_one({"id": user["id"]}, {"$set": {"totp_secret_pending": secret}})
-    uri = pyotp.TOTP(secret).provisioning_uri(name=user["email"], issuer_name="NSTU")
+    uri = pyotp.TOTP(secret).provisioning_uri(name=user["email"], issuer_name="tezsandesh.digital")
     # Render QR as data-URI SVG for inline display
     img = qrcode.make(uri, image_factory=qrcode.image.svg.SvgImage)
     buf = io.BytesIO(); img.save(buf)
@@ -1426,7 +1426,7 @@ async def export_invoice_csv(month: str, _: dict = Depends(require_roles("super_
         bm["billable"] = round(bm["base"] * (1 + bm["markup_pct"] / 100.0), 2)
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow([f"NSTU Invoice — {month}"])
+    w.writerow([f"tezsandesh.digital Invoice — {month}"])
     w.writerow([])
     w.writerow(["channel", "units", "base_INR", "markup_pct", "billable_INR"])
     total_base, total_bill = 0, 0
@@ -1478,7 +1478,7 @@ async def campaign_scheduler_loop():
 # ───────────────────────── Mount ─────────────────────────
 @api.get("/")
 async def root():
-    return {"name": "NSTU API", "version": "1.0.0", "status": "ok"}
+    return {"name": "tezsandesh.digital API", "version": "1.0.0", "status": "ok"}
 
 app.include_router(api)
 

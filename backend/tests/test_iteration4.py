@@ -214,7 +214,7 @@ class TestExports:
         assert r.status_code == 200, r.text
         assert r.headers.get("content-type", "").startswith("text/csv")
         body = r.text
-        assert f"NSTU Invoice" in body and month in body, f"missing header line: {body[:200]}"
+        assert f"tezsandesh.digital Invoice" in body and month in body, f"missing header line: {body[:200]}"
         # Per spec: TOTAL row at bottom
         lines = [ln for ln in body.strip().splitlines() if ln.strip()]
         assert lines[-1].startswith("TOTAL"), f"last line not TOTAL: {lines[-1]!r}"

@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { toast } from "sonner";
-import { Radio, ArrowRight } from "lucide-react";
+import { ArrowRight } from "lucide-react";
 
 export default function Login() {
   const { user, login } = useAuth();
@@ -61,11 +61,16 @@ export default function Login() {
         </div>
         <div className="relative z-10 p-12 flex flex-col justify-between">
           <div className="flex items-center gap-3">
-            <div className="h-10 w-10 grid place-items-center rounded-sm bg-white text-zinc-950">
-              <Radio className="h-5 w-5" strokeWidth={2.4} />
-            </div>
+            <img
+              src="https://customer-assets.emergentagent.com/job_msg-hub-59/artifacts/d0r1lby4_logo.png"
+              alt="tezsandesh.digital"
+              className="h-12 w-12 object-contain"
+            />
             <div>
-              <div className="text-xl font-black tracking-tight">NSTU</div>
+              <div className="text-xl font-black tracking-tight">
+                <span className="text-white">tez</span><span className="text-orange-500">sandesh</span>
+                <span className="text-[11px] text-zinc-400">.digital</span>
+              </div>
               <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-400">Unified Comms Console</div>
             </div>
           </div>
@@ -90,7 +95,7 @@ export default function Login() {
               ))}
             </div>
           </div>
-          <div className="text-[10px] uppercase tracking-[0.15em] text-zinc-500">© 2026 NSTU · Demo Build</div>
+          <div className="text-[10px] uppercase tracking-[0.15em] text-zinc-500">© 2026 tezsandesh.digital · Demo Build</div>
         </div>
       </div>
 

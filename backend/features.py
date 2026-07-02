@@ -614,7 +614,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
         html = f"""<!doctype html><html><body style="font-family: Georgia, serif; padding: 48px; color: #111; max-width: 800px;">
           <div style="border-bottom: 4px solid #000; padding-bottom: 12px; margin-bottom: 32px; display:flex; justify-content:space-between; align-items:flex-end;">
             <div>
-              <div style="text-transform: uppercase; letter-spacing: 0.2em; font-size: 11px; color:#666;">NSTU · Communications Platform</div>
+              <div style="text-transform: uppercase; letter-spacing: 0.2em; font-size: 11px; color:#F97316;">tezsandesh.digital · Communications Platform</div>
               <h1 style="margin: 4px 0 0; font-size: 32px; letter-spacing:-0.02em;">INVOICE</h1>
             </div>
             <div style="text-align:right;">
