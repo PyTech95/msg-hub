@@ -298,6 +298,19 @@ ADAPTERS: Dict[str, BaseAdapter] = {
     "email": EmailAdapter(),
 }
 
+# ── Airtel IQ live adapters (transparent mock fallback when creds absent) ────
+try:
+    from adapters.airtel_iq import build_adapters as _aiq_build, AirtelIQConfig as _AIQCfg
+    _aiq = _aiq_build(BaseAdapter)
+    ADAPTERS["sms"] = _aiq["sms"]
+    ADAPTERS["whatsapp"] = _aiq["whatsapp"]
+    ADAPTERS["voice"] = _aiq["voice"]
+    AIRTEL_IQ_CFG: Optional[_AIQCfg] = _aiq["cfg"]
+    log.info("Airtel IQ adapters wired (live=%s)", AIRTEL_IQ_CFG.live)
+except Exception as _e:
+    log.warning("Airtel IQ adapter init skipped: %s", _e)
+    AIRTEL_IQ_CFG = None
+
 PRICING = {"sms": 0.25, "whatsapp": 0.40, "rcs": 0.50, "voice": 1.20, "email": 0.10}  # INR per unit (msg or min)
 
 async def emit_event(message_id: str, event_type: str, **extra):
@@ -475,6 +488,15 @@ async def seed():
 
     # Providers
     providers = [
+        {"id": new_id(), "name": "Airtel IQ SMS", "channel": "sms", "provider_key": "airtel_iq",
+         "config": {"docs": "https://www.airtel.in/business/b2b/airtel-iq/api-docs/sms/sms-utility"},
+         "credentials": {}, "is_active": True, "mock": True, "created_at": iso(now_utc())},
+        {"id": new_id(), "name": "Airtel IQ WhatsApp", "channel": "whatsapp", "provider_key": "airtel_iq",
+         "config": {"docs": "https://www.airtel.in/b2b/whatsapp-api"},
+         "credentials": {}, "is_active": True, "mock": True, "created_at": iso(now_utc())},
+        {"id": new_id(), "name": "Airtel IQ Voice", "channel": "voice", "provider_key": "airtel_iq",
+         "config": {"docs": "https://www.airtel.in/business/b2b/airtel-iq/api-docs/voice/callflow-api"},
+         "credentials": {}, "is_active": True, "mock": True, "created_at": iso(now_utc())},
         {"id": new_id(), "name": "Twilio SMS (Mock)", "channel": "sms", "provider_key": "twilio", "config": {"sid": "ACxxx", "from": "+15005550006"}, "is_active": True, "mock": True, "created_at": iso(now_utc())},
         {"id": new_id(), "name": "Gupshup WhatsApp (Mock)", "channel": "whatsapp", "provider_key": "gupshup", "config": {"app_name": "demo"}, "is_active": True, "mock": True, "created_at": iso(now_utc())},
         {"id": new_id(), "name": "Google RBM (Mock)", "channel": "rcs", "provider_key": "rbm", "config": {"agent_id": "demo-agent"}, "is_active": True, "mock": True, "created_at": iso(now_utc())},
@@ -1230,6 +1252,131 @@ async def webhook_incoming(channel: Channel, body: Dict[str, Any]):
 @api.get("/webhooks/events")
 async def list_webhook_events(limit: int = 100, _: dict = Depends(current_user)):
     return await db.webhook_events.find({}, {"_id": 0}).sort("created_at", -1).limit(limit).to_list(limit)
+
+# ─────────── Airtel IQ webhook endpoints (DLR / inbound / voice status) ─────
+from fastapi import Request as _FRequest
+try:
+    from adapters.airtel_iq import (
+        verify_signature as _aiq_verify,
+        AIRTEL_SMS_STATUS_MAP as _AIQ_SMS_MAP,
+        AIRTEL_VOICE_STATUS_MAP as _AIQ_VOICE_MAP,
+    )
+except Exception:
+    _aiq_verify = None
+    _AIQ_SMS_MAP = {}
+    _AIQ_VOICE_MAP = {}
+
+def _aiq_signature_ok(req: _FRequest, raw: bytes) -> bool:
+    """Verify Airtel-provided HMAC signature; in demo (mock) mode accept all."""
+    if not AIRTEL_IQ_CFG or not AIRTEL_IQ_CFG.live or not AIRTEL_IQ_CFG.webhook_secret:
+        return True
+    sig = req.headers.get("X-Airtel-Signature") or req.headers.get("x-airtel-signature") or ""
+    return bool(_aiq_verify and _aiq_verify(AIRTEL_IQ_CFG.webhook_secret, raw, sig))
+
+@api.post("/webhooks/airtel/sms/dlr")
+async def airtel_sms_dlr(request: _FRequest):
+    """Airtel IQ SMS Delivery Report — updates message status."""
+    raw = await request.body()
+    sig_ok = _aiq_signature_ok(request, raw)
+    payload = await request.json() if raw else {}
+    ev = {
+        "id": new_id(), "channel": "sms",
+        "event_type": (payload.get("status") or "delivered").lower(),
+        "payload": payload, "signature_valid": sig_ok, "processed": sig_ok,
+        "created_at": iso(now_utc()),
+    }
+    await db.webhook_events.insert_one(ev)
+    if not sig_ok:
+        raise HTTPException(401, "Invalid signature")
+    airtel_id = payload.get("messageId") or payload.get("message_id")
+    status_raw = (payload.get("status") or "").upper()
+    internal = _AIQ_SMS_MAP.get(status_raw, "delivered")
+    if airtel_id:
+        msg = await db.messages.find_one({"provider_message_id": str(airtel_id)}, {"_id": 0})
+        if msg:
+            await emit_event(msg["id"], internal, source="airtel_iq", raw_status=status_raw,
+                             description=payload.get("statusDescription"))
+    return {"ok": True}
+
+@api.post("/webhooks/airtel/whatsapp/inbound")
+async def airtel_whatsapp_inbound(request: _FRequest):
+    """Airtel IQ WhatsApp inbound message OR status update."""
+    raw = await request.body()
+    sig_ok = _aiq_signature_ok(request, raw)
+    payload = await request.json() if raw else {}
+    await db.webhook_events.insert_one({
+        "id": new_id(), "channel": "whatsapp",
+        "event_type": payload.get("event") or payload.get("type") or "received",
+        "payload": payload, "signature_valid": sig_ok, "processed": sig_ok,
+        "created_at": iso(now_utc()),
+    })
+    if not sig_ok:
+        raise HTTPException(401, "Invalid signature")
+    # Case 1: outbound status update
+    airtel_id = payload.get("messageId") or payload.get("wa_message_id")
+    status_raw = (payload.get("status") or "").upper()
+    if airtel_id and status_raw:
+        msg = await db.messages.find_one({"provider_message_id": str(airtel_id)}, {"_id": 0})
+        if msg:
+            await emit_event(msg["id"], _AIQ_SMS_MAP.get(status_raw, "delivered"),
+                             source="airtel_iq_whatsapp", raw_status=status_raw)
+            return {"ok": True}
+    # Case 2: inbound customer message
+    frm = payload.get("from") or payload.get("mobileNumber")
+    body_txt = (payload.get("text") or {}).get("body") if isinstance(payload.get("text"), dict) else payload.get("body")
+    if frm and body_txt:
+        contact = await db.contacts.find_one({"phone": frm}, {"_id": 0})
+        cid = contact["id"] if contact else None
+        if not cid:
+            cid = new_id()
+            await db.contacts.insert_one({
+                "id": cid, "name": frm, "phone": frm, "email": None, "tags": ["wa-inbound"],
+                "opted_out": False, "created_at": iso(now_utc()),
+            })
+        inbound = {
+            "id": new_id(), "channel": "whatsapp", "contact_id": cid, "direction": "inbound",
+            "body": body_txt, "status": "received",
+            "provider_message_id": f"aq_in_{secrets.token_hex(6)}",
+            "campaign_id": None,
+            "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
+        }
+        await db.messages.insert_one(inbound)
+        await db.conversations.update_one(
+            {"contact_id": cid, "channel": "whatsapp"},
+            {"$set": {"last_message_at": iso(now_utc()), "last_message": body_txt, "unread": True}},
+            upsert=True,
+        )
+    return {"ok": True}
+
+@api.post("/webhooks/airtel/voice/status")
+async def airtel_voice_status(request: _FRequest):
+    """Airtel IQ Voice call status update."""
+    raw = await request.body()
+    sig_ok = _aiq_signature_ok(request, raw)
+    payload = await request.json() if raw else {}
+    await db.webhook_events.insert_one({
+        "id": new_id(), "channel": "voice",
+        "event_type": (payload.get("status") or "completed").lower(),
+        "payload": payload, "signature_valid": sig_ok, "processed": sig_ok,
+        "created_at": iso(now_utc()),
+    })
+    if not sig_ok:
+        raise HTTPException(401, "Invalid signature")
+    airtel_call_id = payload.get("callId") or payload.get("call_id")
+    status_raw = (payload.get("status") or "").upper()
+    internal = _AIQ_VOICE_MAP.get(status_raw, "completed")
+    if airtel_call_id:
+        call = await db.call_logs.find_one({"provider_call_id": str(airtel_call_id)}, {"_id": 0})
+        if call:
+            upd: Dict[str, Any] = {"status": internal, "ended_at": iso(now_utc())}
+            if payload.get("duration"):
+                try: upd["duration_sec"] = int(payload["duration"])
+                except Exception: pass
+            if payload.get("recordingUrl"):
+                upd["recording_url"] = payload["recordingUrl"]
+            await db.call_logs.update_one({"id": call["id"]}, {"$set": upd})
+    return {"ok": True}
+
 
 # ───────────────────────── Usage / Billing ─────────────────────────
 @api.get("/usage/summary")
