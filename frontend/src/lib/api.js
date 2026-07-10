@@ -1,6 +1,8 @@
 import axios from "axios";
 
-export const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+// Empty/unset REACT_APP_BACKEND_URL → same-origin relative "/api" (production VPS)
+const BASE = (process.env.REACT_APP_BACKEND_URL || "").replace(/\/$/, "");
+export const API = `${BASE}/api`;
 
 const api = axios.create({
   baseURL: API,

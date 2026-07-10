@@ -469,7 +469,9 @@ async def seed():
             "credentials": {}, "is_active": True, "mock": True, "created_at": iso(now_utc()),
         })
 
-    # Only seed sample data once
+    # Demo sample data — only in demo mode, and only once
+    if (os.environ.get("DEMO_MODE") or "true").strip().lower() != "true":
+        return
     if await db.contacts.count_documents({}) > 0:
         return
 
@@ -1502,9 +1504,11 @@ async def meta_whatsapp_webhook(request: _FRequest):
         "signature_valid": sig_ok, "processed": sig_ok, "created_at": iso(now_utc()),
     })
     if not sig_ok:
+        log.warning("Meta WA webhook: invalid X-Hub-Signature-256, rejecting")
         raise HTTPException(401, "Invalid signature")
     if payload.get("object") != "whatsapp_business_account":
         return {"status": "ignored"}
+    n_status, n_inbound = 0, 0
     for entry in payload.get("entry", []) or []:
         for change in entry.get("changes", []) or []:
             if change.get("field") != "messages":
@@ -1512,8 +1516,11 @@ async def meta_whatsapp_webhook(request: _FRequest):
             value = change.get("value", {}) or {}
             for st in value.get("statuses", []) or []:
                 await _meta_handle_status(st)
+                n_status += 1
             for m in value.get("messages", []) or []:
                 await _meta_handle_inbound(m, value.get("contacts", []) or [])
+                n_inbound += 1
+    log.info("Meta WA webhook processed: %s status update(s), %s inbound message(s)", n_status, n_inbound)
     return {"status": "received"}
 
 class WhatsAppSendIn(BaseModel):

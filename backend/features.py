@@ -583,7 +583,9 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
                 log.error(f"reminder loop error: {e}")
             await asyncio.sleep(60)
 
-    asyncio.create_task(reminder_loop())
+    @router.on_event("startup")
+    async def _start_reminder_loop():
+        asyncio.create_task(reminder_loop())
 
     # =====================================================================
     # FEATURE 5 — Invoice PDF download (WeasyPrint)

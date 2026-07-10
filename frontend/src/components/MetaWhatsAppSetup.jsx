@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Copy, Check, Send, MessageCircle, CheckCircle2, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || window.location.origin;
 
 function CopyField({ label, value, testId }) {
   const [copied, setCopied] = useState(false);

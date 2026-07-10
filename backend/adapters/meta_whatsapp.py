@@ -40,6 +40,20 @@ def _clean_number(to: str) -> str:
     return to.strip().lstrip("+").replace(" ", "").replace("-", "")
 
 
+def _demo_mode() -> bool:
+    return (os.environ.get("DEMO_MODE") or "true").strip().lower() == "true"
+
+
+def _mock_or_fail() -> Dict[str, Any]:
+    """Mock fallback in demo mode; hard failure in production (DEMO_MODE=false)."""
+    if not _demo_mode():
+        raise RuntimeError(
+            "WhatsApp Cloud API credentials not configured — set WHATSAPP_ACCESS_TOKEN "
+            "and WHATSAPP_PHONE_NUMBER_ID in .env (or vault credentials with Mock OFF)"
+        )
+    return {"provider_message_id": f"mock_{secrets.token_hex(8)}", "accepted": True, "mode": "mock"}
+
+
 async def graph_post_message(creds: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{GRAPH_BASE}/{creds.get('graph_version', 'v22.0')}/{creds['phone_number_id']}/messages"
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -77,7 +91,7 @@ def build_adapter(BaseAdapter, creds_provider: Callable[[], Awaitable[Optional[D
         async def send(self, to: str, body: str, media_url: Optional[str] = None) -> Dict[str, Any]:
             creds = await creds_provider()
             if not creds:
-                return {"provider_message_id": f"mock_{secrets.token_hex(8)}", "accepted": True, "mode": "mock"}
+                return _mock_or_fail()
             to_clean = _clean_number(to)
             if media_url:
                 payload = {"messaging_product": "whatsapp", "to": to_clean, "type": "image",
@@ -85,8 +99,10 @@ def build_adapter(BaseAdapter, creds_provider: Callable[[], Awaitable[Optional[D
             else:
                 payload = {"messaging_product": "whatsapp", "to": to_clean, "type": "text",
                            "text": {"body": body, "preview_url": True}}
+            log.info("Meta WA send → %s (type=%s)", to_clean, "image" if media_url else "text")
             data = await graph_post_message(creds, payload)
             pid = ((data.get("messages") or [{}])[0]).get("id") or f"meta_{secrets.token_hex(8)}"
+            log.info("Meta WA accepted id=%s", pid)
             return {"provider_message_id": str(pid), "accepted": True, "mode": "live", "raw": data}
 
         async def send_template(self, to: str, template_name: str,
@@ -94,7 +110,7 @@ def build_adapter(BaseAdapter, creds_provider: Callable[[], Awaitable[Optional[D
                                 components: Optional[list] = None) -> Dict[str, Any]:
             creds = await creds_provider()
             if not creds:
-                return {"provider_message_id": f"mock_{secrets.token_hex(8)}", "accepted": True, "mode": "mock"}
+                return _mock_or_fail()
             template: Dict[str, Any] = {"name": template_name, "language": {"code": language_code}}
             if components:
                 template["components"] = components

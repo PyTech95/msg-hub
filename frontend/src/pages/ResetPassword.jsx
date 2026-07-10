@@ -35,7 +35,7 @@ export default function ResetPassword() {
         <CardHeader>
           <div className="flex items-center gap-2 mb-1">
             <img
-              src="https://customer-assets.emergentagent.com/job_msg-hub-59/artifacts/d0r1lby4_logo.png"
+              src="/logo.png"
               alt="tezsandesh.digital"
               className="h-8 w-8 object-contain"
             />

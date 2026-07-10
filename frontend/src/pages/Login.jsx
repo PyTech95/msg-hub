@@ -62,7 +62,7 @@ export default function Login() {
         <div className="relative z-10 p-12 flex flex-col justify-between">
           <div className="flex items-center gap-3">
             <img
-              src="https://customer-assets.emergentagent.com/job_msg-hub-59/artifacts/d0r1lby4_logo.png"
+              src="/logo.png"
               alt="tezsandesh.digital"
               className="h-12 w-12 object-contain"
             />

@@ -51,7 +51,7 @@ export default function AppLayout() {
       <aside className="hidden md:flex flex-col w-60 fixed inset-y-0 left-0 border-r border-border bg-card" data-testid="app-sidebar">
         <div className="h-14 flex items-center gap-2 px-4 border-b border-border">
           <img
-            src="https://customer-assets.emergentagent.com/job_msg-hub-59/artifacts/d0r1lby4_logo.png"
+            src="/logo.png"
             alt="tezsandesh.digital"
             className="h-9 w-9 object-contain shrink-0"
           />
@@ -88,7 +88,7 @@ export default function AppLayout() {
         <header className="h-14 sticky top-0 z-20 flex items-center justify-between gap-3 px-4 md:px-6 border-b border-border bg-background/80 backdrop-blur">
           <div className="md:hidden flex items-center gap-2">
             <img
-              src="https://customer-assets.emergentagent.com/job_msg-hub-59/artifacts/d0r1lby4_logo.png"
+              src="/logo.png"
               alt="tezsandesh.digital"
               className="h-8 w-8 object-contain"
             />
