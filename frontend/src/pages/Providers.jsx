@@ -11,9 +11,11 @@ import { ChannelBadge } from "@/components/Badges";
 import { Plus, Trash2, KeyRound, Pencil, PlugZap, Eye, EyeOff, CheckCircle2, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
+import { MetaWhatsAppSetup } from "@/components/MetaWhatsAppSetup";
 
 // Suggested credential schemas per provider so super admins know what to fill
 const CRED_SCHEMA = {
+  meta_whatsapp: [{ key: "access_token", label: "Access Token (Meta)", secret: true }, { key: "phone_number_id", label: "Phone Number ID" }, { key: "waba_id", label: "WABA ID (optional)" }],
   twilio:  [{ key: "account_sid", label: "Account SID" }, { key: "auth_token", label: "Auth Token", secret: true }, { key: "from", label: "From number / Sender ID" }],
   gupshup: [{ key: "api_key",     label: "API Key", secret: true }, { key: "app_name", label: "App Name" }, { key: "source", label: "Source number" }],
   exotel:  [{ key: "account_sid", label: "Account SID" }, { key: "api_key", label: "API Key", secret: true }, { key: "api_token", label: "API Token", secret: true }, { key: "from", label: "Caller ID" }],
@@ -126,6 +128,8 @@ export default function Providers() {
         <Button className="rounded-sm gap-2" onClick={openCreate} data-testid="new-provider-button"><Plus className="h-4 w-4" /> Add Provider</Button>
       </div>
 
+      <MetaWhatsAppSetup />
+
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
         {items.map(p => (
           <Card key={p.id} className="rounded-sm shadow-none" data-testid={`provider-card-${p.id}`}>
@@ -184,6 +188,7 @@ export default function Providers() {
                 <Label>Provider</Label>
                 <select value={form.provider_key} onChange={e=>setForm({...form,provider_key:e.target.value})}
                   className="h-9 w-full px-3 rounded-sm border border-border bg-background text-sm" data-testid="provider-key-select">
+                  <option value="meta_whatsapp">meta_whatsapp</option>
                   <option value="twilio">twilio</option>
                   <option value="gupshup">gupshup</option>
                   <option value="exotel">exotel</option>

@@ -311,6 +311,24 @@ except Exception as _e:
     log.warning("Airtel IQ adapter init skipped: %s", _e)
     AIRTEL_IQ_CFG = None
 
+# ── Meta WhatsApp Cloud API adapter (vault → env credentials; mock fallback) ──
+from adapters import meta_whatsapp as meta_wa
+
+async def meta_wa_credentials() -> Optional[Dict[str, str]]:
+    """Resolve live credentials: Provider Vault first, then env vars."""
+    p = await db.provider_accounts.find_one({"provider_key": "meta_whatsapp", "is_active": True}, {"_id": 0})
+    creds = (p or {}).get("credentials") or {}
+    if p and not p.get("mock", True) and creds.get("access_token") and creds.get("phone_number_id"):
+        return {
+            "access_token": creds["access_token"],
+            "phone_number_id": creds["phone_number_id"],
+            "graph_version": creds.get("graph_version") or os.environ.get("GRAPH_API_VERSION") or "v22.0",
+        }
+    return meta_wa.env_config()
+
+ADAPTERS["whatsapp"] = meta_wa.build_adapter(BaseAdapter, meta_wa_credentials)
+log.info("Meta WhatsApp Cloud adapter wired (env_live=%s)", bool(meta_wa.env_config()))
+
 PRICING = {"sms": 0.25, "whatsapp": 0.40, "rcs": 0.50, "voice": 1.20, "email": 0.10}  # INR per unit (msg or min)
 
 async def emit_event(message_id: str, event_type: str, **extra):
@@ -439,6 +457,16 @@ async def seed():
             "key": "markup_pct",
             "value": {"sms": 20, "whatsapp": 25, "rcs": 30, "voice": 15},
             "updated_at": iso(now_utc()),
+        })
+
+    # Meta WhatsApp Cloud provider entry (idempotent)
+    if not await db.provider_accounts.find_one({"provider_key": "meta_whatsapp"}):
+        await db.provider_accounts.insert_one({
+            "id": new_id(), "name": "Meta WhatsApp Cloud", "channel": "whatsapp",
+            "provider_key": "meta_whatsapp",
+            "config": {"docs": "https://developers.facebook.com/docs/whatsapp/cloud-api",
+                       "webhook_path": "/api/webhook/whatsapp"},
+            "credentials": {}, "is_active": True, "mock": True, "created_at": iso(now_utc()),
         })
 
     # Only seed sample data once
@@ -1048,7 +1076,14 @@ async def run_campaign(campaign_id: str, channel: Channel, tpl: dict, audience: 
             {"contact_id": c["id"], "channel": channel},
             {"$set": {"last_message_at": iso(now_utc()), "last_message": body}}, upsert=True,
         )
-        asyncio.create_task(deliver_message(mid, channel))
+        if resp.get("mode") == "live":
+            await emit_event(mid, "sent", source=getattr(adapter, "provider_key", "live"))
+            await db.usage_records.insert_one({
+                "id": new_id(), "channel": channel, "message_id": mid, "units": 1,
+                "amount": PRICING[channel], "currency": "INR", "created_at": iso(now_utc()),
+            })
+        else:
+            asyncio.create_task(deliver_message(mid, channel))
         await asyncio.sleep(0.05)
     await db.campaigns.update_one({"id": campaign_id}, {"$set": {"status": "completed", "completed_at": iso(now_utc())}})
 
@@ -1376,6 +1411,174 @@ async def airtel_voice_status(request: _FRequest):
                 upd["recording_url"] = payload["recordingUrl"]
             await db.call_logs.update_one({"id": call["id"]}, {"$set": upd})
     return {"ok": True}
+
+
+# ─────────── Meta WhatsApp Cloud API — webhooks + direct send ───────────
+from fastapi.responses import PlainTextResponse
+
+@api.get("/webhook/whatsapp")
+async def meta_whatsapp_verify(request: _FRequest):
+    """Meta webhook verification handshake (hub.challenge)."""
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+    expected = (os.environ.get("WHATSAPP_VERIFY_TOKEN") or "").strip()
+    if mode == "subscribe" and expected and token == expected and challenge:
+        return PlainTextResponse(content=challenge, status_code=200)
+    raise HTTPException(403, "Webhook verification failed")
+
+async def _meta_handle_status(st: Dict[str, Any]):
+    pid = st.get("id")
+    if not pid:
+        return
+    raw_status = (st.get("status") or "").lower()
+    internal = meta_wa.META_STATUS_MAP.get(raw_status, "sent")
+    msg = await db.messages.find_one({"provider_message_id": str(pid)}, {"_id": 0})
+    if msg:
+        extra: Dict[str, Any] = {"source": "meta_whatsapp", "raw_status": raw_status}
+        if st.get("errors"):
+            extra["errors"] = st["errors"]
+        await emit_event(msg["id"], internal, **extra)
+
+async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict]):
+    pid = m.get("id")
+    if pid and await db.messages.find_one({"provider_message_id": str(pid)}):
+        return  # already processed (Meta retries webhooks)
+    frm = m.get("from") or ""
+    phone = frm if frm.startswith("+") else f"+{frm}"
+    msg_type = m.get("type")
+    if msg_type == "text":
+        body_txt = (m.get("text") or {}).get("body") or ""
+    elif msg_type == "button":
+        body_txt = (m.get("button") or {}).get("text") or ""
+    elif msg_type == "interactive":
+        inter = m.get("interactive") or {}
+        body_txt = ((inter.get("button_reply") or inter.get("list_reply") or {}).get("title")) or "[interactive reply]"
+    else:
+        body_txt = f"[{msg_type} message]"
+    profile_name = ""
+    for c in contacts_info:
+        if c.get("wa_id") == frm:
+            profile_name = (c.get("profile") or {}).get("name") or ""
+    contact = await db.contacts.find_one({"phone": {"$in": [phone, frm]}}, {"_id": 0})
+    if contact:
+        cid = contact["id"]
+    else:
+        cid = new_id()
+        await db.contacts.insert_one({
+            "id": cid, "name": profile_name or phone, "phone": phone, "email": None,
+            "tags": ["wa-inbound"], "list_ids": [], "dnd": False, "opted_out": False,
+            "notes": "", "custom_fields": {}, "created_at": iso(now_utc()),
+        })
+    inbound = {
+        "id": new_id(), "channel": "whatsapp", "contact_id": cid, "direction": "inbound",
+        "body": body_txt, "status": "received",
+        "provider_message_id": str(pid) if pid else f"meta_in_{secrets.token_hex(6)}",
+        "campaign_id": None, "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
+    }
+    await db.messages.insert_one(inbound)
+    await db.message_events.insert_one({
+        "id": new_id(), "message_id": inbound["id"], "type": "received",
+        "payload": {"body": body_txt, "source": "meta_whatsapp"}, "created_at": iso(now_utc()),
+    })
+    await db.conversations.update_one(
+        {"contact_id": cid, "channel": "whatsapp"},
+        {"$set": {"last_message_at": iso(now_utc()), "last_message": body_txt, "unread": True}},
+        upsert=True,
+    )
+    if body_txt.strip().upper() == "STOP":
+        await db.contacts.update_one({"id": cid}, {"$set": {"opted_out": True}})
+
+@api.post("/webhook/whatsapp")
+async def meta_whatsapp_webhook(request: _FRequest):
+    """Receives Meta Cloud API events: inbound messages + delivery statuses."""
+    raw = await request.body()
+    app_secret = (os.environ.get("WHATSAPP_APP_SECRET") or "").strip()
+    sig_ok = meta_wa.verify_meta_signature(app_secret, raw, request.headers.get("X-Hub-Signature-256") or "")
+    payload = await request.json() if raw else {}
+    await db.webhook_events.insert_one({
+        "id": new_id(), "channel": "whatsapp", "provider": "meta_whatsapp",
+        "event_type": "meta_webhook", "payload": payload,
+        "signature_valid": sig_ok, "processed": sig_ok, "created_at": iso(now_utc()),
+    })
+    if not sig_ok:
+        raise HTTPException(401, "Invalid signature")
+    if payload.get("object") != "whatsapp_business_account":
+        return {"status": "ignored"}
+    for entry in payload.get("entry", []) or []:
+        for change in entry.get("changes", []) or []:
+            if change.get("field") != "messages":
+                continue
+            value = change.get("value", {}) or {}
+            for st in value.get("statuses", []) or []:
+                await _meta_handle_status(st)
+            for m in value.get("messages", []) or []:
+                await _meta_handle_inbound(m, value.get("contacts", []) or [])
+    return {"status": "received"}
+
+class WhatsAppSendIn(BaseModel):
+    to: str
+    message: str
+    media_url: Optional[str] = None
+
+@api.post("/whatsapp/send-message")
+async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTasks, user: dict = Depends(current_user)):
+    phone = body.to.strip()
+    if not phone.startswith("+"):
+        phone = f"+{phone}"
+    contact = await db.contacts.find_one({"phone": {"$in": [phone, phone.lstrip('+')]}}, {"_id": 0})
+    if contact and contact.get("opted_out"):
+        raise HTTPException(400, "Contact has opted out")
+    if contact:
+        cid = contact["id"]
+    else:
+        cid = new_id()
+        await db.contacts.insert_one({
+            "id": cid, "name": phone, "phone": phone, "email": None, "tags": ["wa-direct"],
+            "list_ids": [], "dnd": False, "opted_out": False, "notes": "", "custom_fields": {},
+            "created_at": iso(now_utc()),
+        })
+    mid = new_id()
+    await db.messages.insert_one({
+        "id": mid, "channel": "whatsapp", "contact_id": cid, "direction": "outbound",
+        "body": body.message, "media_url": body.media_url, "status": "queued",
+        "provider_message_id": None, "campaign_id": None,
+        "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
+    })
+    try:
+        resp = await ADAPTERS["whatsapp"].send(phone, body.message, body.media_url)
+    except Exception as e:
+        await emit_event(mid, "failed", reason=str(e), source="meta_whatsapp")
+        raise HTTPException(502, f"WhatsApp send failed: {e}")
+    await db.messages.update_one({"id": mid}, {"$set": {"provider_message_id": resp["provider_message_id"]}})
+    await db.conversations.update_one(
+        {"contact_id": cid, "channel": "whatsapp"},
+        {"$set": {"last_message_at": iso(now_utc()), "last_message": body.message}}, upsert=True,
+    )
+    if resp.get("mode") == "live":
+        await emit_event(mid, "sent", source="meta_whatsapp")
+        await db.usage_records.insert_one({
+            "id": new_id(), "channel": "whatsapp", "message_id": mid, "units": 1,
+            "amount": PRICING["whatsapp"], "currency": "INR", "created_at": iso(now_utc()),
+        })
+    else:
+        background.add_task(deliver_message, mid, "whatsapp")
+    return {"message_id": mid, "provider_message_id": resp["provider_message_id"],
+            "mode": resp.get("mode"), "status": "sent" if resp.get("mode") == "live" else "queued"}
+
+@api.get("/whatsapp/setup")
+async def whatsapp_setup(_: dict = Depends(require_roles("super_admin", "admin"))):
+    """Setup info for configuring the Callback URL + Verify Token in the Meta dashboard."""
+    creds = await meta_wa_credentials()
+    return {
+        "webhook_path": "/api/webhook/whatsapp",
+        "verify_token": (os.environ.get("WHATSAPP_VERIFY_TOKEN") or "").strip(),
+        "graph_version": os.environ.get("GRAPH_API_VERSION") or "v22.0",
+        "env_configured": bool(meta_wa.env_config()),
+        "live": bool(creds),
+        "phone_number_id": (creds or {}).get("phone_number_id", ""),
+        "signature_check_enabled": bool((os.environ.get("WHATSAPP_APP_SECRET") or "").strip()),
+    }
 
 
 # ───────────────────────── Usage / Billing ─────────────────────────
