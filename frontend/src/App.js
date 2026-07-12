@@ -25,6 +25,7 @@ import Reports from "@/pages/Reports";
 import Providers from "@/pages/Providers";
 import Webhooks from "@/pages/Webhooks";
 import Team from "@/pages/Team";
+import Companies from "@/pages/Companies";
 import AuditLogs from "@/pages/AuditLogs";
 import Invoices from "@/pages/Invoices";
 import Settings from "@/pages/Settings";
@@ -59,7 +60,8 @@ export default function App() {
               <Route path="/reports" element={<RoleRoute allow={["super_admin","admin"]}><Reports /></RoleRoute>} />
               <Route path="/providers" element={<RoleRoute allow={["super_admin","admin"]}><Providers /></RoleRoute>} />
               <Route path="/webhooks" element={<RoleRoute allow={["super_admin","admin"]}><Webhooks /></RoleRoute>} />
-              <Route path="/team" element={<RoleRoute allow={["super_admin"]}><Team /></RoleRoute>} />
+              <Route path="/team" element={<RoleRoute allow={["super_admin","admin"]}><Team /></RoleRoute>} />
+              <Route path="/companies" element={<RoleRoute allow={["super_admin"]}><Companies /></RoleRoute>} />
               <Route path="/audit-logs" element={<RoleRoute allow={["super_admin","admin"]}><AuditLogs /></RoleRoute>} />
               <Route path="/invoices" element={<RoleRoute allow={["super_admin","admin"]}><Invoices /></RoleRoute>} />
               <Route path="/settings" element={<Settings />} />

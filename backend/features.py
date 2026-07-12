@@ -35,7 +35,7 @@ def _new_id() -> str:
     return str(uuid.uuid4())
 
 
-def build_features_router(*, db, current_user, require_roles, audit, emit_event, ADAPTERS):
+def build_features_router(*, db, current_user, require_roles, audit, emit_event, ADAPTERS, cflt):
     """Wire the features router. Pass in references to the main app's dependencies."""
     router = APIRouter(prefix="/api")
 
@@ -115,6 +115,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
                 "due_date": (b.get("due_date") or "").strip(),
                 "raw": (b.get("raw") or "").strip(),
                 "sent": {"sms": False, "whatsapp": False, "email": False},
+                "company_id": user.get("company_id"),
                 "created_at": _iso(_now()),
             })
         if rows:
@@ -135,20 +136,20 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
         return {"batch_id": batch_id, "bill_count": len(rows), "page_count": page_count, "warning": llm_error}
 
     @router.get("/bills/batches")
-    async def list_bill_batches(_: dict = Depends(current_user)):
-        return await db.bill_batches.find({}, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
+    async def list_bill_batches(user: dict = Depends(current_user)):
+        return await db.bill_batches.find(cflt(user), {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
 
     @router.get("/bills")
-    async def list_bills(batch_id: Optional[str] = None, _: dict = Depends(current_user)):
-        flt: Dict[str, Any] = {}
+    async def list_bills(batch_id: Optional[str] = None, user: dict = Depends(current_user)):
+        flt: Dict[str, Any] = cflt(user)
         if batch_id:
             flt["batch_id"] = batch_id
         return await db.bills.find(flt, {"_id": 0}).sort("created_at", -1).limit(2000).to_list(2000)
 
     @router.delete("/bills/batches/{batch_id}")
     async def delete_bill_batch(batch_id: str, user: dict = Depends(require_roles("super_admin","admin"))):
-        await db.bills.delete_many({"batch_id": batch_id})
-        await db.bill_batches.delete_one({"id": batch_id})
+        await db.bills.delete_many(cflt(user, {"batch_id": batch_id}))
+        await db.bill_batches.delete_one(cflt(user, {"id": batch_id}))
         await audit("bill_batch_deleted", "bill_batch", batch_id, user)
         return {"ok": True}
 
@@ -176,7 +177,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
     async def send_bills(body: BillSendIn, user: dict = Depends(current_user)):
         if body.channel not in ("sms", "whatsapp", "email"):
             raise HTTPException(400, "channel must be sms | whatsapp | email")
-        bills = await db.bills.find({"id": {"$in": body.bill_ids}}, {"_id": 0}).to_list(len(body.bill_ids))
+        bills = await db.bills.find(cflt(user, {"id": {"$in": body.bill_ids}}), {"_id": 0}).to_list(len(body.bill_ids))
         sent, skipped = 0, 0
         for b in bills:
             recipient = b.get("email") if body.channel == "email" else b.get("phone")
@@ -188,7 +189,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
                 "id": mid, "channel": body.channel, "contact_id": b["id"],
                 "direction": "outbound", "body": body_text,
                 "status": "queued", "provider_message_id": None,
-                "campaign_id": None,
+                "campaign_id": None, "company_id": user.get("company_id"),
                 "meta": {"bill_id": b["id"], "subject": body.subject},
                 "created_at": _iso(_now()), "updated_at": _iso(_now()),
             })
@@ -222,14 +223,15 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
         description: Optional[str] = ""
 
     @router.get("/notice-templates")
-    async def list_notice_tpls(_: dict = Depends(current_user)):
-        return await db.notice_templates.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    async def list_notice_tpls(user: dict = Depends(current_user)):
+        return await db.notice_templates.find(cflt(user), {"_id": 0}).sort("created_at", -1).to_list(200)
 
     @router.post("/notice-templates")
     async def create_notice_tpl(body: NoticeTemplateIn, user: dict = Depends(require_roles("super_admin","admin"))):
         doc = body.model_dump()
         doc["id"] = _new_id()
         doc["created_by"] = user.get("email")
+        doc["company_id"] = user.get("company_id")
         doc["created_at"] = _iso(_now())
         await db.notice_templates.insert_one(doc)
         doc.pop("_id", None)
@@ -238,12 +240,12 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
 
     @router.patch("/notice-templates/{tpl_id}")
     async def update_notice_tpl(tpl_id: str, body: NoticeTemplateIn, user: dict = Depends(require_roles("super_admin","admin"))):
-        await db.notice_templates.update_one({"id": tpl_id}, {"$set": body.model_dump()})
-        return await db.notice_templates.find_one({"id": tpl_id}, {"_id": 0})
+        await db.notice_templates.update_one(cflt(user, {"id": tpl_id}), {"$set": body.model_dump()})
+        return await db.notice_templates.find_one(cflt(user, {"id": tpl_id}), {"_id": 0})
 
     @router.delete("/notice-templates/{tpl_id}")
     async def delete_notice_tpl(tpl_id: str, user: dict = Depends(require_roles("super_admin","admin"))):
-        await db.notice_templates.delete_one({"id": tpl_id})
+        await db.notice_templates.delete_one(cflt(user, {"id": tpl_id}))
         await audit("notice_template_deleted", "notice_template", tpl_id, user)
         return {"ok": True}
 
@@ -258,9 +260,9 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
         return HTML(string=html).write_pdf()
 
     @router.post("/notices/preview")
-    async def preview_notice(payload: Dict[str, Any], _: dict = Depends(current_user)):
+    async def preview_notice(payload: Dict[str, Any], user: dict = Depends(current_user)):
         """payload = {template_id, variables: {...}}"""
-        tpl = await db.notice_templates.find_one({"id": payload.get("template_id")}, {"_id": 0})
+        tpl = await db.notice_templates.find_one(cflt(user, {"id": payload.get("template_id")}), {"_id": 0})
         if not tpl:
             raise HTTPException(404, "Template not found")
         rendered = _render_html(tpl["html"], payload.get("variables") or {})
@@ -278,20 +280,20 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
 
     @router.post("/notices/send")
     async def send_notices(body: NoticeSendIn, user: dict = Depends(current_user)):
-        tpl = await db.notice_templates.find_one({"id": body.template_id}, {"_id": 0})
+        tpl = await db.notice_templates.find_one(cflt(user, {"id": body.template_id}), {"_id": 0})
         if not tpl:
             raise HTTPException(404, "Template not found")
 
         rows: List[Dict[str, Any]] = []
         if body.bill_ids:
-            rows = await db.bills.find({"id": {"$in": body.bill_ids}}, {"_id": 0}).to_list(len(body.bill_ids))
+            rows = await db.bills.find(cflt(user, {"id": {"$in": body.bill_ids}}), {"_id": 0}).to_list(len(body.bill_ids))
             # normalize variables from bill
             for r in rows:
                 r["_vars"] = {k: r.get(k, "") for k in ("name","phone","email","property_id","address","amount","due_date","raw")}
                 r["_recipient_phone"] = r.get("phone")
                 r["_recipient_email"] = r.get("email")
         elif body.contact_ids:
-            cs = await db.contacts.find({"id": {"$in": body.contact_ids}}, {"_id": 0}).to_list(len(body.contact_ids))
+            cs = await db.contacts.find(cflt(user, {"id": {"$in": body.contact_ids}}), {"_id": 0}).to_list(len(body.contact_ids))
             for c in cs:
                 c["_vars"] = {"name": c.get("name",""), "phone": c.get("phone",""), "email": c.get("email","")}
                 c["_recipient_phone"] = c.get("phone")
@@ -316,6 +318,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
                 "target_id": r.get("id"),
                 "recipient": recipient,
                 "channel": body.channel,
+                "company_id": user.get("company_id"),
                 "pdf_b64": base64.b64encode(pdf_bytes).decode(),
                 "created_at": _iso(_now()),
             })
@@ -327,7 +330,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
                 "body": body.message or "Please find your notice attached.",
                 "media_url": f"/api/notices/download/{attachment_key}",
                 "status": "queued", "provider_message_id": None,
-                "campaign_id": None,
+                "campaign_id": None, "company_id": user.get("company_id"),
                 "meta": {"notice_template_id": body.template_id, "attachment": attachment_key},
                 "created_at": _iso(_now()), "updated_at": _iso(_now()),
             })
@@ -366,10 +369,10 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
         # Resolve targets
         targets: List[Dict[str, Any]] = []
         if body.bill_ids:
-            rows = await db.bills.find({"id": {"$in": body.bill_ids}}, {"_id": 0}).to_list(len(body.bill_ids))
+            rows = await db.bills.find(cflt(user, {"id": {"$in": body.bill_ids}}), {"_id": 0}).to_list(len(body.bill_ids))
             targets = [{"id": r["id"], "phone": r.get("phone",""), "vars": r} for r in rows if r.get("phone")]
         elif body.contact_ids:
-            rows = await db.contacts.find({"id": {"$in": body.contact_ids}}, {"_id": 0}).to_list(len(body.contact_ids))
+            rows = await db.contacts.find(cflt(user, {"id": {"$in": body.contact_ids}}), {"_id": 0}).to_list(len(body.contact_ids))
             targets = [{"id": r["id"], "phone": r.get("phone",""), "vars": r} for r in rows if r.get("phone")]
         else:
             raise HTTPException(400, "Provide bill_ids or contact_ids")
@@ -378,12 +381,14 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
             raise HTTPException(400, "No targets resolved (all rows missing phone numbers?)")
 
         camp_id = _new_id()
+        company_id = user.get("company_id")
         await db.voice_campaigns.insert_one({
             "id": camp_id, "name": body.name, "script": body.script, "voice": body.voice,
             "target_count": len(targets),
             "stats": {"queued": len(targets), "initiated": 0, "completed": 0, "no-answer": 0, "busy": 0, "failed": 0},
             "status": "running" if targets else "completed",
             "created_by": user.get("email"),
+            "company_id": company_id,
             "created_at": _iso(_now()),
         })
         await audit("voice_campaign_started", "voice_campaign", camp_id, user, {"name": body.name, "targets": len(targets)})
@@ -399,12 +404,13 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
                     "provider_call_id": f"mock_{secrets.token_hex(6)}",
                     "notes": f"AI script ({body.voice}): {rendered_script[:200]}",
                     "voice_campaign_id": camp_id,
+                    "company_id": company_id,
                     "started_at": _iso(_now()), "ended_at": None,
                     "created_at": _iso(_now()),
                 })
                 await db.usage_records.insert_one({
                     "id": _new_id(), "channel": "voice", "message_id": cid, "units": 1,
-                    "amount": 1.20, "currency": "INR", "created_at": _iso(_now()),
+                    "amount": 1.20, "currency": "INR", "company_id": company_id, "created_at": _iso(_now()),
                 })
                 await db.voice_campaigns.update_one({"id": camp_id}, {"$inc": {"stats.initiated": 1}})
 
@@ -423,12 +429,12 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
         return {"id": camp_id, "queued": len(targets)}
 
     @router.get("/voice-campaigns")
-    async def list_voice_campaigns(_: dict = Depends(current_user)):
-        return await db.voice_campaigns.find({}, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
+    async def list_voice_campaigns(user: dict = Depends(current_user)):
+        return await db.voice_campaigns.find(cflt(user), {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
 
     @router.get("/voice-campaigns/{camp_id}")
-    async def get_voice_campaign(camp_id: str, _: dict = Depends(current_user)):
-        c = await db.voice_campaigns.find_one({"id": camp_id}, {"_id": 0})
+    async def get_voice_campaign(camp_id: str, user: dict = Depends(current_user)):
+        c = await db.voice_campaigns.find_one(cflt(user, {"id": camp_id}), {"_id": 0})
         if not c:
             raise HTTPException(404, "Not found")
         calls = await db.call_logs.find({"voice_campaign_id": camp_id}, {"_id": 0}).sort("created_at", -1).limit(500).to_list(500)
@@ -480,6 +486,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
                     "template": step["template"],
                     "scheduled_at": _iso(fire_at),
                     "status": "pending",  # pending | fired | skipped | cancelled
+                    "company_id": b.get("company_id"),
                     "fired_at": None,
                     "created_at": _iso(_now()),
                 })
@@ -502,12 +509,12 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
         return {"ok": True, "cancelled": result.modified_count}
 
     @router.get("/bills/{bill_id}/schedules")
-    async def list_bill_schedules(bill_id: str, _: dict = Depends(current_user)):
-        return await db.reminder_schedules.find({"bill_id": bill_id}, {"_id": 0}).sort("scheduled_at", 1).to_list(50)
+    async def list_bill_schedules(bill_id: str, user: dict = Depends(current_user)):
+        return await db.reminder_schedules.find(cflt(user, {"bill_id": bill_id}), {"_id": 0}).sort("scheduled_at", 1).to_list(50)
 
     @router.get("/reminders/upcoming")
-    async def list_upcoming_reminders(_: dict = Depends(current_user)):
-        rows = await db.reminder_schedules.find({"status": "pending"}, {"_id": 0}).sort("scheduled_at", 1).limit(200).to_list(200)
+    async def list_upcoming_reminders(user: dict = Depends(current_user)):
+        rows = await db.reminder_schedules.find(cflt(user, {"status": "pending"}), {"_id": 0}).sort("scheduled_at", 1).limit(200).to_list(200)
         # enrich with bill
         bill_ids = list({r["bill_id"] for r in rows})
         bs = await db.bills.find({"id": {"$in": bill_ids}}, {"_id": 0}).to_list(len(bill_ids))
@@ -550,12 +557,13 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
                             "provider_call_id": f"mock_{secrets.token_hex(6)}",
                             "notes": f"Auto-reminder T-{r['days_before']}d: {rendered[:200]}",
                             "voice_campaign_id": None,
+                            "company_id": r.get("company_id"),
                             "started_at": _iso(now), "ended_at": None,
                             "created_at": _iso(now),
                         })
                         await db.usage_records.insert_one({
                             "id": _new_id(), "channel": "voice", "message_id": cid, "units": 1,
-                            "amount": 1.20, "currency": "INR", "created_at": _iso(now),
+                            "amount": 1.20, "currency": "INR", "company_id": r.get("company_id"), "created_at": _iso(now),
                         })
                         adapter = ADAPTERS.get("voice")
                         if adapter:
@@ -567,7 +575,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
                         await db.messages.insert_one({
                             "id": mid, "channel": ch, "contact_id": bill["id"], "direction": "outbound",
                             "body": rendered, "status": "queued", "provider_message_id": None,
-                            "campaign_id": None,
+                            "campaign_id": None, "company_id": r.get("company_id"),
                             "meta": {"reminder": True, "bill_id": bill["id"], "days_before": r["days_before"]},
                             "created_at": _iso(now), "updated_at": _iso(now),
                         })
@@ -591,11 +599,11 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
     # FEATURE 5 — Invoice PDF download (WeasyPrint)
     # =====================================================================
     @router.get("/export/invoice/{month}.pdf")
-    async def export_invoice_pdf(month: str, _: dict = Depends(require_roles("super_admin","admin"))):
+    async def export_invoice_pdf(month: str, user: dict = Depends(require_roles("super_admin","admin"))):
         markup_row = await db.system_settings.find_one({"key": "markup_pct"}, {"_id": 0})
         markup = (markup_row or {}).get("value", {}) or {}
         records = await db.usage_records.find(
-            {"created_at": {"$regex": f"^{month}"}}, {"_id": 0}
+            cflt(user, {"created_at": {"$regex": f"^{month}"}}), {"_id": 0}
         ).limit(20000).to_list(20000)
         by_ch: Dict[str, Dict[str, Any]] = {}
         for r in records:

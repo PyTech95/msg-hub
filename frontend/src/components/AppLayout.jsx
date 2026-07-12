@@ -3,7 +3,7 @@ import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import {
   LayoutDashboard, Users, FileText, Megaphone, MessageSquare, Phone,
   BarChart3, Plug, Webhook, UserCog, Settings, Inbox, Sun, Moon, LogOut,
-  ListChecks, ReceiptText, ScrollText, Sparkles, BotMessageSquare, AlarmClock
+  ListChecks, ReceiptText, ScrollText, Sparkles, BotMessageSquare, AlarmClock, Building2
 } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { useTheme } from "@/contexts/ThemeContext";
@@ -31,10 +31,11 @@ const NAV = [
   { to: "/calls",         label: "Voice Calls",   icon: Phone,           roles: ["super_admin","admin","agent"] },
   { to: "/reports",       label: "Reports",       icon: BarChart3,       roles: ["super_admin","admin"] },
   { to: "/invoices",      label: "Invoices",      icon: ReceiptText,     roles: ["super_admin","admin"] },
-  { to: "/providers",     label: "Providers",     icon: Plug,            roles: ["super_admin","admin"] },
-  { to: "/webhooks",      label: "Webhooks",      icon: Webhook,         roles: ["super_admin","admin"] },
+  { to: "/companies",     label: "Companies",     icon: Building2,       roles: ["super_admin"], platformOnly: true },
+  { to: "/providers",     label: "Providers",     icon: Plug,            roles: ["super_admin","admin"], platformOnly: true },
+  { to: "/webhooks",      label: "Webhooks",      icon: Webhook,         roles: ["super_admin","admin"], platformOnly: true },
   { to: "/audit-logs",    label: "Audit Logs",    icon: ScrollText,      roles: ["super_admin","admin"] },
-  { to: "/team",          label: "Team",          icon: UserCog,         roles: ["super_admin"] },
+  { to: "/team",          label: "Team",          icon: UserCog,         roles: ["super_admin","admin"] },
   { to: "/settings",      label: "Settings",      icon: Settings,        roles: ["super_admin","admin","agent"] },
 ];
 
@@ -65,7 +66,7 @@ export default function AppLayout() {
         </div>
 
         <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5">
-          {NAV.filter(item => item.roles.includes(user?.role)).map((item) => (
+          {NAV.filter(item => item.roles.includes(user?.role) && (!item.platformOnly || !user?.company_id)).map((item) => (
             <NavLink
               key={item.to}
               to={item.to}
@@ -106,7 +107,7 @@ export default function AppLayout() {
                 <Avatar className="h-7 w-7"><AvatarFallback className="text-xs font-semibold">{(user?.name||"U").slice(0,2).toUpperCase()}</AvatarFallback></Avatar>
                 <div className="text-left hidden sm:block">
                   <div className="text-xs font-semibold leading-tight">{user?.name}</div>
-                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{user?.role}</div>
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{user?.company_name ? `${user.company_name}` : user?.role}</div>
                 </div>
               </Button>
             </DropdownMenuTrigger>

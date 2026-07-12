@@ -138,6 +138,28 @@ def require_roles(*roles: str):
         return user
     return _dep
 
+def platform_only(*roles: str):
+    """Role check + must be a platform user (no company_id). Blocks company-scoped users."""
+    async def _dep(user: dict = Depends(require_roles(*roles))) -> dict:
+        if user.get("company_id"):
+            raise HTTPException(403, "Platform-level access required")
+        return user
+    return _dep
+
+# ───────────────────────── Multi-tenant helpers ─────────────────────────
+def cflt(user: dict, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Tenant filter: company users see only their company's data; platform super admin sees all."""
+    flt: Dict[str, Any] = dict(extra or {})
+    if user.get("company_id"):
+        flt["company_id"] = user["company_id"]
+    return flt
+
+async def with_company(user: dict) -> dict:
+    if user.get("company_id"):
+        comp = await db.companies.find_one({"id": user["company_id"]}, {"_id": 0, "name": 1})
+        user["company_name"] = (comp or {}).get("name")
+    return user
+
 # ───────────────────────── Pydantic Models ─────────────────────────
 Channel = Literal["sms", "whatsapp", "rcs", "voice"]
 Role = Literal["super_admin", "admin", "agent"]
@@ -364,6 +386,7 @@ async def emit_inbound_reply(message_id: str):
         "status": "received",
         "provider_message_id": f"mock_in_{secrets.token_hex(6)}",
         "campaign_id": None,
+        "company_id": msg.get("company_id"),
         "created_at": iso(now_utc()),
         "updated_at": iso(now_utc()),
     }
@@ -388,6 +411,7 @@ async def deliver_message(message_id: str, channel: Channel):
     adapter = ADAPTERS[channel]
     await adapter.simulate_lifecycle(message_id)
     # usage accounting
+    msg = await db.messages.find_one({"id": message_id}, {"_id": 0, "company_id": 1})
     await db.usage_records.insert_one({
         "id": new_id(),
         "channel": channel,
@@ -395,6 +419,7 @@ async def deliver_message(message_id: str, channel: Channel):
         "units": 1,
         "amount": PRICING[channel],
         "currency": "INR",
+        "company_id": (msg or {}).get("company_id"),
         "created_at": iso(now_utc()),
     })
 
@@ -664,6 +689,12 @@ async def login(body: LoginIn, response: Response, request: Request):
         await audit("login_failed", "user", "", None, {"email": email, "ip": ip})
         raise HTTPException(401, "Invalid credentials")
 
+    # Company gating: users of a deactivated company cannot log in
+    if user.get("company_id"):
+        comp = await db.companies.find_one({"id": user["company_id"]}, {"_id": 0})
+        if not comp or comp.get("is_active") is False:
+            raise HTTPException(403, "Your company account is deactivated. Contact tezsandesh support.")
+
     # 2FA challenge: if user has 2FA enabled and no otp provided, ask for it
     if user.get("totp_enabled") and not body.otp:
         return {"otp_required": True, "message": "Enter the 6-digit code from your authenticator"}
@@ -683,15 +714,18 @@ async def login(body: LoginIn, response: Response, request: Request):
     token = make_token({"id": user["id"], "email": user["email"], "role": user["role"], "token_version": user.get("token_version", 1)})
     response.set_cookie("access_token", token, httponly=True, samesite="lax", max_age=ACCESS_TTL_MIN*60, path="/")
     await audit("login", "user", user["id"], user, {"ip": ip})
-    return {"token": token, "user": clean(user)}
+    return {"token": token, "user": await with_company(clean(user))}
 
 @api.post("/auth/register")
 async def register(body: RegisterIn, user: dict = Depends(require_roles("super_admin","admin"))):
     if await db.users.find_one({"email": body.email.lower()}):
         raise HTTPException(409, "Email already exists")
+    if user.get("company_id") and body.role == "super_admin":
+        raise HTTPException(403, "Company admins cannot create super admins")
     doc = {
         "id": new_id(), "email": body.email.lower(), "password_hash": hash_pw(body.password),
-        "name": body.name, "role": body.role, "token_version": 1, "created_at": iso(now_utc()),
+        "name": body.name, "role": body.role, "company_id": user.get("company_id"),
+        "token_version": 1, "created_at": iso(now_utc()),
     }
     await db.users.insert_one(doc)
     await audit("user_created", "user", doc["id"], user, {"email": doc["email"], "role": doc["role"]})
@@ -704,7 +738,7 @@ async def logout(response: Response, _: dict = Depends(current_user)):
 
 @api.get("/auth/me")
 async def me(user: dict = Depends(current_user)):
-    return user
+    return await with_company(user)
 
 class ChangePasswordIn(BaseModel):
     old_password: str
@@ -846,17 +880,98 @@ async def reset_password(body: ResetPasswordIn):
 
 # ───────────────────────── Users / Team ─────────────────────────
 @api.get("/users")
-async def list_users(_: dict = Depends(current_user)):
-    users = await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(500)
-    return users
+async def list_users(user: dict = Depends(current_user)):
+    return await db.users.find(cflt(user), {"_id": 0, "password_hash": 0}).to_list(500)
 
 @api.delete("/users/{user_id}")
-async def delete_user(user_id: str, actor: dict = Depends(require_roles("super_admin"))):
+async def delete_user(user_id: str, actor: dict = Depends(require_roles("super_admin","admin"))):
     if user_id == actor["id"]:
         raise HTTPException(400, "Cannot delete yourself")
     target = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+    if not target:
+        raise HTTPException(404, "User not found")
+    if actor.get("company_id") and target.get("company_id") != actor["company_id"]:
+        raise HTTPException(403, "Cannot delete users outside your company")
     await db.users.delete_one({"id": user_id})
-    await audit("user_deleted", "user", user_id, actor, {"target_email": (target or {}).get("email")})
+    await audit("user_deleted", "user", user_id, actor, {"target_email": target.get("email")})
+    return {"ok": True}
+
+# ───────────────────────── Companies (multi-tenant SaaS) ─────────────────────────
+class CompanyIn(BaseModel):
+    name: str
+    admin_email: EmailStr
+    admin_password: str
+    admin_name: Optional[str] = None
+
+class CompanyUpdate(BaseModel):
+    name: Optional[str] = None
+    is_active: Optional[bool] = None
+
+TENANT_COLLECTIONS = [
+    "contacts", "contact_lists", "templates", "campaigns", "campaign_recipients",
+    "messages", "conversations", "call_logs", "bills", "bill_batches",
+    "notice_templates", "notice_pdfs", "voice_campaigns", "reminder_schedules",
+    "usage_records", "audit_logs",
+]
+
+@api.get("/companies")
+async def list_companies(_: dict = Depends(require_roles("super_admin"))):
+    comps = await db.companies.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    for c in comps:
+        cid = c["id"]
+        c["stats"] = {
+            "users": await db.users.count_documents({"company_id": cid}),
+            "contacts": await db.contacts.count_documents({"company_id": cid}),
+            "messages": await db.messages.count_documents({"company_id": cid}),
+            "campaigns": await db.campaigns.count_documents({"company_id": cid}),
+        }
+        agg = await db.usage_records.aggregate([
+            {"$match": {"company_id": cid}},
+            {"$group": {"_id": None, "amount": {"$sum": "$amount"}, "units": {"$sum": "$units"}}},
+        ]).to_list(1)
+        c["usage"] = {"amount": round(agg[0]["amount"], 2) if agg else 0, "units": agg[0]["units"] if agg else 0}
+    return comps
+
+@api.post("/companies")
+async def create_company(body: CompanyIn, actor: dict = Depends(require_roles("super_admin"))):
+    if await db.users.find_one({"email": body.admin_email.lower()}):
+        raise HTTPException(409, "Admin email already exists")
+    if len(body.admin_password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    comp = {"id": new_id(), "name": body.name.strip(), "is_active": True,
+            "admin_email": body.admin_email.lower(), "created_at": iso(now_utc())}
+    await db.companies.insert_one(comp)
+    admin_user = {
+        "id": new_id(), "email": body.admin_email.lower(), "password_hash": hash_pw(body.admin_password),
+        "name": body.admin_name or f"{body.name.strip()} Admin", "role": "admin",
+        "company_id": comp["id"], "token_version": 1, "created_at": iso(now_utc()),
+    }
+    await db.users.insert_one(admin_user)
+    await audit("company_created", "company", comp["id"], actor, {"name": comp["name"], "admin_email": admin_user["email"]})
+    return clean(comp)
+
+@api.patch("/companies/{company_id}")
+async def update_company(company_id: str, body: CompanyUpdate, actor: dict = Depends(require_roles("super_admin"))):
+    upd = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+    if not upd:
+        raise HTTPException(400, "No fields")
+    await db.companies.update_one({"id": company_id}, {"$set": upd})
+    await audit("company_updated", "company", company_id, actor, upd)
+    return await db.companies.find_one({"id": company_id}, {"_id": 0})
+
+@api.delete("/companies/{company_id}")
+async def delete_company(company_id: str, actor: dict = Depends(require_roles("super_admin"))):
+    comp = await db.companies.find_one({"id": company_id}, {"_id": 0})
+    if not comp:
+        raise HTTPException(404, "Not found")
+    msg_ids = [m["id"] for m in await db.messages.find({"company_id": company_id}, {"_id": 0, "id": 1}).to_list(100000)]
+    if msg_ids:
+        await db.message_events.delete_many({"message_id": {"$in": msg_ids}})
+    for coll in TENANT_COLLECTIONS:
+        await db[coll].delete_many({"company_id": company_id})
+    await db.users.delete_many({"company_id": company_id})
+    await db.companies.delete_one({"id": company_id})
+    await audit("company_deleted", "company", company_id, actor, {"name": comp.get("name")})
     return {"ok": True}
 
 # ───────────────────────── Contacts ─────────────────────────
@@ -923,7 +1038,7 @@ async def import_contacts_csv(file: UploadFile = File(...), _: dict = Depends(cu
             "email": (row.get("email") or "").strip() or None,
             "tags": [t.strip() for t in (row.get("tags") or "").split(",") if t.strip()],
             "list_ids": [], "dnd": False, "opted_out": False, "notes": "",
-            "custom_fields": {}, "created_at": iso(now_utc()),
+            "custom_fields": {}, "company_id": user.get("company_id"), "created_at": iso(now_utc()),
         })
     if docs:
         await db.contacts.insert_many(docs)
@@ -932,31 +1047,32 @@ async def import_contacts_csv(file: UploadFile = File(...), _: dict = Depends(cu
 
 # ───────────────────────── Lists ─────────────────────────
 @api.get("/lists")
-async def list_lists(_: dict = Depends(current_user)):
-    return await db.contact_lists.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+async def list_lists(user: dict = Depends(current_user)):
+    return await db.contact_lists.find(cflt(user), {"_id": 0}).sort("created_at", -1).to_list(500)
 
 @api.post("/lists")
-async def create_list(body: ListIn, _: dict = Depends(current_user)):
+async def create_list(body: ListIn, user: dict = Depends(current_user)):
     doc = body.model_dump()
     doc["id"] = new_id()
+    doc["company_id"] = user.get("company_id")
     doc["created_at"] = iso(now_utc())
     await db.contact_lists.insert_one(doc)
     return clean(doc)
 
 @api.delete("/lists/{list_id}")
-async def delete_list(list_id: str, _: dict = Depends(require_roles("super_admin","admin"))):
-    await db.contact_lists.delete_one({"id": list_id})
+async def delete_list(list_id: str, user: dict = Depends(require_roles("super_admin","admin"))):
+    await db.contact_lists.delete_one(cflt(user, {"id": list_id}))
     return {"ok": True}
 
 @api.patch("/lists/{list_id}")
-async def update_list(list_id: str, body: ListIn, _: dict = Depends(require_roles("super_admin","admin"))):
-    await db.contact_lists.update_one({"id": list_id}, {"$set": body.model_dump()})
-    return await db.contact_lists.find_one({"id": list_id}, {"_id": 0})
+async def update_list(list_id: str, body: ListIn, user: dict = Depends(require_roles("super_admin","admin"))):
+    await db.contact_lists.update_one(cflt(user, {"id": list_id}), {"$set": body.model_dump()})
+    return await db.contact_lists.find_one(cflt(user, {"id": list_id}), {"_id": 0})
 
 @api.get("/export/contacts.csv")
-async def export_contacts_csv(_: dict = Depends(current_user)):
+async def export_contacts_csv(user: dict = Depends(current_user)):
     from fastapi.responses import Response as FastResponse
-    docs = await db.contacts.find({}, {"_id": 0}).to_list(10000)
+    docs = await db.contacts.find(cflt(user), {"_id": 0}).to_list(10000)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["name", "phone", "email", "tags", "dnd", "opted_out", "city", "created_at"])
@@ -971,27 +1087,28 @@ async def export_contacts_csv(_: dict = Depends(current_user)):
 
 # ───────────────────────── Templates ─────────────────────────
 @api.get("/templates")
-async def list_templates(channel: Optional[Channel] = None, _: dict = Depends(current_user)):
-    flt = {"channel": channel} if channel else {}
+async def list_templates(channel: Optional[Channel] = None, user: dict = Depends(current_user)):
+    flt = cflt(user, {"channel": channel} if channel else {})
     return await db.templates.find(flt, {"_id": 0}).sort("created_at", -1).to_list(500)
 
 @api.post("/templates")
-async def create_template(body: TemplateIn, _: dict = Depends(current_user)):
+async def create_template(body: TemplateIn, user: dict = Depends(current_user)):
     doc = body.model_dump()
     doc["id"] = new_id()
+    doc["company_id"] = user.get("company_id")
     doc["created_at"] = iso(now_utc())
     await db.templates.insert_one(doc)
     return clean(doc)
 
 @api.patch("/templates/{template_id}")
-async def update_template(template_id: str, body: TemplateIn, _: dict = Depends(current_user)):
-    await db.templates.update_one({"id": template_id}, {"$set": body.model_dump()})
-    t = await db.templates.find_one({"id": template_id}, {"_id": 0})
+async def update_template(template_id: str, body: TemplateIn, user: dict = Depends(current_user)):
+    await db.templates.update_one(cflt(user, {"id": template_id}), {"$set": body.model_dump()})
+    t = await db.templates.find_one(cflt(user, {"id": template_id}), {"_id": 0})
     return t
 
 @api.delete("/templates/{template_id}")
-async def delete_template(template_id: str, _: dict = Depends(require_roles("super_admin","admin"))):
-    await db.templates.delete_one({"id": template_id})
+async def delete_template(template_id: str, user: dict = Depends(require_roles("super_admin","admin"))):
+    await db.templates.delete_one(cflt(user, {"id": template_id}))
     return {"ok": True}
 
 # ───────────────────────── Campaigns ─────────────────────────
@@ -1015,12 +1132,12 @@ async def resolve_audience(list_ids: List[str], contact_ids: List[str]) -> List[
     return await db.contacts.find(flt, {"_id": 0}).to_list(10000)
 
 @api.get("/campaigns")
-async def list_campaigns(_: dict = Depends(current_user)):
-    return await db.campaigns.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+async def list_campaigns(user: dict = Depends(current_user)):
+    return await db.campaigns.find(cflt(user), {"_id": 0}).sort("created_at", -1).to_list(500)
 
 @api.get("/campaigns/{campaign_id}")
-async def get_campaign(campaign_id: str, _: dict = Depends(current_user)):
-    c = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+async def get_campaign(campaign_id: str, user: dict = Depends(current_user)):
+    c = await db.campaigns.find_one(cflt(user, {"id": campaign_id}), {"_id": 0})
     if not c:
         raise HTTPException(404, "Not found")
     recipients = await db.campaign_recipients.find({"campaign_id": campaign_id}, {"_id": 0}).limit(500).to_list(500)
@@ -1028,10 +1145,10 @@ async def get_campaign(campaign_id: str, _: dict = Depends(current_user)):
 
 @api.post("/campaigns")
 async def create_campaign(body: CampaignIn, background: BackgroundTasks, user: dict = Depends(current_user)):
-    tpl = await db.templates.find_one({"id": body.template_id}, {"_id": 0})
+    tpl = await db.templates.find_one(cflt(user, {"id": body.template_id}), {"_id": 0})
     if not tpl:
         raise HTTPException(404, "Template not found")
-    audience = await resolve_audience(body.list_ids, body.contact_ids)
+    audience = await resolve_audience(user, body.list_ids, body.contact_ids)
     schedule_dt = None
     if body.schedule_at:
         try:
@@ -1044,18 +1161,19 @@ async def create_campaign(body: CampaignIn, background: BackgroundTasks, user: d
         "template_id": body.template_id, "list_ids": body.list_ids, "contact_ids": body.contact_ids,
         "schedule_at": body.schedule_at, "status": status,
         "stats": {"queued": len(audience), "sent": 0, "delivered": 0, "failed": 0, "replied": 0},
+        "company_id": user.get("company_id"),
         "created_by": user["email"], "created_at": iso(now_utc()),
     }
     await db.campaigns.insert_one(camp)
-    recipients = [{"id": new_id(), "campaign_id": camp["id"], "contact_id": c["id"], "status": "queued", "created_at": iso(now_utc())} for c in audience]
+    recipients = [{"id": new_id(), "campaign_id": camp["id"], "contact_id": c["id"], "status": "queued", "company_id": user.get("company_id"), "created_at": iso(now_utc())} for c in audience]
     if recipients:
         await db.campaign_recipients.insert_many(recipients)
     await audit("campaign_created", "campaign", camp["id"], user, {"name": camp["name"], "channel": camp["channel"], "audience_size": len(audience), "status": status})
     if status == "running":
-        background.add_task(run_campaign, camp["id"], body.channel, tpl, audience, body.variables_map)
+        background.add_task(run_campaign, camp["id"], body.channel, tpl, audience, body.variables_map, user.get("company_id"))
     return clean(camp)
 
-async def run_campaign(campaign_id: str, channel: Channel, tpl: dict, audience: List[dict], variables_map: Dict[str, Any]):
+async def run_campaign(campaign_id: str, channel: Channel, tpl: dict, audience: List[dict], variables_map: Dict[str, Any], company_id: Optional[str] = None):
     adapter = ADAPTERS[channel]
     for c in audience:
         body = render_body(tpl["body"], c, variables_map)
@@ -1064,7 +1182,8 @@ async def run_campaign(campaign_id: str, channel: Channel, tpl: dict, audience: 
             "id": mid, "channel": channel, "contact_id": c["id"], "direction": "outbound",
             "body": body, "media_url": tpl.get("media_url"),
             "status": "queued", "provider_message_id": None,
-            "campaign_id": campaign_id, "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
+            "campaign_id": campaign_id, "company_id": company_id,
+            "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
         }
         await db.messages.insert_one(msg)
         try:
@@ -1076,13 +1195,13 @@ async def run_campaign(campaign_id: str, channel: Channel, tpl: dict, audience: 
         await db.campaign_recipients.update_one({"campaign_id": campaign_id, "contact_id": c["id"]}, {"$set": {"status": "sent"}})
         await db.conversations.update_one(
             {"contact_id": c["id"], "channel": channel},
-            {"$set": {"last_message_at": iso(now_utc()), "last_message": body}}, upsert=True,
+            {"$set": {"last_message_at": iso(now_utc()), "last_message": body, "company_id": company_id}}, upsert=True,
         )
         if resp.get("mode") == "live":
             await emit_event(mid, "sent", source=getattr(adapter, "provider_key", "live"))
             await db.usage_records.insert_one({
                 "id": new_id(), "channel": channel, "message_id": mid, "units": 1,
-                "amount": PRICING[channel], "currency": "INR", "created_at": iso(now_utc()),
+                "amount": PRICING[channel], "currency": "INR", "company_id": company_id, "created_at": iso(now_utc()),
             })
         else:
             asyncio.create_task(deliver_message(mid, channel))
@@ -1090,15 +1209,15 @@ async def run_campaign(campaign_id: str, channel: Channel, tpl: dict, audience: 
     await db.campaigns.update_one({"id": campaign_id}, {"$set": {"status": "completed", "completed_at": iso(now_utc())}})
 
 @api.delete("/campaigns/{campaign_id}")
-async def delete_campaign(campaign_id: str, _: dict = Depends(require_roles("super_admin","admin"))):
-    await db.campaigns.delete_one({"id": campaign_id})
+async def delete_campaign(campaign_id: str, user: dict = Depends(require_roles("super_admin","admin"))):
+    await db.campaigns.delete_one(cflt(user, {"id": campaign_id}))
     await db.campaign_recipients.delete_many({"campaign_id": campaign_id})
     return {"ok": True}
 
 # ───────────────────────── Messages (single send + logs) ─────────────────────────
 @api.post("/messages/send")
 async def send_message(body: SendMessageIn, background: BackgroundTasks, user: dict = Depends(current_user)):
-    contact = await db.contacts.find_one({"id": body.contact_id}, {"_id": 0})
+    contact = await db.contacts.find_one(cflt(user, {"id": body.contact_id}), {"_id": 0})
     if not contact:
         raise HTTPException(404, "Contact not found")
     if contact.get("opted_out"):
@@ -1107,23 +1226,34 @@ async def send_message(body: SendMessageIn, background: BackgroundTasks, user: d
     msg = {
         "id": mid, "channel": body.channel, "contact_id": body.contact_id, "direction": "outbound",
         "body": body.body, "media_url": body.media_url, "status": "queued",
-        "provider_message_id": None, "campaign_id": None,
+        "provider_message_id": None, "campaign_id": None, "company_id": user.get("company_id"),
         "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
     }
     await db.messages.insert_one(msg)
     adapter = ADAPTERS[body.channel]
-    resp = await adapter.send(contact["phone"], body.body, body.media_url)
+    try:
+        resp = await adapter.send(contact["phone"], body.body, body.media_url)
+    except Exception as e:
+        await emit_event(mid, "failed", reason=str(e))
+        raise HTTPException(502, f"Send failed: {e}")
     await db.messages.update_one({"id": mid}, {"$set": {"provider_message_id": resp["provider_message_id"]}})
     await db.conversations.update_one(
         {"contact_id": body.contact_id, "channel": body.channel},
-        {"$set": {"last_message_at": iso(now_utc()), "last_message": body.body}}, upsert=True,
+        {"$set": {"last_message_at": iso(now_utc()), "last_message": body.body, "company_id": user.get("company_id")}}, upsert=True,
     )
-    background.add_task(deliver_message, mid, body.channel)
-    return {"message_id": mid, "status": "queued"}
+    if resp.get("mode") == "live":
+        await emit_event(mid, "sent", source=getattr(adapter, "provider_key", "live"))
+        await db.usage_records.insert_one({
+            "id": new_id(), "channel": body.channel, "message_id": mid, "units": 1,
+            "amount": PRICING[body.channel], "currency": "INR", "company_id": user.get("company_id"), "created_at": iso(now_utc()),
+        })
+    else:
+        background.add_task(deliver_message, mid, body.channel)
+    return {"message_id": mid, "status": "sent" if resp.get("mode") == "live" else "queued", "mode": resp.get("mode")}
 
 @api.get("/messages")
-async def list_messages(channel: Optional[Channel] = None, contact_id: Optional[str] = None, status: Optional[str] = None, limit: int = 200, _: dict = Depends(current_user)):
-    flt: Dict[str, Any] = {}
+async def list_messages(channel: Optional[Channel] = None, contact_id: Optional[str] = None, status: Optional[str] = None, limit: int = 200, user: dict = Depends(current_user)):
+    flt: Dict[str, Any] = cflt(user)
     if channel: flt["channel"] = channel
     if contact_id: flt["contact_id"] = contact_id
     if status: flt["status"] = status
@@ -1136,8 +1266,8 @@ async def message_events(message_id: str, _: dict = Depends(current_user)):
 
 # ───────────────────────── Conversations ─────────────────────────
 @api.get("/conversations")
-async def list_conversations(_: dict = Depends(current_user)):
-    convs = await db.conversations.find({}, {"_id": 0}).sort("last_message_at", -1).to_list(500)
+async def list_conversations(user: dict = Depends(current_user)):
+    convs = await db.conversations.find(cflt(user), {"_id": 0}).sort("last_message_at", -1).to_list(500)
     # enrich with contact name
     for c in convs:
         contact = await db.contacts.find_one({"id": c["contact_id"]}, {"_id": 0, "name": 1, "phone": 1})
@@ -1147,9 +1277,9 @@ async def list_conversations(_: dict = Depends(current_user)):
     return convs
 
 @api.get("/contacts/{contact_id}/timeline")
-async def contact_timeline(contact_id: str, _: dict = Depends(current_user)):
-    msgs = await db.messages.find({"contact_id": contact_id}, {"_id": 0}).sort("created_at", -1).limit(500).to_list(500)
-    calls = await db.call_logs.find({"contact_id": contact_id}, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
+async def contact_timeline(contact_id: str, user: dict = Depends(current_user)):
+    msgs = await db.messages.find(cflt(user, {"contact_id": contact_id}), {"_id": 0}).sort("created_at", -1).limit(500).to_list(500)
+    calls = await db.call_logs.find(cflt(user, {"contact_id": contact_id}), {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
     return {"messages": msgs, "calls": calls}
 
 # ───────────────────────── Voice Calls ─────────────────────────
@@ -1194,7 +1324,7 @@ async def create_provider(body: ProviderIn, _: dict = Depends(require_roles("sup
     return clean(doc)
 
 @api.patch("/providers/{provider_id}")
-async def update_provider(provider_id: str, body: ProviderIn, _: dict = Depends(require_roles("super_admin","admin"))):
+async def update_provider(provider_id: str, body: ProviderIn, _: dict = Depends(platform_only("super_admin","admin"))):
     await db.provider_accounts.update_one({"id": provider_id}, {"$set": body.model_dump()})
     p = await db.provider_accounts.find_one({"id": provider_id}, {"_id": 0})
     return p
@@ -1253,10 +1383,17 @@ async def set_provider_credentials(provider_id: str, body: ProviderCredentialsIn
     return {"ok": True}
 
 @api.post("/providers/{provider_id}/test")
-async def test_provider(provider_id: str, _: dict = Depends(require_roles("super_admin","admin"))):
+async def test_provider(provider_id: str, _: dict = Depends(platform_only("super_admin","admin"))):
     p = await db.provider_accounts.find_one({"id": provider_id}, {"_id": 0})
     if not p:
         raise HTTPException(404, "Not found")
+    if p["provider_key"] == "meta_whatsapp":
+        creds_resolved = await meta_wa_credentials()
+        if not creds_resolved:
+            return {"ok": False, "mode": "mock",
+                    "message": "No Meta credentials found. Add access_token + phone_number_id in the vault (turn Mock OFF) or set WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID in backend .env."}
+        result = await meta_wa.health_check(creds_resolved)
+        return {"ok": result["ok"], "mode": "live", "latency_ms": random.randint(80, 320), "message": result["message"]}
     # In mock mode we always succeed; in live mode we would attempt a real handshake.
     if p.get("mock", True):
         return {"ok": True, "mode": "mock", "latency_ms": random.randint(40, 180),
@@ -1287,7 +1424,7 @@ async def webhook_incoming(channel: Channel, body: Dict[str, Any]):
     return {"ok": True, "id": evt["id"]}
 
 @api.get("/webhooks/events")
-async def list_webhook_events(limit: int = 100, _: dict = Depends(current_user)):
+async def list_webhook_events(limit: int = 100, _: dict = Depends(platform_only("super_admin","admin"))):
     return await db.webhook_events.find({}, {"_id": 0}).sort("created_at", -1).limit(limit).to_list(limit)
 
 # ─────────── Airtel IQ webhook endpoints (DLR / inbound / voice status) ─────
@@ -1462,21 +1599,36 @@ async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict]):
     for c in contacts_info:
         if c.get("wa_id") == frm:
             profile_name = (c.get("profile") or {}).get("name") or ""
-    contact = await db.contacts.find_one({"phone": {"$in": [phone, frm]}}, {"_id": 0})
+    # Company resolution: match contact by phone; if multiple companies share it,
+    # route to the one with the most recent WhatsApp conversation.
+    candidates = await db.contacts.find({"phone": {"$in": [phone, frm]}}, {"_id": 0}).to_list(20)
+    contact = None
+    if len(candidates) == 1:
+        contact = candidates[0]
+    elif candidates:
+        conv = await db.conversations.find(
+            {"contact_id": {"$in": [c["id"] for c in candidates]}, "channel": "whatsapp"},
+            {"_id": 0, "contact_id": 1},
+        ).sort("last_message_at", -1).to_list(1)
+        match_id = conv[0]["contact_id"] if conv else candidates[0]["id"]
+        contact = next((c for c in candidates if c["id"] == match_id), candidates[0])
     if contact:
         cid = contact["id"]
+        company_id = contact.get("company_id")
     else:
         cid = new_id()
+        company_id = None
         await db.contacts.insert_one({
             "id": cid, "name": profile_name or phone, "phone": phone, "email": None,
             "tags": ["wa-inbound"], "list_ids": [], "dnd": False, "opted_out": False,
-            "notes": "", "custom_fields": {}, "created_at": iso(now_utc()),
+            "notes": "", "custom_fields": {}, "company_id": None, "created_at": iso(now_utc()),
         })
     inbound = {
         "id": new_id(), "channel": "whatsapp", "contact_id": cid, "direction": "inbound",
         "body": body_txt, "status": "received",
         "provider_message_id": str(pid) if pid else f"meta_in_{secrets.token_hex(6)}",
-        "campaign_id": None, "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
+        "campaign_id": None, "company_id": company_id,
+        "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
     }
     await db.messages.insert_one(inbound)
     await db.message_events.insert_one({
@@ -1485,7 +1637,7 @@ async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict]):
     })
     await db.conversations.update_one(
         {"contact_id": cid, "channel": "whatsapp"},
-        {"$set": {"last_message_at": iso(now_utc()), "last_message": body_txt, "unread": True}},
+        {"$set": {"last_message_at": iso(now_utc()), "last_message": body_txt, "unread": True, "company_id": company_id}},
         upsert=True,
     )
     if body_txt.strip().upper() == "STOP":
@@ -1533,7 +1685,7 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
     phone = body.to.strip()
     if not phone.startswith("+"):
         phone = f"+{phone}"
-    contact = await db.contacts.find_one({"phone": {"$in": [phone, phone.lstrip('+')]}}, {"_id": 0})
+    contact = await db.contacts.find_one(cflt(user, {"phone": {"$in": [phone, phone.lstrip('+')]}}), {"_id": 0})
     if contact and contact.get("opted_out"):
         raise HTTPException(400, "Contact has opted out")
     if contact:
@@ -1543,13 +1695,13 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
         await db.contacts.insert_one({
             "id": cid, "name": phone, "phone": phone, "email": None, "tags": ["wa-direct"],
             "list_ids": [], "dnd": False, "opted_out": False, "notes": "", "custom_fields": {},
-            "created_at": iso(now_utc()),
+            "company_id": user.get("company_id"), "created_at": iso(now_utc()),
         })
     mid = new_id()
     await db.messages.insert_one({
         "id": mid, "channel": "whatsapp", "contact_id": cid, "direction": "outbound",
         "body": body.message, "media_url": body.media_url, "status": "queued",
-        "provider_message_id": None, "campaign_id": None,
+        "provider_message_id": None, "campaign_id": None, "company_id": user.get("company_id"),
         "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
     })
     try:
@@ -1560,13 +1712,13 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
     await db.messages.update_one({"id": mid}, {"$set": {"provider_message_id": resp["provider_message_id"]}})
     await db.conversations.update_one(
         {"contact_id": cid, "channel": "whatsapp"},
-        {"$set": {"last_message_at": iso(now_utc()), "last_message": body.message}}, upsert=True,
+        {"$set": {"last_message_at": iso(now_utc()), "last_message": body.message, "company_id": user.get("company_id")}}, upsert=True,
     )
     if resp.get("mode") == "live":
         await emit_event(mid, "sent", source="meta_whatsapp")
         await db.usage_records.insert_one({
             "id": new_id(), "channel": "whatsapp", "message_id": mid, "units": 1,
-            "amount": PRICING["whatsapp"], "currency": "INR", "created_at": iso(now_utc()),
+            "amount": PRICING["whatsapp"], "currency": "INR", "company_id": user.get("company_id"), "created_at": iso(now_utc()),
         })
     else:
         background.add_task(deliver_message, mid, "whatsapp")
@@ -1574,7 +1726,7 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
             "mode": resp.get("mode"), "status": "sent" if resp.get("mode") == "live" else "queued"}
 
 @api.get("/whatsapp/setup")
-async def whatsapp_setup(_: dict = Depends(require_roles("super_admin", "admin"))):
+async def whatsapp_setup(_: dict = Depends(platform_only("super_admin", "admin"))):
     """Setup info for configuring the Callback URL + Verify Token in the Meta dashboard."""
     creds = await meta_wa_credentials()
     return {
@@ -1590,8 +1742,8 @@ async def whatsapp_setup(_: dict = Depends(require_roles("super_admin", "admin")
 
 # ───────────────────────── Usage / Billing ─────────────────────────
 @api.get("/usage/summary")
-async def usage_summary(_: dict = Depends(current_user)):
-    pipeline = [{"$group": {"_id": "$channel", "units": {"$sum": "$units"}, "amount": {"$sum": "$amount"}}}]
+async def usage_summary(user: dict = Depends(current_user)):
+    pipeline = [{"$match": cflt(user)}, {"$group": {"_id": "$channel", "units": {"$sum": "$units"}, "amount": {"$sum": "$amount"}}}]
     rows = await db.usage_records.aggregate(pipeline).to_list(100)
     total_amount = sum(r["amount"] for r in rows)
     total_units = sum(r["units"] for r in rows)
@@ -1603,23 +1755,24 @@ async def usage_summary(_: dict = Depends(current_user)):
     }
 
 @api.get("/usage/records")
-async def usage_records(limit: int = 200, _: dict = Depends(current_user)):
-    return await db.usage_records.find({}, {"_id": 0}).sort("created_at", -1).limit(limit).to_list(limit)
+async def usage_records(limit: int = 200, user: dict = Depends(current_user)):
+    return await db.usage_records.find(cflt(user), {"_id": 0}).sort("created_at", -1).limit(limit).to_list(limit)
 
 # ───────────────────────── Dashboard / Analytics ─────────────────────────
 @api.get("/dashboard/stats")
-async def dashboard_stats(_: dict = Depends(current_user)):
-    total_msgs = await db.messages.count_documents({})
-    delivered = await db.messages.count_documents({"status": "delivered"})
-    failed = await db.messages.count_documents({"status": "failed"})
-    replied = await db.messages.count_documents({"direction": "inbound"})
-    active_campaigns = await db.campaigns.count_documents({"status": {"$in": ["running","scheduled"]}})
-    contacts_count = await db.contacts.count_documents({})
+async def dashboard_stats(user: dict = Depends(current_user)):
+    base = cflt(user)
+    total_msgs = await db.messages.count_documents(base)
+    delivered = await db.messages.count_documents(cflt(user, {"status": "delivered"}))
+    failed = await db.messages.count_documents(cflt(user, {"status": "failed"}))
+    replied = await db.messages.count_documents(cflt(user, {"direction": "inbound"}))
+    active_campaigns = await db.campaigns.count_documents(cflt(user, {"status": {"$in": ["running","scheduled"]}}))
+    contacts_count = await db.contacts.count_documents(base)
 
     # last 7 days bar series by channel
     since = now_utc() - timedelta(days=7)
     pipeline = [
-        {"$match": {"created_at": {"$gte": iso(since)}}},
+        {"$match": cflt(user, {"created_at": {"$gte": iso(since)}})},
         {"$group": {"_id": {"day": {"$substr": ["$created_at", 0, 10]}, "channel": "$channel"}, "count": {"$sum": 1}}},
     ]
     rows = await db.messages.aggregate(pipeline).to_list(1000)
@@ -1631,12 +1784,12 @@ async def dashboard_stats(_: dict = Depends(current_user)):
     series = [{"date": d, **vals} for d, vals in sorted(series_map.items())]
 
     # channel split (pie)
-    pipeline2 = [{"$group": {"_id": "$channel", "count": {"$sum": 1}}}]
+    pipeline2 = [{"$match": base}, {"$group": {"_id": "$channel", "count": {"$sum": 1}}}]
     by_channel = await db.messages.aggregate(pipeline2).to_list(20)
     channel_split = [{"channel": r["_id"], "count": r["count"]} for r in by_channel]
 
     # status split for delivery donut
-    pipeline3 = [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
+    pipeline3 = [{"$match": base}, {"$group": {"_id": "$status", "count": {"$sum": 1}}}]
     by_status = await db.messages.aggregate(pipeline3).to_list(20)
 
     return {
@@ -1656,8 +1809,8 @@ async def dashboard_stats(_: dict = Depends(current_user)):
 # ───────────────────────── Audit Logs ─────────────────────────
 @api.get("/audit-logs")
 async def list_audit_logs(limit: int = 200, action: Optional[str] = None,
-                          _: dict = Depends(require_roles("super_admin","admin"))):
-    flt: Dict[str, Any] = {}
+                          user: dict = Depends(require_roles("super_admin","admin"))):
+    flt: Dict[str, Any] = cflt(user)
     if action:
         flt["action"] = action
     return await db.audit_logs.find(flt, {"_id": 0}).sort("created_at", -1).limit(limit).to_list(limit)
@@ -1687,11 +1840,12 @@ async def set_markup(body: MarkupIn, user: dict = Depends(require_roles("super_a
 
 # ───────────────────────── Invoices ─────────────────────────
 @api.get("/invoices")
-async def list_invoices(_: dict = Depends(require_roles("super_admin","admin"))):
+async def list_invoices(user: dict = Depends(require_roles("super_admin","admin"))):
     """Return monthly invoice summaries (last 6 months that have usage)."""
     markup_row = await db.system_settings.find_one({"key": "markup_pct"}, {"_id": 0})
     markup = (markup_row or {}).get("value", {}) or {}
     pipeline = [
+        {"$match": cflt(user)},
         {"$group": {
             "_id": {"month": {"$substr": ["$created_at", 0, 7]}, "channel": "$channel"},
             "units": {"$sum": "$units"},
@@ -1714,12 +1868,12 @@ async def list_invoices(_: dict = Depends(require_roles("super_admin","admin")))
     return {"invoices": invoices, "markup_pct": markup, "currency": "INR"}
 
 @api.get("/invoices/{month}")
-async def invoice_detail(month: str, _: dict = Depends(require_roles("super_admin","admin"))):
+async def invoice_detail(month: str, user: dict = Depends(require_roles("super_admin","admin"))):
     """month = YYYY-MM"""
     markup_row = await db.system_settings.find_one({"key": "markup_pct"}, {"_id": 0})
     markup = (markup_row or {}).get("value", {}) or {}
     records = await db.usage_records.find(
-        {"created_at": {"$regex": f"^{month}"}}, {"_id": 0}
+        cflt(user, {"created_at": {"$regex": f"^{month}"}}), {"_id": 0}
     ).sort("created_at", -1).limit(2000).to_list(2000)
     by_ch: Dict[str, Dict[str, Any]] = {}
     for r in records:
@@ -1741,9 +1895,9 @@ async def invoice_detail(month: str, _: dict = Depends(require_roles("super_admi
 # ───────────────────────── Messages CSV export ─────────────────────────
 @api.get("/export/messages.csv")
 async def export_messages_csv(channel: Optional[Channel] = None, status: Optional[str] = None,
-                              _: dict = Depends(current_user)):
+                              user: dict = Depends(current_user)):
     from fastapi.responses import StreamingResponse
-    flt: Dict[str, Any] = {}
+    flt: Dict[str, Any] = cflt(user)
     if channel: flt["channel"] = channel
     if status: flt["status"] = status
 
@@ -1767,12 +1921,12 @@ async def export_messages_csv(channel: Optional[Channel] = None, status: Optiona
                              headers={"Content-Disposition": "attachment; filename=messages.csv"})
 
 @api.get("/export/invoice/{month}.csv")
-async def export_invoice_csv(month: str, _: dict = Depends(require_roles("super_admin","admin"))):
+async def export_invoice_csv(month: str, user: dict = Depends(require_roles("super_admin","admin"))):
     from fastapi.responses import Response as FastResponse
     markup_row = await db.system_settings.find_one({"key": "markup_pct"}, {"_id": 0})
     markup = (markup_row or {}).get("value", {}) or {}
     records = await db.usage_records.find(
-        {"created_at": {"$regex": f"^{month}"}}, {"_id": 0}
+        cflt(user, {"created_at": {"$regex": f"^{month}"}}), {"_id": 0}
     ).sort("created_at", -1).limit(20000).to_list(20000)
     by_ch: Dict[str, Dict[str, Any]] = {}
     for r in records:
@@ -1816,13 +1970,13 @@ async def campaign_scheduler_loop():
                         await db.campaigns.update_one({"id": c["id"]}, {"$set": {"status": "failed", "error": "template missing"}})
                         await audit("campaign_failed", "campaign", c["id"], None, {"reason": "template missing"})
                         continue
-                    audience = await resolve_audience(c.get("list_ids", []) or [], c.get("contact_ids", []) or [])
+                    audience = await resolve_audience({"company_id": c.get("company_id")}, c.get("list_ids", []) or [], c.get("contact_ids", []) or [])
                     await db.campaigns.update_one({"id": c["id"]}, {"$set": {"status": "running"}})
                     await audit("campaign_auto_started", "campaign", c["id"], None, {"name": c.get("name"), "audience_size": len(audience)})
 
-                    async def safe_run(cid=c["id"], ch=c["channel"], t=tpl, aud=audience):
+                    async def safe_run(cid=c["id"], ch=c["channel"], t=tpl, aud=audience, comp=c.get("company_id")):
                         try:
-                            await run_campaign(cid, ch, t, aud, {})
+                            await run_campaign(cid, ch, t, aud, {}, comp)
                         except Exception as e:
                             log.error(f"run_campaign crashed for {cid}: {e}")
                             await db.campaigns.update_one({"id": cid}, {"$set": {"status": "failed", "error": str(e)[:300]}})
@@ -1843,5 +1997,5 @@ app.include_router(api)
 from features import build_features_router
 app.include_router(build_features_router(
     db=db, current_user=current_user, require_roles=require_roles,
-    audit=audit, emit_event=emit_event, ADAPTERS=ADAPTERS,
+    audit=audit, emit_event=emit_event, ADAPTERS=ADAPTERS, cflt=cflt,
 ))
