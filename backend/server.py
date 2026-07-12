@@ -103,6 +103,7 @@ async def audit(action: str, target_type: str = "", target_id: str = "",
             "actor_id": (actor or {}).get("id"),
             "actor_email": (actor or {}).get("email"),
             "actor_role": (actor or {}).get("role"),
+            "company_id": (actor or {}).get("company_id"),
             "meta": meta or {},
             "created_at": iso(now_utc()),
         })
