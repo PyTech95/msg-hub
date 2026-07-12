@@ -83,13 +83,14 @@ async def health_check(creds: Dict[str, str]) -> Dict[str, Any]:
         return {"ok": False, "message": f"Handshake failed: {e}"}
 
 
-def build_adapter(BaseAdapter, creds_provider: Callable[[], Awaitable[Optional[Dict[str, str]]]]):
+def build_adapter(BaseAdapter, creds_provider: Callable[..., Awaitable[Optional[Dict[str, str]]]]):
     class MetaWhatsAppAdapter(BaseAdapter):
         channel = "whatsapp"
         provider_key = "meta_whatsapp"
 
-        async def send(self, to: str, body: str, media_url: Optional[str] = None) -> Dict[str, Any]:
-            creds = await creds_provider()
+        async def send(self, to: str, body: str, media_url: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+            company_id = kwargs.get("company_id")
+            creds = await creds_provider(company_id)
             if not creds:
                 return _mock_or_fail()
             to_clean = _clean_number(to)
@@ -99,7 +100,7 @@ def build_adapter(BaseAdapter, creds_provider: Callable[[], Awaitable[Optional[D
             else:
                 payload = {"messaging_product": "whatsapp", "to": to_clean, "type": "text",
                            "text": {"body": body, "preview_url": True}}
-            log.info("Meta WA send → %s (type=%s)", to_clean, "image" if media_url else "text")
+            log.info("Meta WA send → %s (type=%s, company=%s)", to_clean, "image" if media_url else "text", company_id or "-")
             data = await graph_post_message(creds, payload)
             pid = ((data.get("messages") or [{}])[0]).get("id") or f"meta_{secrets.token_hex(8)}"
             log.info("Meta WA accepted id=%s", pid)
@@ -107,8 +108,9 @@ def build_adapter(BaseAdapter, creds_provider: Callable[[], Awaitable[Optional[D
 
         async def send_template(self, to: str, template_name: str,
                                 language_code: str = "en_US",
-                                components: Optional[list] = None) -> Dict[str, Any]:
-            creds = await creds_provider()
+                                components: Optional[list] = None,
+                                company_id: Optional[str] = None) -> Dict[str, Any]:
+            creds = await creds_provider(company_id)
             if not creds:
                 return _mock_or_fail()
             template: Dict[str, Any] = {"name": template_name, "language": {"code": language_code}}

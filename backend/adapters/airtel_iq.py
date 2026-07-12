@@ -144,7 +144,7 @@ def build_adapters(BaseAdapter):
         channel = "sms"
         provider_key = "airtel_iq"
 
-        async def send(self, to: str, body: str, media_url: Optional[str] = None) -> Dict[str, Any]:
+        async def send(self, to: str, body: str, media_url: Optional[str] = None, **kwargs) -> Dict[str, Any]:
             if not (client and cfg.sms_ready()):
                 # Fallback: mock response so app keeps working.
                 return {"provider_message_id": f"mock_{secrets.token_hex(8)}", "accepted": True, "mode": "mock"}
@@ -174,7 +174,7 @@ def build_adapters(BaseAdapter):
         channel = "whatsapp"
         provider_key = "airtel_iq"
 
-        async def send(self, to: str, body: str, media_url: Optional[str] = None) -> Dict[str, Any]:
+        async def send(self, to: str, body: str, media_url: Optional[str] = None, **kwargs) -> Dict[str, Any]:
             if not (client and cfg.whatsapp_ready()):
                 return {"provider_message_id": f"mock_{secrets.token_hex(8)}", "accepted": True, "mode": "mock"}
             payload = {
@@ -194,7 +194,7 @@ def build_adapters(BaseAdapter):
         channel = "voice"
         provider_key = "airtel_iq"
 
-        async def send(self, to: str, body: str, media_url: Optional[str] = None) -> Dict[str, Any]:
+        async def send(self, to: str, body: str, media_url: Optional[str] = None, **kwargs) -> Dict[str, Any]:
             # `body` is treated as TTS script; `media_url` (if set) can be hosted audio.
             if not (client and cfg.voice_ready()):
                 return {"provider_message_id": f"mock_{secrets.token_hex(8)}", "accepted": True, "mode": "mock"}

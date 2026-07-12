@@ -29,6 +29,7 @@ import Companies from "@/pages/Companies";
 import AuditLogs from "@/pages/AuditLogs";
 import Invoices from "@/pages/Invoices";
 import Settings from "@/pages/Settings";
+import WhatsAppSettings from "@/pages/WhatsAppSettings";
 import ForgotPassword from "@/pages/ForgotPassword";
 import ResetPassword from "@/pages/ResetPassword";
 
@@ -65,6 +66,7 @@ export default function App() {
               <Route path="/audit-logs" element={<RoleRoute allow={["super_admin","admin"]}><AuditLogs /></RoleRoute>} />
               <Route path="/invoices" element={<RoleRoute allow={["super_admin","admin"]}><Invoices /></RoleRoute>} />
               <Route path="/settings" element={<Settings />} />
+              <Route path="/whatsapp-settings" element={<RoleRoute allow={["super_admin","admin"]}><WhatsAppSettings /></RoleRoute>} />
             </Route>
             <Route path="*" element={<Navigate to="/dashboard" replace />} />
           </Routes>

@@ -254,7 +254,7 @@ class BaseAdapter:
     channel: Channel = "sms"
     provider_key: str = "mock"
 
-    async def send(self, to: str, body: str, media_url: Optional[str] = None) -> Dict[str, Any]:
+    async def send(self, to: str, body: str, media_url: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         # Simulate provider response
         return {"provider_message_id": f"mock_{secrets.token_hex(8)}", "accepted": True}
 
@@ -309,7 +309,7 @@ class VoiceAdapter(BaseAdapter):
 class EmailAdapter(BaseAdapter):
     """Mock email adapter; swap with Resend/SendGrid later (creds via Providers UI)."""
     channel = "email"  # type: ignore
-    async def send(self, to: str, body: str, media_url=None):
+    async def send(self, to: str, body: str, media_url=None, **kwargs):
         log.info(f"[mock email] to={to} body={(body or '')[:80]} attachment={media_url}")
         return {"provider_message_id": f"email_{secrets.token_hex(8)}", "accepted": True}
 
@@ -334,11 +334,28 @@ except Exception as _e:
     log.warning("Airtel IQ adapter init skipped: %s", _e)
     AIRTEL_IQ_CFG = None
 
-# ── Meta WhatsApp Cloud API adapter (vault → env credentials; mock fallback) ──
+# ── Meta WhatsApp Cloud API adapter (per-tenant → vault → env; mock fallback) ──
 from adapters import meta_whatsapp as meta_wa
 
-async def meta_wa_credentials() -> Optional[Dict[str, str]]:
-    """Resolve live credentials: Provider Vault first, then env vars."""
+async def meta_wa_credentials(company_id: Optional[str] = None) -> Optional[Dict[str, str]]:
+    """Resolve live credentials:
+    1) Per-tenant config in `company_whatsapp_configs`
+    2) Global Provider Vault (`provider_accounts` where provider_key='meta_whatsapp')
+    3) Environment variables (WHATSAPP_ACCESS_TOKEN + WHATSAPP_PHONE_NUMBER_ID)
+    Returns None → adapter runs in mock (demo) or hard-fails (production).
+    """
+    # 1) Per-tenant
+    if company_id:
+        cfg = await db.company_whatsapp_configs.find_one(
+            {"company_id": company_id, "is_active": True}, {"_id": 0})
+        if (cfg and not cfg.get("mock", True)
+                and cfg.get("access_token") and cfg.get("phone_number_id")):
+            return {
+                "access_token": cfg["access_token"],
+                "phone_number_id": cfg["phone_number_id"],
+                "graph_version": cfg.get("graph_version") or os.environ.get("GRAPH_API_VERSION") or "v22.0",
+            }
+    # 2) Global vault
     p = await db.provider_accounts.find_one({"provider_key": "meta_whatsapp", "is_active": True}, {"_id": 0})
     creds = (p or {}).get("credentials") or {}
     if p and not p.get("mock", True) and creds.get("access_token") and creds.get("phone_number_id"):
@@ -347,10 +364,11 @@ async def meta_wa_credentials() -> Optional[Dict[str, str]]:
             "phone_number_id": creds["phone_number_id"],
             "graph_version": creds.get("graph_version") or os.environ.get("GRAPH_API_VERSION") or "v22.0",
         }
+    # 3) Env fallback
     return meta_wa.env_config()
 
 ADAPTERS["whatsapp"] = meta_wa.build_adapter(BaseAdapter, meta_wa_credentials)
-log.info("Meta WhatsApp Cloud adapter wired (env_live=%s)", bool(meta_wa.env_config()))
+log.info("Meta WhatsApp Cloud adapter wired (env_live=%s, multi-tenant capable)", bool(meta_wa.env_config()))
 
 PRICING = {"sms": 0.25, "whatsapp": 0.40, "rcs": 0.50, "voice": 1.20, "email": 0.10}  # INR per unit (msg or min)
 
@@ -438,6 +456,7 @@ async def on_startup():
     await db.password_reset_tokens.create_index("token", unique=True)
     await db.system_settings.create_index("key", unique=True)
     await db.login_attempts.create_index("identifier")
+    await db.company_whatsapp_configs.create_index("company_id", unique=True)
     await seed()
     asyncio.create_task(campaign_scheduler_loop())
     log.info("CPaaS backend ready.")
@@ -912,7 +931,7 @@ TENANT_COLLECTIONS = [
     "contacts", "contact_lists", "templates", "campaigns", "campaign_recipients",
     "messages", "conversations", "call_logs", "bills", "bill_batches",
     "notice_templates", "notice_pdfs", "voice_campaigns", "reminder_schedules",
-    "usage_records", "audit_logs",
+    "usage_records", "audit_logs", "company_whatsapp_configs",
 ]
 
 @api.get("/companies")
@@ -925,6 +944,12 @@ async def list_companies(_: dict = Depends(require_roles("super_admin"))):
             "contacts": await db.contacts.count_documents({"company_id": cid}),
             "messages": await db.messages.count_documents({"company_id": cid}),
             "campaigns": await db.campaigns.count_documents({"company_id": cid}),
+        }
+        wa = await db.company_whatsapp_configs.find_one({"company_id": cid}, {"_id": 0, "phone_number_id": 1, "mock": 1, "is_active": 1})
+        c["whatsapp"] = {
+            "configured": bool(wa),
+            "live": bool(wa and not wa.get("mock", True) and wa.get("is_active", True)),
+            "phone_number_id": (wa or {}).get("phone_number_id", ""),
         }
         agg = await db.usage_records.aggregate([
             {"$match": {"company_id": cid}},
@@ -1190,7 +1215,7 @@ async def run_campaign(campaign_id: str, channel: Channel, tpl: dict, audience: 
         }
         await db.messages.insert_one(msg)
         try:
-            resp = await adapter.send(c["phone"], body, tpl.get("media_url"))
+            resp = await adapter.send(c["phone"], body, tpl.get("media_url"), company_id=company_id)
             await db.messages.update_one({"id": mid}, {"$set": {"provider_message_id": resp.get("provider_message_id"), "status": "queued"}})
         except Exception as e:
             await emit_event(mid, "failed", reason=str(e))
@@ -1235,7 +1260,7 @@ async def send_message(body: SendMessageIn, background: BackgroundTasks, user: d
     await db.messages.insert_one(msg)
     adapter = ADAPTERS[body.channel]
     try:
-        resp = await adapter.send(contact["phone"], body.body, body.media_url)
+        resp = await adapter.send(contact["phone"], body.body, body.media_url, company_id=user.get("company_id"))
     except Exception as e:
         await emit_event(mid, "failed", reason=str(e))
         raise HTTPException(502, f"Send failed: {e}")
@@ -1586,7 +1611,7 @@ async def _meta_handle_status(st: Dict[str, Any]):
             extra["errors"] = st["errors"]
         await emit_event(msg["id"], internal, **extra)
 
-async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict]):
+async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict], company_id: Optional[str] = None):
     pid = m.get("id")
     if pid and await db.messages.find_one({"provider_message_id": str(pid)}):
         return  # already processed (Meta retries webhooks)
@@ -1606,9 +1631,11 @@ async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict]):
     for c in contacts_info:
         if c.get("wa_id") == frm:
             profile_name = (c.get("profile") or {}).get("name") or ""
-    # Company resolution: match contact by phone; if multiple companies share it,
-    # route to the one with the most recent WhatsApp conversation.
-    candidates = await db.contacts.find({"phone": {"$in": [phone, frm]}}, {"_id": 0}).to_list(20)
+    # If tenant webhook supplied company_id, prefer contacts inside that company.
+    contact_query: Dict[str, Any] = {"phone": {"$in": [phone, frm]}}
+    if company_id:
+        contact_query["company_id"] = company_id
+    candidates = await db.contacts.find(contact_query, {"_id": 0}).to_list(20)
     contact = None
     if len(candidates) == 1:
         contact = candidates[0]
@@ -1621,20 +1648,20 @@ async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict]):
         contact = next((c for c in candidates if c["id"] == match_id), candidates[0])
     if contact:
         cid = contact["id"]
-        company_id = contact.get("company_id")
+        resolved_company_id = contact.get("company_id") or company_id
     else:
         cid = new_id()
-        company_id = None
+        resolved_company_id = company_id
         await db.contacts.insert_one({
             "id": cid, "name": profile_name or phone, "phone": phone, "email": None,
             "tags": ["wa-inbound"], "list_ids": [], "dnd": False, "opted_out": False,
-            "notes": "", "custom_fields": {}, "company_id": None, "created_at": iso(now_utc()),
+            "notes": "", "custom_fields": {}, "company_id": resolved_company_id, "created_at": iso(now_utc()),
         })
     inbound = {
         "id": new_id(), "channel": "whatsapp", "contact_id": cid, "direction": "inbound",
         "body": body_txt, "status": "received",
         "provider_message_id": str(pid) if pid else f"meta_in_{secrets.token_hex(6)}",
-        "campaign_id": None, "company_id": company_id,
+        "campaign_id": None, "company_id": resolved_company_id,
         "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
     }
     await db.messages.insert_one(inbound)
@@ -1644,7 +1671,7 @@ async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict]):
     })
     await db.conversations.update_one(
         {"contact_id": cid, "channel": "whatsapp"},
-        {"$set": {"last_message_at": iso(now_utc()), "last_message": body_txt, "unread": True, "company_id": company_id}},
+        {"$set": {"last_message_at": iso(now_utc()), "last_message": body_txt, "unread": True, "company_id": resolved_company_id}},
         upsert=True,
     )
     if body_txt.strip().upper() == "STOP":
@@ -1712,7 +1739,7 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
         "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
     })
     try:
-        resp = await ADAPTERS["whatsapp"].send(phone, body.message, body.media_url)
+        resp = await ADAPTERS["whatsapp"].send(phone, body.message, body.media_url, company_id=user.get("company_id"))
     except Exception as e:
         await emit_event(mid, "failed", reason=str(e), source="meta_whatsapp")
         raise HTTPException(502, f"WhatsApp send failed: {e}")
@@ -1745,6 +1772,188 @@ async def whatsapp_setup(_: dict = Depends(platform_only("super_admin", "admin")
         "phone_number_id": (creds or {}).get("phone_number_id", ""),
         "signature_check_enabled": bool((os.environ.get("WHATSAPP_APP_SECRET") or "").strip()),
     }
+
+
+# ─────────── Per-tenant WhatsApp configuration (Company Admin) ───────────
+def _mask_wa(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a safe view of a company WA config (masks token / app_secret)."""
+    out: Dict[str, Any] = {
+        "company_id": cfg.get("company_id"),
+        "phone_number_id": cfg.get("phone_number_id") or "",
+        "graph_version": cfg.get("graph_version") or "v22.0",
+        "verify_token": cfg.get("verify_token") or "",
+        "is_active": cfg.get("is_active", True),
+        "mock": cfg.get("mock", True),
+        "access_token_set": bool(cfg.get("access_token")),
+        "app_secret_set": bool(cfg.get("app_secret")),
+        "updated_at": cfg.get("updated_at"),
+        "updated_by": cfg.get("updated_by"),
+    }
+    tok = cfg.get("access_token") or ""
+    out["access_token_preview"] = ("•" * max(0, len(tok) - 4) + tok[-4:]) if tok else ""
+    sec = cfg.get("app_secret") or ""
+    out["app_secret_preview"] = ("•" * max(0, len(sec) - 4) + sec[-4:]) if sec else ""
+    return out
+
+
+class WhatsAppConfigIn(BaseModel):
+    access_token: Optional[str] = None
+    phone_number_id: Optional[str] = None
+    app_secret: Optional[str] = None
+    graph_version: Optional[str] = None
+    is_active: Optional[bool] = None
+    mock: Optional[bool] = None
+
+
+@api.get("/whatsapp/config")
+async def get_wa_config(user: dict = Depends(current_user)):
+    """Company Admin/Agent: view own tenant WhatsApp config (masked).
+    Super Admin (no company_id): returns platform env/vault info + a summary of tenants."""
+    if user.get("company_id"):
+        cfg = await db.company_whatsapp_configs.find_one({"company_id": user["company_id"]}, {"_id": 0})
+        if not cfg:
+            return {
+                "configured": False, "company_id": user["company_id"],
+                "webhook_path": None, "verify_token": None,
+                "hint": "Call PUT /api/whatsapp/config to set your Meta Cloud API credentials.",
+            }
+        base_url = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+        webhook_path = f"/api/webhook/whatsapp/{user['company_id']}"
+        return {
+            "configured": True,
+            **_mask_wa(cfg),
+            "webhook_path": webhook_path,
+            "webhook_url": (base_url + webhook_path) if base_url else webhook_path,
+            "graph_api_version_env": os.environ.get("GRAPH_API_VERSION") or "v22.0",
+        }
+    # Super Admin
+    tenants = await db.company_whatsapp_configs.find({}, {"_id": 0}).to_list(500)
+    return {
+        "configured": bool(meta_wa.env_config()),
+        "platform_env_configured": bool(meta_wa.env_config()),
+        "verify_token": (os.environ.get("WHATSAPP_VERIFY_TOKEN") or "").strip(),
+        "webhook_path": "/api/webhook/whatsapp",
+        "tenant_count": len(tenants),
+        "tenants": [_mask_wa(t) for t in tenants],
+    }
+
+
+@api.put("/whatsapp/config")
+async def put_wa_config(body: WhatsAppConfigIn, user: dict = Depends(require_roles("super_admin","admin"))):
+    """Company Admin only: create/update the tenant's WhatsApp credentials.
+    A per-tenant `verify_token` is auto-generated on first create."""
+    if not user.get("company_id"):
+        raise HTTPException(400, "Super Admin does not have a per-tenant WhatsApp config. Use the global Provider Vault instead.")
+    existing = await db.company_whatsapp_configs.find_one({"company_id": user["company_id"]}, {"_id": 0})
+    now = iso(now_utc())
+    upd: Dict[str, Any] = {"updated_at": now, "updated_by": user.get("email")}
+    for k in ("access_token", "phone_number_id", "app_secret", "graph_version"):
+        v = getattr(body, k, None)
+        if v is not None:
+            upd[k] = v.strip() if isinstance(v, str) else v
+    if body.is_active is not None: upd["is_active"] = bool(body.is_active)
+    if body.mock is not None: upd["mock"] = bool(body.mock)
+    if not existing:
+        upd.update({
+            "id": new_id(), "company_id": user["company_id"],
+            "verify_token": f"tzs_{secrets.token_urlsafe(24)}",
+            "is_active": upd.get("is_active", True),
+            "mock": upd.get("mock", False),
+            "created_at": now, "created_by": user.get("email"),
+        })
+        await db.company_whatsapp_configs.insert_one(upd)
+        await audit("wa_config_created", "wa_config", user["company_id"], user,
+                    {"phone_number_id": upd.get("phone_number_id", ""), "mock": upd.get("mock")})
+    else:
+        await db.company_whatsapp_configs.update_one(
+            {"company_id": user["company_id"]}, {"$set": upd})
+        await audit("wa_config_updated", "wa_config", user["company_id"], user,
+                    {"fields": sorted([k for k in upd.keys() if k not in ("updated_at","updated_by")])})
+    cfg = await db.company_whatsapp_configs.find_one({"company_id": user["company_id"]}, {"_id": 0})
+    base_url = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+    webhook_path = f"/api/webhook/whatsapp/{user['company_id']}"
+    return {
+        "ok": True, "configured": True,
+        **_mask_wa(cfg),
+        "webhook_path": webhook_path,
+        "webhook_url": (base_url + webhook_path) if base_url else webhook_path,
+    }
+
+
+@api.delete("/whatsapp/config")
+async def delete_wa_config(user: dict = Depends(require_roles("super_admin","admin"))):
+    if not user.get("company_id"):
+        raise HTTPException(400, "Super Admin does not have a per-tenant WhatsApp config.")
+    res = await db.company_whatsapp_configs.delete_one({"company_id": user["company_id"]})
+    await audit("wa_config_deleted", "wa_config", user["company_id"], user)
+    return {"ok": True, "deleted": res.deleted_count}
+
+
+@api.post("/whatsapp/config/test")
+async def test_wa_config(user: dict = Depends(require_roles("super_admin","admin"))):
+    """Live Meta Graph handshake using the tenant's own credentials."""
+    if not user.get("company_id"):
+        raise HTTPException(400, "Use POST /api/providers/{id}/test for the platform-level provider.")
+    creds = await meta_wa_credentials(user["company_id"])
+    if not creds:
+        return {"ok": False, "mode": "mock",
+                "message": "No live credentials configured for this tenant. Add access_token + phone_number_id and set mock=false."}
+    result = await meta_wa.health_check(creds)
+    return {"ok": result["ok"], "mode": "live", "message": result["message"], "phone_number_id": creds.get("phone_number_id")}
+
+
+# ─────────── Per-tenant Meta WhatsApp webhook ───────────
+@api.get("/webhook/whatsapp/{company_id}")
+async def meta_whatsapp_verify_tenant(company_id: str, request: _FRequest):
+    """Meta webhook verification handshake using the tenant's own verify_token."""
+    cfg = await db.company_whatsapp_configs.find_one({"company_id": company_id}, {"_id": 0})
+    if not cfg:
+        raise HTTPException(404, "Tenant WhatsApp config not found")
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+    expected = (cfg.get("verify_token") or "").strip()
+    if mode == "subscribe" and expected and token == expected and challenge:
+        return PlainTextResponse(content=challenge, status_code=200)
+    raise HTTPException(403, "Webhook verification failed")
+
+
+@api.post("/webhook/whatsapp/{company_id}")
+async def meta_whatsapp_webhook_tenant(company_id: str, request: _FRequest):
+    """Receives Meta Cloud API events for a specific tenant."""
+    cfg = await db.company_whatsapp_configs.find_one({"company_id": company_id}, {"_id": 0})
+    if not cfg:
+        raise HTTPException(404, "Tenant WhatsApp config not found")
+    raw = await request.body()
+    app_secret = (cfg.get("app_secret") or "").strip()
+    sig_ok = meta_wa.verify_meta_signature(app_secret, raw, request.headers.get("X-Hub-Signature-256") or "")
+    payload = await request.json() if raw else {}
+    await db.webhook_events.insert_one({
+        "id": new_id(), "channel": "whatsapp", "provider": "meta_whatsapp",
+        "event_type": "meta_webhook", "payload": payload,
+        "signature_valid": sig_ok, "processed": sig_ok,
+        "company_id": company_id,
+        "created_at": iso(now_utc()),
+    })
+    if not sig_ok:
+        log.warning("Meta WA tenant webhook (%s): invalid X-Hub-Signature-256, rejecting", company_id)
+        raise HTTPException(401, "Invalid signature")
+    if payload.get("object") != "whatsapp_business_account":
+        return {"status": "ignored"}
+    n_status, n_inbound = 0, 0
+    for entry in payload.get("entry", []) or []:
+        for change in entry.get("changes", []) or []:
+            if change.get("field") != "messages":
+                continue
+            value = change.get("value", {}) or {}
+            for st in value.get("statuses", []) or []:
+                await _meta_handle_status(st)
+                n_status += 1
+            for m in value.get("messages", []) or []:
+                await _meta_handle_inbound(m, value.get("contacts", []) or [], company_id=company_id)
+                n_inbound += 1
+    log.info("Meta WA tenant %s webhook: %s status update(s), %s inbound message(s)", company_id, n_status, n_inbound)
+    return {"status": "received"}
 
 
 # ───────────────────────── Usage / Billing ─────────────────────────

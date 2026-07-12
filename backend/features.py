@@ -197,7 +197,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
             adapter = ADAPTERS.get(body.channel)
             if adapter:
                 try:
-                    resp = await adapter.send(recipient, body_text, None)
+                    resp = await adapter.send(recipient, body_text, None, company_id=user.get("company_id"))
                     await db.messages.update_one({"id": mid}, {"$set": {"provider_message_id": resp.get("provider_message_id")}})
                     asyncio.create_task(_deliver(mid, body.channel, adapter))
                 except Exception as e:
@@ -336,7 +336,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
             })
             if adapter:
                 try:
-                    resp = await adapter.send(recipient, body.message or "Notice attached", f"/api/notices/download/{attachment_key}")
+                    resp = await adapter.send(recipient, body.message or "Notice attached", f"/api/notices/download/{attachment_key}", company_id=user.get("company_id"))
                     await db.messages.update_one({"id": mid}, {"$set": {"provider_message_id": resp.get("provider_message_id")}})
                     asyncio.create_task(_deliver(mid, body.channel, adapter))
                 except Exception as e:
@@ -580,7 +580,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
                             "created_at": _iso(now), "updated_at": _iso(now),
                         })
                         try:
-                            resp = await adapter.send(recipient, rendered, None)
+                            resp = await adapter.send(recipient, rendered, None, company_id=r.get("company_id"))
                             await db.messages.update_one({"id": mid}, {"$set": {"provider_message_id": resp.get("provider_message_id")}})
                             asyncio.create_task(_deliver(mid, ch, adapter))
                         except Exception as e:
