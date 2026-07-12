@@ -346,8 +346,8 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
         return {"sent": sent, "skipped": skipped}
 
     @router.get("/notices/download/{key}")
-    async def download_notice(key: str, _: dict = Depends(current_user)):
-        rec = await db.notice_pdfs.find_one({"key": key}, {"_id": 0})
+    async def download_notice(key: str, user: dict = Depends(current_user)):
+        rec = await db.notice_pdfs.find_one(cflt(user, {"key": key}), {"_id": 0})
         if not rec:
             raise HTTPException(404, "Not found")
         pdf = base64.b64decode(rec["pdf_b64"])
@@ -437,7 +437,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
         c = await db.voice_campaigns.find_one(cflt(user, {"id": camp_id}), {"_id": 0})
         if not c:
             raise HTTPException(404, "Not found")
-        calls = await db.call_logs.find({"voice_campaign_id": camp_id}, {"_id": 0}).sort("created_at", -1).limit(500).to_list(500)
+        calls = await db.call_logs.find(cflt(user, {"voice_campaign_id": camp_id}), {"_id": 0}).sort("created_at", -1).limit(500).to_list(500)
         return {"campaign": c, "calls": calls}
 
     # =====================================================================
@@ -460,7 +460,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
     @router.post("/bills/enable-reminders")
     async def enable_reminders(body: EnableRemindersIn, user: dict = Depends(current_user)):
         steps = body.steps or DEFAULT_STEPS
-        bills = await db.bills.find({"id": {"$in": body.bill_ids}}, {"_id": 0}).to_list(len(body.bill_ids))
+        bills = await db.bills.find(cflt(user, {"id": {"$in": body.bill_ids}}), {"_id": 0}).to_list(len(body.bill_ids))
         created = 0; skipped = 0
         for b in bills:
             dd = (b.get("due_date") or "").strip()
@@ -497,10 +497,10 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
 
     @router.post("/bills/{bill_id}/mark-paid")
     async def mark_bill_paid(bill_id: str, user: dict = Depends(current_user)):
-        existing = await db.bills.find_one({"id": bill_id}, {"_id": 0, "id": 1})
+        existing = await db.bills.find_one(cflt(user, {"id": bill_id}), {"_id": 0, "id": 1})
         if not existing:
             raise HTTPException(404, "Bill not found")
-        await db.bills.update_one({"id": bill_id}, {"$set": {"paid": True, "paid_at": _iso(_now())}})
+        await db.bills.update_one(cflt(user, {"id": bill_id}), {"$set": {"paid": True, "paid_at": _iso(_now())}})
         result = await db.reminder_schedules.update_many(
             {"bill_id": bill_id, "status": "pending"},
             {"$set": {"status": "cancelled"}},

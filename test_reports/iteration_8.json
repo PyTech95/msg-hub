@@ -1,0 +1,25 @@
+{
+  "summary": "P0 multi-tenant SaaS data isolation verification. 28 new pytest cases in test_iteration8_isolation.py + 29 regression cases (iter6 + iter7) — 57/57 PASS. Verified: SA-only company create/list/delete, unique admin_email 409, per-tenant scoping on contacts (list/get/patch/delete/bulk-delete/CSV import), lists, templates, campaigns (incl. recipients), messages+events, calls, dashboard stats, audit-logs, usage/invoices, notice-templates, voice-campaigns, reminders. RBAC: company admin gets 403 on /providers (GET/POST/DELETE), /providers/{id}/credentials (GET/PUT), /providers/{id}/test, /webhooks/events, /whatsapp/setup, /companies; SA gets 200 on all. Company DELETE cascades and admin login fails post-delete. Provider list untouched after tenant activity.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_iteration8_isolation.py",
+    "/app/test_reports/pytest/iter8_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "DELETE /api/contacts/{id} for a cross-tenant id returns 200 {'ok': true} even though nothing was deleted (delete_one with cflt filter matches nothing). Consider raising 404 when matched_count==0 to give the caller a truthful signal — currently harmless due to scoping but is a semantic leak (a malicious tenant cannot confirm the id exists elsewhere though, since the response is identical whether the id exists in another tenant or not — so this is fine as-is for security).",
+    "Same 'silent no-op' pattern in DELETE /lists, /templates, /campaigns and PATCH /lists — matched_count is not checked. Acceptable but consider returning {'deleted': N} or 404.",
+    "audit_logs collection is listed in TENANT_COLLECTIONS for cascade delete, but audit_logs documents currently do NOT store company_id (audit() only writes actor fields). Therefore, DELETE /api/companies/{id} will NOT actually remove that company's audit rows — they stay in the DB. Additionally, GET /api/audit-logs scoping via cflt(user) filters on 'company_id' which those rows lack, so a company admin sees an empty list — which is 'safe by default' but hides real audit history. Recommend: add company_id to audit() by threading actor.company_id into every audit call.",
+    "server.py is ~2000 lines — split into routers/ modules (auth, companies, contacts, campaigns, messages, providers, webhooks) for maintainability.",
+    "cflt() correctly returns {} for platform users (no company_id) so super_admin sees aggregate — good. But some endpoints combine cflt with require_roles('super_admin','admin') which permits BOTH company admins and SA; this is intentional and works because cflt narrows the query for company users."
+  ],
+  "updated_files": ["/app/backend/tests/test_iteration8_isolation.py"],
+  "success_rate": {"backend": "100%", "frontend": "not tested (backend-only requested)"},
+  "test_credentials": "admin@cpaas.io / Admin@12345 (SA); tenantA+<ts>@test.com, tenantB+<ts>@test.com / Test@12345 (created + cleaned up in-test via DELETE /companies)",
+  "seed_data_creation": "Test tenants TEST_CoA_*, TEST_CoB_*, TEST_CoC_* + their admins/contacts/templates/campaigns/messages/calls/lists/notice-templates are auto-cleaned via company DELETE cascade in module teardown / TestCompanyDeleteCascade. Note: audit_logs rows for these tenants may linger (see code review comment #3).",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 8 added test_iteration8_isolation.py — 28 tests covering the P0 multi-tenant isolation surface. To run all regression tests locally: `cd /app && export REACT_APP_BACKEND_URL=$(grep REACT_APP_BACKEND_URL frontend/.env | cut -d= -f2) && export DB_NAME=cpaas_database && export MONGO_URL=mongodb://localhost:27017 && pytest backend/tests/ -q`. Iter6 and iter7 tests need DB_NAME + MONGO_URL exported because they use pymongo directly. Only real gap noticed: audit_logs docs don't carry company_id — see review comment #3 (non-blocking for P0 isolation).",
+  "rca of the issue": "N/A — all data-isolation P0 requirements pass. Only enhancement recommendation is to add company_id to audit_logs docs so tenant admins can see their own audit trail post-cascade and cascade-delete actually purges their audit history."
+}

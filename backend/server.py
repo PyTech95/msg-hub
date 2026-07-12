@@ -401,7 +401,7 @@ async def emit_inbound_reply(message_id: str):
     await db.campaigns.update_one({"id": msg.get("campaign_id") or "_"}, {"$inc": {"stats.replied": 1}})
     await db.conversations.update_one(
         {"contact_id": msg["contact_id"], "channel": msg["channel"]},
-        {"$set": {"last_message_at": iso(now_utc()), "last_message": body, "unread": True}},
+        {"$set": {"last_message_at": iso(now_utc()), "last_message": body, "unread": True, "company_id": msg.get("company_id")}},
         upsert=True,
     )
     if body.strip().upper() == "STOP":
@@ -976,8 +976,8 @@ async def delete_company(company_id: str, actor: dict = Depends(require_roles("s
 
 # ───────────────────────── Contacts ─────────────────────────
 @api.get("/contacts")
-async def list_contacts(q: Optional[str] = None, list_id: Optional[str] = None, _: dict = Depends(current_user)):
-    flt: Dict[str, Any] = {}
+async def list_contacts(q: Optional[str] = None, list_id: Optional[str] = None, user: dict = Depends(current_user)):
+    flt: Dict[str, Any] = cflt(user)
     if q:
         flt["$or"] = [{"name": {"$regex": q, "$options": "i"}}, {"phone": {"$regex": q}}, {"email": {"$regex": q, "$options": "i"}}]
     if list_id:
@@ -986,42 +986,44 @@ async def list_contacts(q: Optional[str] = None, list_id: Optional[str] = None, 
     return docs
 
 @api.post("/contacts")
-async def create_contact(body: ContactIn, _: dict = Depends(current_user)):
+async def create_contact(body: ContactIn, user: dict = Depends(current_user)):
     doc = body.model_dump()
     doc["id"] = new_id()
     doc["opted_out"] = False
+    doc["company_id"] = user.get("company_id")
     doc["created_at"] = iso(now_utc())
     await db.contacts.insert_one(doc)
     return clean(doc)
 
 @api.get("/contacts/{contact_id}")
-async def get_contact(contact_id: str, _: dict = Depends(current_user)):
-    c = await db.contacts.find_one({"id": contact_id}, {"_id": 0})
+async def get_contact(contact_id: str, user: dict = Depends(current_user)):
+    c = await db.contacts.find_one(cflt(user, {"id": contact_id}), {"_id": 0})
     if not c:
         raise HTTPException(404, "Contact not found")
     return c
 
 @api.patch("/contacts/{contact_id}")
-async def update_contact(contact_id: str, body: ContactUpdate, _: dict = Depends(current_user)):
+async def update_contact(contact_id: str, body: ContactUpdate, user: dict = Depends(current_user)):
     upd = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     if not upd:
         raise HTTPException(400, "No fields")
-    await db.contacts.update_one({"id": contact_id}, {"$set": upd})
-    c = await db.contacts.find_one({"id": contact_id}, {"_id": 0})
-    return c
+    res = await db.contacts.update_one(cflt(user, {"id": contact_id}), {"$set": upd})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Contact not found")
+    return await db.contacts.find_one(cflt(user, {"id": contact_id}), {"_id": 0})
 
 @api.delete("/contacts/{contact_id}")
-async def delete_contact(contact_id: str, _: dict = Depends(require_roles("super_admin","admin"))):
-    await db.contacts.delete_one({"id": contact_id})
+async def delete_contact(contact_id: str, user: dict = Depends(require_roles("super_admin","admin"))):
+    await db.contacts.delete_one(cflt(user, {"id": contact_id}))
     return {"ok": True}
 
 @api.post("/contacts/bulk-delete")
-async def bulk_delete_contacts(ids: List[str], _: dict = Depends(require_roles("super_admin","admin"))):
-    res = await db.contacts.delete_many({"id": {"$in": ids}})
+async def bulk_delete_contacts(ids: List[str], user: dict = Depends(require_roles("super_admin","admin"))):
+    res = await db.contacts.delete_many(cflt(user, {"id": {"$in": ids}}))
     return {"deleted": res.deleted_count}
 
 @api.post("/contacts/import")
-async def import_contacts_csv(file: UploadFile = File(...), _: dict = Depends(current_user)):
+async def import_contacts_csv(file: UploadFile = File(...), user: dict = Depends(current_user)):
     raw = (await file.read()).decode("utf-8", errors="ignore")
     reader = csv.DictReader(io.StringIO(raw))
     inserted = 0
@@ -1120,8 +1122,8 @@ def render_body(tpl_body: str, contact: dict, variables_map: Dict[str, Any]) -> 
         body = body.replace("{{" + k + "}}", str(v))
     return body
 
-async def resolve_audience(list_ids: List[str], contact_ids: List[str]) -> List[dict]:
-    flt: Dict[str, Any] = {"opted_out": {"$ne": True}, "dnd": {"$ne": True}}
+async def resolve_audience(user: dict, list_ids: List[str], contact_ids: List[str]) -> List[dict]:
+    flt: Dict[str, Any] = cflt(user, {"opted_out": {"$ne": True}, "dnd": {"$ne": True}})
     or_clauses = []
     if list_ids:
         or_clauses.append({"list_ids": {"$in": list_ids}})
@@ -1140,7 +1142,7 @@ async def get_campaign(campaign_id: str, user: dict = Depends(current_user)):
     c = await db.campaigns.find_one(cflt(user, {"id": campaign_id}), {"_id": 0})
     if not c:
         raise HTTPException(404, "Not found")
-    recipients = await db.campaign_recipients.find({"campaign_id": campaign_id}, {"_id": 0}).limit(500).to_list(500)
+    recipients = await db.campaign_recipients.find(cflt(user, {"campaign_id": campaign_id}), {"_id": 0}).limit(500).to_list(500)
     return {"campaign": c, "recipients": recipients}
 
 @api.post("/campaigns")
@@ -1211,7 +1213,7 @@ async def run_campaign(campaign_id: str, channel: Channel, tpl: dict, audience: 
 @api.delete("/campaigns/{campaign_id}")
 async def delete_campaign(campaign_id: str, user: dict = Depends(require_roles("super_admin","admin"))):
     await db.campaigns.delete_one(cflt(user, {"id": campaign_id}))
-    await db.campaign_recipients.delete_many({"campaign_id": campaign_id})
+    await db.campaign_recipients.delete_many(cflt(user, {"campaign_id": campaign_id}))
     return {"ok": True}
 
 # ───────────────────────── Messages (single send + logs) ─────────────────────────
@@ -1261,7 +1263,10 @@ async def list_messages(channel: Optional[Channel] = None, contact_id: Optional[
     return msgs
 
 @api.get("/messages/{message_id}/events")
-async def message_events(message_id: str, _: dict = Depends(current_user)):
+async def message_events(message_id: str, user: dict = Depends(current_user)):
+    msg = await db.messages.find_one(cflt(user, {"id": message_id}), {"_id": 0, "id": 1})
+    if not msg:
+        raise HTTPException(404, "Message not found")
     return await db.message_events.find({"message_id": message_id}, {"_id": 0}).sort("created_at", 1).to_list(200)
 
 # ───────────────────────── Conversations ─────────────────────────
@@ -1285,7 +1290,7 @@ async def contact_timeline(contact_id: str, user: dict = Depends(current_user)):
 # ───────────────────────── Voice Calls ─────────────────────────
 @api.post("/calls")
 async def initiate_call(body: CallIn, background: BackgroundTasks, user: dict = Depends(current_user)):
-    contact = await db.contacts.find_one({"id": body.contact_id}, {"_id": 0})
+    contact = await db.contacts.find_one(cflt(user, {"id": body.contact_id}), {"_id": 0})
     if not contact:
         raise HTTPException(404, "Contact not found")
     cid = new_id()
@@ -1294,6 +1299,7 @@ async def initiate_call(body: CallIn, background: BackgroundTasks, user: dict = 
         "duration_sec": 0, "recording_url": None,
         "provider_call_id": f"mock_{secrets.token_hex(6)}",
         "notes": body.notes or "",
+        "company_id": user.get("company_id"),
         "started_at": iso(now_utc()), "ended_at": None,
         "created_at": iso(now_utc()),
     }
@@ -1302,21 +1308,21 @@ async def initiate_call(body: CallIn, background: BackgroundTasks, user: dict = 
     # usage
     await db.usage_records.insert_one({
         "id": new_id(), "channel": "voice", "message_id": cid, "units": 1, "amount": PRICING["voice"],
-        "currency": "INR", "created_at": iso(now_utc())
+        "currency": "INR", "company_id": user.get("company_id"), "created_at": iso(now_utc())
     })
     return {"call_id": cid, "status": "initiated"}
 
 @api.get("/calls")
-async def list_calls(_: dict = Depends(current_user)):
-    return await db.call_logs.find({}, {"_id": 0}).sort("created_at", -1).limit(500).to_list(500)
+async def list_calls(user: dict = Depends(current_user)):
+    return await db.call_logs.find(cflt(user), {"_id": 0}).sort("created_at", -1).limit(500).to_list(500)
 
 # ───────────────────────── Providers ─────────────────────────
 @api.get("/providers")
-async def list_providers(_: dict = Depends(current_user)):
+async def list_providers(_: dict = Depends(platform_only("super_admin","admin"))):
     return await db.provider_accounts.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
 
 @api.post("/providers")
-async def create_provider(body: ProviderIn, _: dict = Depends(require_roles("super_admin","admin"))):
+async def create_provider(body: ProviderIn, _: dict = Depends(platform_only("super_admin","admin"))):
     doc = body.model_dump()
     doc["id"] = new_id()
     doc["created_at"] = iso(now_utc())
@@ -1330,7 +1336,7 @@ async def update_provider(provider_id: str, body: ProviderIn, _: dict = Depends(
     return p
 
 @api.delete("/providers/{provider_id}")
-async def delete_provider(provider_id: str, _: dict = Depends(require_roles("super_admin"))):
+async def delete_provider(provider_id: str, _: dict = Depends(platform_only("super_admin"))):
     await db.provider_accounts.delete_one({"id": provider_id})
     return {"ok": True}
 
@@ -1351,7 +1357,7 @@ def mask_credentials(cred: Dict[str, Any]) -> Dict[str, Any]:
     return masked
 
 @api.get("/providers/{provider_id}/credentials")
-async def get_provider_credentials(provider_id: str, _: dict = Depends(require_roles("super_admin","admin"))):
+async def get_provider_credentials(provider_id: str, _: dict = Depends(platform_only("super_admin","admin"))):
     p = await db.provider_accounts.find_one({"id": provider_id}, {"_id": 0})
     if not p:
         raise HTTPException(404, "Not found")
@@ -1363,7 +1369,7 @@ async def get_provider_credentials(provider_id: str, _: dict = Depends(require_r
     }
 
 @api.put("/providers/{provider_id}/credentials")
-async def set_provider_credentials(provider_id: str, body: ProviderCredentialsIn, user: dict = Depends(require_roles("super_admin"))):
+async def set_provider_credentials(provider_id: str, body: ProviderCredentialsIn, user: dict = Depends(platform_only("super_admin"))):
     p = await db.provider_accounts.find_one({"id": provider_id}, {"_id": 0})
     if not p:
         raise HTTPException(404, "Not found")
@@ -1970,7 +1976,7 @@ async def campaign_scheduler_loop():
                         await db.campaigns.update_one({"id": c["id"]}, {"$set": {"status": "failed", "error": "template missing"}})
                         await audit("campaign_failed", "campaign", c["id"], None, {"reason": "template missing"})
                         continue
-                    audience = await resolve_audience({"company_id": c.get("company_id")}, c.get("list_ids", []) or [], c.get("contact_ids", []) or [])
+                    audience = await resolve_audience({"company_id": c.get("company_id"), "role": "admin"}, c.get("list_ids", []) or [], c.get("contact_ids", []) or [])
                     await db.campaigns.update_one({"id": c["id"]}, {"$set": {"status": "running"}})
                     await audit("campaign_auto_started", "campaign", c["id"], None, {"name": c.get("name"), "audience_size": len(audience)})
 
