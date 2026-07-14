@@ -1,0 +1,35 @@
+{
+  "summary": "Comprehensive testing of per-tenant WhatsApp credentials feature (backend + frontend). 22/22 new backend tests PASS including cross-tenant isolation, verify_token uniqueness, X-Hub-Signature-256 enforcement (signed accept + unsigned reject when app_secret set + unsigned accept when no app_secret), inbound message tagging with correct company_id, secret masking (raw token never returned), SA 400 restrictions on all tenant endpoints, partial-update preserves secrets, delete + company-cascade removes wa config. Frontend UI validated for both Company Admin flow (empty state → save → Step 1 webhook card with Callback URL + Verify Token starting 'tzs_' → Step 3 quicksend → Delete → back to Not configured) and Super Admin platform overview (tenant list, sidebar 'WhatsApp Setup' correctly hidden for SA, visible for tenant admin, platform-only items /providers /webhooks /companies hidden for tenant admin). P0 isolation regression (iteration 8): 27/28 pass — 1 transient network timeout on /reminders/upcoming (not a code regression).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Dashboard (pre-existing, unrelated to this iteration)", "issues": ["Recharts warning: 'width(-1) height(-1) of chart should be greater than 0' — container sizing issue on some charts. Pre-existing, not introduced by this iteration."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration9_wa_pertenant.py",
+    "/app/test_reports/pytest/iteration9.xml"
+  ],
+  "action_items": [
+    "Optional: Investigate pre-existing Recharts container sizing warnings on Dashboard (unrelated to this iteration)."
+  ],
+  "critical_code_review_comments": [
+    "server.py is 2218 lines — recommend splitting per-feature routers (whatsapp/, webhook/, companies/, contacts/, etc.) to improve maintainability. Not blocking.",
+    "GOOD: raw access_token / app_secret are never returned by any endpoint — only *_preview (masked last-4) and *_set boolean. Verified explicitly.",
+    "GOOD: verify_token is per-tenant and unique (secrets.token_urlsafe(24), 'tzs_' prefix).",
+    "GOOD: When app_secret is set, tenant webhook enforces X-Hub-Signature-256 (401 on invalid); when not set, signature check is bypassed — consistent with legacy behaviour.",
+    "GOOD: Company delete correctly cascades and removes company_whatsapp_configs row (verified by SA tenant_count drop and tenant list filter).",
+    "GOOD: cflt/scoping applied to messages/contacts created via inbound tenant webhook (verified: A cannot see B's inbound contact).",
+    "MINOR: PUT accepts empty strings for access_token — currently spec says empty means 'leave unchanged' (frontend strips before send). Backend `if v is not None` allows empty strings to overwrite. Frontend guards this correctly. Could tighten backend to also skip empty strings for safety."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (22/22 new; 27/28 P0 regression — 1 transient net timeout)", "frontend": "100%"},
+  "test_credentials": "SA admin@cpaas.io / Admin@12345. Ephemeral tenants created per test run with TEST_ prefix; auto-cleaned via company delete cascade.",
+  "seed_data_creation": "Ephemeral: 3 tenants (watest_A+*, watest_B+*, watest_cascade+*) plus 1 UI tenant (watest_UI+1784032793@test.com) created during tests; all cleaned via /api/companies DELETE cascade.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Feature is fully verified. Reuse test_iteration9_wa_pertenant.py for regression. All tenant-scoped WhatsApp behaviours (config CRUD, masking, per-tenant verify_token, tenant webhook GET+POST with signature enforcement, cross-tenant isolation, cascade) are covered. If retesting P0 isolation, note the reminders/upcoming timeout is intermittent — retry once.",
+  "rca of the issue": "N/A — no defects found."
+}
