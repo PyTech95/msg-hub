@@ -1849,8 +1849,14 @@ async def put_wa_config(body: WhatsAppConfigIn, user: dict = Depends(require_rol
     upd: Dict[str, Any] = {"updated_at": now, "updated_by": user.get("email")}
     for k in ("access_token", "phone_number_id", "app_secret", "graph_version"):
         v = getattr(body, k, None)
-        if v is not None:
-            upd[k] = v.strip() if isinstance(v, str) else v
+        if v is None:
+            continue
+        if isinstance(v, str):
+            v = v.strip()
+            # Empty string = "leave unchanged" for secrets/identifiers
+            if not v:
+                continue
+        upd[k] = v
     if body.is_active is not None: upd["is_active"] = bool(body.is_active)
     if body.mock is not None: upd["mock"] = bool(body.mock)
     if not existing:
