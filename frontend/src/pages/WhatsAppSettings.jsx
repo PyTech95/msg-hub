@@ -52,6 +52,9 @@ export default function WhatsAppSettings() {
   // Quick send-test
   const [to, setTo] = useState("");
   const [msg, setMsg] = useState("Hello from tezsandesh.digital 👋");
+  const [quickMode, setQuickMode] = useState("template");  // template is safer default
+  const [quickTpl, setQuickTpl] = useState("hello_world");
+  const [quickLang, setQuickLang] = useState("en_US");
   const [sending, setSending] = useState(false);
   const [sendResult, setSendResult] = useState(null);
 
@@ -126,7 +129,14 @@ export default function WhatsAppSettings() {
     e.preventDefault();
     setSending(true); setSendResult(null);
     try {
-      const { data } = await api.post("/whatsapp/send-message", { to, message: msg });
+      const payload = { to };
+      if (quickMode === "template") {
+        payload.template_name = quickTpl.trim();
+        payload.template_language = quickLang.trim() || "en_US";
+      } else {
+        payload.message = msg;
+      }
+      const { data } = await api.post("/whatsapp/send-message", payload);
       setSendResult({ ok: true, ...data });
       toast.success(data.mode === "live" ? "Sent via Meta Cloud API!" : "Sent in MOCK mode");
     } catch (err) {
@@ -333,12 +343,36 @@ export default function WhatsAppSettings() {
         <Card className="rounded-sm shadow-none">
           <CardContent className="p-4 space-y-3">
             <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Step 3 · Send a test message</div>
-            <form onSubmit={quickSend} className="grid grid-cols-1 md:grid-cols-[220px_1fr_auto] gap-2">
-              <Input required placeholder="+91XXXXXXXXXX" value={to} onChange={e => setTo(e.target.value)} className="rounded-sm" data-testid="wa-quicksend-to" />
-              <Input required placeholder="Message" value={msg} onChange={e => setMsg(e.target.value)} className="rounded-sm" data-testid="wa-quicksend-message" />
-              <Button type="submit" disabled={sending} className="rounded-sm gap-1" data-testid="wa-quicksend-button">
-                <Send className="h-3.5 w-3.5" /> {sending ? "Sending…" : "Send"}
+            <div className="text-[11px] text-muted-foreground -mt-1">
+              Free-form text is only delivered if the recipient messaged your business in the last 24h. Use an approved template like <code className="bg-muted px-1 rounded">hello_world</code> to always deliver.
+            </div>
+            <div className="flex items-center gap-2">
+              <Button type="button" size="sm" variant={quickMode === "freeform" ? "default" : "outline"} className="rounded-sm h-7 text-xs" onClick={() => setQuickMode("freeform")} data-testid="quick-mode-freeform">
+                Free-form
               </Button>
+              <Button type="button" size="sm" variant={quickMode === "template" ? "default" : "outline"} className="rounded-sm h-7 text-xs" onClick={() => setQuickMode("template")} data-testid="quick-mode-template">
+                Template (recommended)
+              </Button>
+            </div>
+            <form onSubmit={quickSend} className="space-y-2">
+              {quickMode === "template" ? (
+                <div className="grid grid-cols-1 md:grid-cols-[220px_1fr_140px_auto] gap-2">
+                  <Input required placeholder="+91XXXXXXXXXX" value={to} onChange={e => setTo(e.target.value)} className="rounded-sm" data-testid="wa-quicksend-to" />
+                  <Input required placeholder="Template name" value={quickTpl} onChange={e => setQuickTpl(e.target.value)} className="rounded-sm font-mono" data-testid="wa-quicksend-template-name" />
+                  <Input placeholder="en_US" value={quickLang} onChange={e => setQuickLang(e.target.value)} className="rounded-sm font-mono" data-testid="wa-quicksend-template-lang" />
+                  <Button type="submit" disabled={sending} className="rounded-sm gap-1" data-testid="wa-quicksend-button">
+                    <Send className="h-3.5 w-3.5" /> {sending ? "Sending…" : "Send"}
+                  </Button>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-[220px_1fr_auto] gap-2">
+                  <Input required placeholder="+91XXXXXXXXXX" value={to} onChange={e => setTo(e.target.value)} className="rounded-sm" data-testid="wa-quicksend-to" />
+                  <Input required placeholder="Message" value={msg} onChange={e => setMsg(e.target.value)} className="rounded-sm" data-testid="wa-quicksend-message" />
+                  <Button type="submit" disabled={sending} className="rounded-sm gap-1" data-testid="wa-quicksend-button">
+                    <Send className="h-3.5 w-3.5" /> {sending ? "Sending…" : "Send"}
+                  </Button>
+                </div>
+              )}
             </form>
             {sendResult && (
               <div className={`p-2 rounded-sm border text-xs flex items-start gap-2 ${sendResult.ok ? "border-emerald-300 bg-emerald-50 dark:bg-emerald-900/20" : "border-red-300 bg-red-50 dark:bg-red-900/20"}`} data-testid="wa-quicksend-result">

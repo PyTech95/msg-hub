@@ -229,8 +229,14 @@ class CampaignIn(BaseModel):
 class SendMessageIn(BaseModel):
     channel: Channel
     contact_id: str
-    body: str
+    body: str = ""
     media_url: Optional[str] = None
+    # WhatsApp-only: send an approved Meta template instead of free-form text.
+    # Free-form text only delivers when the recipient messaged the business in the last 24h.
+    # Templates (e.g. "hello_world") always deliver regardless.
+    template_name: Optional[str] = None
+    template_language: Optional[str] = "en_US"
+    template_components: Optional[List[Dict[str, Any]]] = None
 
 class CallIn(BaseModel):
     contact_id: str
@@ -1250,6 +1256,7 @@ async def send_message(body: SendMessageIn, background: BackgroundTasks, user: d
         raise HTTPException(404, "Contact not found")
     if contact.get("opted_out"):
         raise HTTPException(400, "Contact has opted out")
+    is_wa_template = (body.channel == "whatsapp" and (body.template_name or "").strip() != "")
     mid = new_id()
     msg = {
         "id": mid, "channel": body.channel, "contact_id": body.contact_id, "direction": "outbound",
@@ -1257,10 +1264,24 @@ async def send_message(body: SendMessageIn, background: BackgroundTasks, user: d
         "provider_message_id": None, "campaign_id": None, "company_id": user.get("company_id"),
         "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
     }
+    if is_wa_template:
+        msg["meta"] = {
+            "template_name": body.template_name.strip(),
+            "template_language": (body.template_language or "en_US").strip(),
+            "template_components": body.template_components or [],
+        }
     await db.messages.insert_one(msg)
     adapter = ADAPTERS[body.channel]
     try:
-        resp = await adapter.send(contact["phone"], body.body, body.media_url, company_id=user.get("company_id"))
+        if is_wa_template:
+            resp = await adapter.send_template(
+                contact["phone"], body.template_name.strip(),
+                language_code=(body.template_language or "en_US").strip(),
+                components=body.template_components or None,
+                company_id=user.get("company_id"),
+            )
+        else:
+            resp = await adapter.send(contact["phone"], body.body, body.media_url, company_id=user.get("company_id"))
     except Exception as e:
         await emit_event(mid, "failed", reason=str(e))
         raise HTTPException(502, f"Send failed: {e}")
@@ -1711,8 +1732,11 @@ async def meta_whatsapp_webhook(request: _FRequest):
 
 class WhatsAppSendIn(BaseModel):
     to: str
-    message: str
+    message: str = ""
     media_url: Optional[str] = None
+    template_name: Optional[str] = None
+    template_language: Optional[str] = "en_US"
+    template_components: Optional[List[Dict[str, Any]]] = None
 
 @api.post("/whatsapp/send-message")
 async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTasks, user: dict = Depends(current_user)):
@@ -1731,15 +1755,31 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
             "list_ids": [], "dnd": False, "opted_out": False, "notes": "", "custom_fields": {},
             "company_id": user.get("company_id"), "created_at": iso(now_utc()),
         })
+    is_template = (body.template_name or "").strip() != ""
     mid = new_id()
-    await db.messages.insert_one({
+    msg_doc: Dict[str, Any] = {
         "id": mid, "channel": "whatsapp", "contact_id": cid, "direction": "outbound",
         "body": body.message, "media_url": body.media_url, "status": "queued",
         "provider_message_id": None, "campaign_id": None, "company_id": user.get("company_id"),
         "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
-    })
+    }
+    if is_template:
+        msg_doc["meta"] = {
+            "template_name": body.template_name.strip(),
+            "template_language": (body.template_language or "en_US").strip(),
+            "template_components": body.template_components or [],
+        }
+    await db.messages.insert_one(msg_doc)
     try:
-        resp = await ADAPTERS["whatsapp"].send(phone, body.message, body.media_url, company_id=user.get("company_id"))
+        if is_template:
+            resp = await ADAPTERS["whatsapp"].send_template(
+                phone, body.template_name.strip(),
+                language_code=(body.template_language or "en_US").strip(),
+                components=body.template_components or None,
+                company_id=user.get("company_id"),
+            )
+        else:
+            resp = await ADAPTERS["whatsapp"].send(phone, body.message, body.media_url, company_id=user.get("company_id"))
     except Exception as e:
         await emit_event(mid, "failed", reason=str(e), source="meta_whatsapp")
         raise HTTPException(502, f"WhatsApp send failed: {e}")

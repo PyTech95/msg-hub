@@ -3,9 +3,11 @@ import { useParams, Link } from "react-router-dom";
 import api from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { ChannelBadge, StatusBadge } from "@/components/Badges";
-import { Phone, ArrowLeft, Send, MessageSquare, MessageCircle, Smartphone } from "lucide-react";
+import { Phone, ArrowLeft, Send, MessageSquare, MessageCircle, Smartphone, AlertTriangle, Info } from "lucide-react";
 import { toast } from "sonner";
 
 const CHANNELS = [
@@ -24,6 +26,11 @@ export default function ContactProfile() {
   const [body, setBody] = useState("");
   const [sending, setSending] = useState(false);
 
+  // WhatsApp-specific send mode
+  const [waMode, setWaMode] = useState("freeform"); // "freeform" | "template"
+  const [tplName, setTplName] = useState("hello_world");
+  const [tplLang, setTplLang] = useState("en_US");
+
   const load = async () => {
     const c = await api.get(`/contacts/${id}`);
     setContact(c.data);
@@ -34,11 +41,20 @@ export default function ContactProfile() {
 
   const send = async (e) => {
     e.preventDefault();
-    if (!body.trim()) return;
+    const isTemplate = channel === "whatsapp" && waMode === "template";
+    if (!isTemplate && !body.trim()) return;
+    if (isTemplate && !tplName.trim()) { toast.error("Template name required"); return; }
     setSending(true);
     try {
-      await api.post("/messages/send", { channel, contact_id: id, body });
-      toast.success("Message queued");
+      const payload = { channel, contact_id: id, body: isTemplate ? "" : body };
+      if (isTemplate) {
+        payload.template_name = tplName.trim();
+        payload.template_language = tplLang.trim() || "en_US";
+      }
+      await api.post("/messages/send", payload);
+      toast.success(isTemplate
+        ? `Template "${tplName}" queued — this always delivers when the template is approved by Meta.`
+        : "Message queued");
       setBody("");
       setTimeout(load, 700);
       setTimeout(load, 2200);
@@ -59,6 +75,13 @@ export default function ContactProfile() {
   };
 
   if (!contact) return <div className="text-sm text-muted-foreground">Loading…</div>;
+
+  // Has the contact sent an inbound WhatsApp in the last 24h? (indicates open service window)
+  const now = Date.now();
+  const has24hInbound = (timeline.messages || []).some(m =>
+    m.channel === "whatsapp" && m.direction === "inbound" &&
+    (now - new Date(m.created_at).getTime()) <= 24 * 3600 * 1000
+  );
 
   // Combined timeline events
   const events = [
@@ -106,11 +129,55 @@ export default function ContactProfile() {
                 </Button>
               ))}
             </div>
+
+            {channel === "whatsapp" && !has24hInbound && waMode === "freeform" && (
+              <div className="flex items-start gap-2 p-3 rounded-sm border border-amber-300 bg-amber-50 dark:bg-amber-900/20 text-xs" data-testid="wa-window-warning">
+                <AlertTriangle className="h-4 w-4 text-amber-600 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <div className="font-semibold text-amber-900 dark:text-amber-200">Meta 24-hour window is not open for this contact</div>
+                  <div className="text-amber-800 dark:text-amber-300">
+                    Meta will silently drop free-form text if the customer hasn&apos;t messaged your business in the last 24 hours (or if your phone number is still in Meta&apos;s dev-mode allowlist). Use an <strong>approved template</strong> instead — it always delivers.
+                  </div>
+                  <Button type="button" size="sm" variant="outline" className="rounded-sm h-7 mt-1 border-amber-400" onClick={() => setWaMode("template")} data-testid="switch-to-template-mode">
+                    Switch to Template
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {channel === "whatsapp" && (
+              <div className="flex items-center gap-2" data-testid="wa-mode-toggle">
+                <Button type="button" size="sm" variant={waMode === "freeform" ? "default" : "outline"} className="rounded-sm h-7 text-xs" onClick={() => setWaMode("freeform")} data-testid="wa-mode-freeform">
+                  Free-form text
+                </Button>
+                <Button type="button" size="sm" variant={waMode === "template" ? "default" : "outline"} className="rounded-sm h-7 text-xs" onClick={() => setWaMode("template")} data-testid="wa-mode-template">
+                  Approved template
+                </Button>
+                {has24hInbound && waMode === "freeform" && (
+                  <span className="text-[11px] text-emerald-700 flex items-center gap-1 ml-2"><Info className="h-3 w-3" /> 24h window open</span>
+                )}
+              </div>
+            )}
+
             <form onSubmit={send} className="space-y-2">
-              <Textarea value={body} onChange={e => setBody(e.target.value)} rows={3}
-                placeholder={`Write a ${channel} message…`} className="rounded-sm" data-testid="compose-message-input" />
+              {channel === "whatsapp" && waMode === "template" ? (
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="space-y-1">
+                    <Label className="text-xs">Template name</Label>
+                    <Input value={tplName} onChange={e => setTplName(e.target.value)} placeholder="hello_world" className="rounded-sm font-mono" data-testid="wa-template-name-input" />
+                    <div className="text-[10px] text-muted-foreground">Default: <code className="bg-muted px-1 rounded">hello_world</code> (pre-approved by Meta)</div>
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs">Language code</Label>
+                    <Input value={tplLang} onChange={e => setTplLang(e.target.value)} placeholder="en_US" className="rounded-sm font-mono" data-testid="wa-template-lang-input" />
+                  </div>
+                </div>
+              ) : (
+                <Textarea value={body} onChange={e => setBody(e.target.value)} rows={3}
+                  placeholder={`Write a ${channel} message…`} className="rounded-sm" data-testid="compose-message-input" />
+              )}
               <div className="flex justify-end">
-                <Button type="submit" disabled={sending || !body.trim()} className="rounded-sm gap-2" data-testid="send-message-button">
+                <Button type="submit" disabled={sending || (channel === "whatsapp" && waMode === "template" ? !tplName.trim() : !body.trim())} className="rounded-sm gap-2" data-testid="send-message-button">
                   <Send className="h-4 w-4" /> {sending ? "Sending…" : "Send"}
                 </Button>
               </div>
