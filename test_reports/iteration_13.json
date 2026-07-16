@@ -1,0 +1,34 @@
+{
+  "summary": "Iteration 13 — WhatsApp templates per-tenant isolation + SA env fallback + SA templates card rendering. Backend 8/8 tests pass. Frontend had a CRITICAL TDZ bug (fixed by testing agent): `loadTemplates` was referenced by `templatesCard` JSX (line 94) before its `const` declaration (line 157), causing an Uncaught ReferenceError that crashed the entire /whatsapp-settings page for BOTH SA and CA. After moving `loadTemplates` above `templatesCard`, SA view now renders `wa-templates-card` with 3 template rows (3p_direct_integration_test_template APPROVED, hello_world APPROVED, hello PENDING). CA without config correctly does NOT render the card (per spec).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "WhatsAppSettings.jsx", "issue": "TDZ error: `loadTemplates` referenced inside `templatesCard` JSX before its `const` declaration → Uncaught ReferenceError 'Cannot access loadTemplates before initialization' → page crashes with red overlay. FIXED by testing agent: moved loadTemplates() definition above templatesCard block.", "selector": "[data-testid=wa-templates-card]", "priority": "CRITICAL (fixed)"}
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration13_wa_templates_isolation.py",
+    "/app/test_reports/pytest/iteration13.xml"
+  ],
+  "action_items": [
+    "Verify the JSX reordering fix in WhatsAppSettings.jsx (loadTemplates now defined before templatesCard). If preferred, wrap in useCallback and hoist via functional pattern.",
+    "Add a lint rule / test to catch temporal-dead-zone references in JSX (this crashed the entire page)."
+  ],
+  "critical_code_review_comments": [
+    "Frontend: TDZ error was undetectable at compile time because ESLint no-use-before-define is likely disabled. Consider enabling it for const/let referenced in JSX.",
+    "Backend list_wa_templates cleanly separates tenant vs SA branches now — good tenant isolation. `status` param still not enum-validated (carry-over from iteration 12)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration13_wa_templates_isolation.py (new — 8 tests, all pass)",
+    "/app/frontend/src/pages/WhatsAppSettings.jsx (moved const loadTemplates above templatesCard to fix TDZ crash)"
+  ],
+  "success_rate": {"backend": "100% (8/8)", "frontend": "100% after TDZ fix (SA card renders with 3 templates; CA without cfg correctly hides card; CA WA setup page loads with data-testid inputs)"},
+  "test_credentials": "SA admin@cpaas.io / Admin@12345. Ephemeral tenants created and deleted inside tests.",
+  "seed_data_creation": "Two transient tenants TEST_WATPL13_* and TEST_UI13B_* created via UI; both deleted at teardown.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 13 verified: (a) backend GET /api/whatsapp/templates now enforces strict per-tenant isolation — CA without WA config gets {ok:false,error:'No live WhatsApp credentials...'}, CA with token+phone but no waba_id gets {ok:false,error:'WABA ID is not configured...'}, CA with full config uses tenant's own waba, SA still uses env WABA fallback (returns 3 templates). (b) Frontend SA view of /whatsapp-settings now renders wa-templates-card auto-loaded (3 rows). TDZ bug in WhatsAppSettings.jsx was fixed by moving `const loadTemplates = async () => {...}` above `const templatesCard = (...)` — without that fix, whole page crashed. Test file: test_iteration13_wa_templates_isolation.py.",
+  "rca of the issue": "TDZ RCA: `templatesCard` is a top-level JSX expression evaluated during component render at line 94, which reads `loadTemplates` via `onClick={loadTemplates}` at line 104. Because `loadTemplates` was declared with `const` at line 157 (below), JavaScript's temporal dead zone throws ReferenceError. Fix: move the `const loadTemplates = async () => {...}` block to before `const templatesCard = (...)`. Verified by reloading /whatsapp-settings as SA — card renders + auto-loads 3 templates."
+}

@@ -83,8 +83,13 @@ export default function WhatsAppSettings() {
   };
   useEffect(() => { load(); }, []);
   useEffect(() => {
-    if (cfg?.configured && cfg?.waba_id && templates === null) loadTemplates();
-  }, [cfg?.configured, cfg?.waba_id, templates]);
+    // Auto-load templates when: (a) company admin has waba_id configured, OR (b) super admin has platform env live
+    const canLoad = cfg && templates === null && !tplLoading && (
+      (cfg.configured && cfg.waba_id) ||
+      (!user?.company_id && cfg.platform_env_configured)
+    );
+    if (canLoad) loadTemplates();
+  }, [cfg, templates, user?.company_id, tplLoading]);
 
   const loadTemplates = async () => {
     setTplLoading(true); setTplError("");
@@ -105,6 +110,69 @@ export default function WhatsAppSettings() {
       setTplError(err.response?.data?.detail || err.message || "Failed to load templates");
     } finally { setTplLoading(false); }
   };
+
+  const templatesCard = (
+    <Card className="rounded-sm shadow-none" data-testid="wa-templates-card">
+      <CardContent className="p-4 space-y-3">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
+              <FileText className="h-3.5 w-3.5" /> Approved Templates
+            </div>
+            <div className="text-[11px] text-muted-foreground mt-0.5">Fetched live from Meta Graph API. Templates must be <strong>APPROVED</strong> before you can send them.</div>
+          </div>
+          <Button type="button" variant="outline" size="sm" onClick={loadTemplates} disabled={tplLoading} className="rounded-sm gap-1" data-testid="wa-templates-refresh">
+            <RefreshCw className={`h-3.5 w-3.5 ${tplLoading ? "animate-spin" : ""}`} /> {tplLoading ? "Loading…" : (templates === null ? "Load templates" : "Refresh")}
+          </Button>
+        </div>
+        {tplError && (
+          <div className="p-2 rounded-sm border border-red-300 bg-red-50 dark:bg-red-900/20 text-xs flex items-start gap-2" data-testid="wa-templates-error">
+            <AlertTriangle className="h-4 w-4 text-red-600 shrink-0 mt-0.5" />
+            <div>{tplError}</div>
+          </div>
+        )}
+        {templates && templates.length === 0 && !tplError && (
+          <div className="text-xs text-muted-foreground p-3 border border-dashed rounded-sm text-center" data-testid="wa-templates-empty">
+            No templates found. Create one in <a className="underline" href="https://business.facebook.com/wa/manage/message-templates/" target="_blank" rel="noreferrer">Meta Business Manager → Message Templates</a>.
+          </div>
+        )}
+        {templates && templates.length > 0 && (
+          <div className="border rounded-sm overflow-hidden" data-testid="wa-templates-list">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-muted/40">
+                  <th className="text-left p-2 font-medium">Name</th>
+                  <th className="text-left p-2 font-medium">Language</th>
+                  <th className="text-left p-2 font-medium">Category</th>
+                  <th className="text-left p-2 font-medium">Status</th>
+                  <th className="text-left p-2 font-medium">Vars</th>
+                  <th className="text-left p-2 font-medium">Body preview</th>
+                </tr>
+              </thead>
+              <tbody>
+                {templates.map(t => (
+                  <tr key={`${t.name}_${t.language}`} className="border-t hover:bg-muted/20" data-testid={`wa-template-row-${t.name}`}>
+                    <td className="p-2 font-mono">{t.name}</td>
+                    <td className="p-2 font-mono text-muted-foreground">{t.language}</td>
+                    <td className="p-2"><Badge variant="outline" className="rounded-sm text-[10px]">{t.category || "—"}</Badge></td>
+                    <td className="p-2">
+                      {t.status === "APPROVED"
+                        ? <Badge variant="outline" className="rounded-sm text-[10px] border-emerald-300 text-emerald-700">APPROVED</Badge>
+                        : t.status === "PENDING"
+                          ? <Badge variant="outline" className="rounded-sm text-[10px] border-amber-300 text-amber-700">PENDING</Badge>
+                          : <Badge variant="outline" className="rounded-sm text-[10px] border-red-300 text-red-700">{t.status}</Badge>}
+                    </td>
+                    <td className="p-2 font-mono">{t.variable_count}</td>
+                    <td className="p-2 text-muted-foreground max-w-md truncate" title={t.body_preview}>{t.body_preview || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
 
   const save = async (e) => {
     e.preventDefault();
@@ -228,6 +296,8 @@ export default function WhatsAppSettings() {
             </CardContent>
           </Card>
         )}
+        {/* Platform-level templates from env WABA */}
+        {cfg.platform_env_configured && templatesCard}
       </div>
     );
   }
@@ -379,68 +449,7 @@ export default function WhatsAppSettings() {
       </Card>
 
       {/* Step 2.5: Templates catalog (auto-fetched from Meta) */}
-      {isConfigured && (
-        <Card className="rounded-sm shadow-none" data-testid="wa-templates-card">
-          <CardContent className="p-4 space-y-3">
-            <div className="flex items-center justify-between flex-wrap gap-2">
-              <div>
-                <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
-                  <FileText className="h-3.5 w-3.5" /> Approved Templates
-                </div>
-                <div className="text-[11px] text-muted-foreground mt-0.5">Fetched live from Meta Graph API using your WABA ID. Templates must be <strong>APPROVED</strong> before you can send them.</div>
-              </div>
-              <Button type="button" variant="outline" size="sm" onClick={loadTemplates} disabled={tplLoading} className="rounded-sm gap-1" data-testid="wa-templates-refresh">
-                <RefreshCw className={`h-3.5 w-3.5 ${tplLoading ? "animate-spin" : ""}`} /> {tplLoading ? "Loading…" : (templates === null ? "Load templates" : "Refresh")}
-              </Button>
-            </div>
-            {tplError && (
-              <div className="p-2 rounded-sm border border-red-300 bg-red-50 dark:bg-red-900/20 text-xs flex items-start gap-2" data-testid="wa-templates-error">
-                <AlertTriangle className="h-4 w-4 text-red-600 shrink-0 mt-0.5" />
-                <div>{tplError}</div>
-              </div>
-            )}
-            {templates && templates.length === 0 && !tplError && (
-              <div className="text-xs text-muted-foreground p-3 border border-dashed rounded-sm text-center" data-testid="wa-templates-empty">
-                No templates found. Create one in <a className="underline" href="https://business.facebook.com/wa/manage/message-templates/" target="_blank" rel="noreferrer">Meta Business Manager → Message Templates</a>.
-              </div>
-            )}
-            {templates && templates.length > 0 && (
-              <div className="border rounded-sm overflow-hidden" data-testid="wa-templates-list">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="bg-muted/40">
-                      <th className="text-left p-2 font-medium">Name</th>
-                      <th className="text-left p-2 font-medium">Language</th>
-                      <th className="text-left p-2 font-medium">Category</th>
-                      <th className="text-left p-2 font-medium">Status</th>
-                      <th className="text-left p-2 font-medium">Vars</th>
-                      <th className="text-left p-2 font-medium">Body preview</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {templates.map(t => (
-                      <tr key={`${t.name}_${t.language}`} className="border-t hover:bg-muted/20" data-testid={`wa-template-row-${t.name}`}>
-                        <td className="p-2 font-mono">{t.name}</td>
-                        <td className="p-2 font-mono text-muted-foreground">{t.language}</td>
-                        <td className="p-2"><Badge variant="outline" className="rounded-sm text-[10px]">{t.category || "—"}</Badge></td>
-                        <td className="p-2">
-                          {t.status === "APPROVED"
-                            ? <Badge variant="outline" className="rounded-sm text-[10px] border-emerald-300 text-emerald-700">APPROVED</Badge>
-                            : t.status === "PENDING"
-                              ? <Badge variant="outline" className="rounded-sm text-[10px] border-amber-300 text-amber-700">PENDING</Badge>
-                              : <Badge variant="outline" className="rounded-sm text-[10px] border-red-300 text-red-700">{t.status}</Badge>}
-                        </td>
-                        <td className="p-2 font-mono">{t.variable_count}</td>
-                        <td className="p-2 text-muted-foreground max-w-md truncate" title={t.body_preview}>{t.body_preview || "—"}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      )}
+      {isConfigured && templatesCard}
 
       {/* Step 3: quick send test */}
       {isConfigured && (

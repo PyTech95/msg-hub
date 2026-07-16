@@ -1977,21 +1977,37 @@ async def list_wa_templates(status: Optional[str] = None, limit: int = 100,
                             user: dict = Depends(current_user)):
     """Fetch approved WhatsApp message templates from Meta Graph API.
     Filter by status (APPROVED / PENDING / REJECTED) — default returns all.
-    Requires WABA ID configured (per-tenant or env WHATSAPP_WABA_ID).
+    Requires WABA ID configured:
+      - Company Admin: must be set on the tenant's own WhatsApp config (per-tenant isolation).
+      - Super Admin: falls back to env WHATSAPP_WABA_ID.
     """
-    creds = await meta_wa_credentials(user.get("company_id"))
-    if not creds:
-        return {"ok": False, "templates": [],
-                "error": "No live WhatsApp credentials configured. Add access_token + phone_number_id in Step 2."}
-    waba_id = (creds.get("waba_id") or "").strip()
-    if not waba_id:
-        return {"ok": False, "templates": [],
-                "error": "WhatsApp Business Account (WABA) ID is not configured. Add it in Step 2 to fetch approved templates."}
+    is_tenant_user = bool(user.get("company_id"))
+    if is_tenant_user:
+        # Strict per-tenant scoping: do NOT inherit env/global creds
+        cfg = await db.company_whatsapp_configs.find_one(
+            {"company_id": user["company_id"], "is_active": True}, {"_id": 0})
+        if not cfg or cfg.get("mock", True) or not cfg.get("access_token") or not cfg.get("phone_number_id"):
+            return {"ok": False, "templates": [],
+                    "error": "No live WhatsApp credentials configured for this tenant. Save your access_token + phone_number_id in Step 2 (and set Mock mode off)."}
+        if not (cfg.get("waba_id") or "").strip():
+            return {"ok": False, "templates": [],
+                    "error": "WhatsApp Business Account (WABA) ID is not configured. Add it in Step 2 to fetch approved templates."}
+        access_token = cfg["access_token"]
+        waba_id = cfg["waba_id"].strip()
+        graph_version = cfg.get("graph_version") or "v22.0"
+    else:
+        creds = await meta_wa_credentials(None)  # SA: env/vault only
+        if not creds:
+            return {"ok": False, "templates": [],
+                    "error": "No live WhatsApp credentials configured at platform level."}
+        waba_id = (creds.get("waba_id") or "").strip()
+        if not waba_id:
+            return {"ok": False, "templates": [],
+                    "error": "Platform WABA ID (WHATSAPP_WABA_ID) is not configured."}
+        access_token = creds["access_token"]
+        graph_version = creds.get("graph_version") or "v22.0"
     result = await meta_wa.list_message_templates(
-        creds["access_token"], waba_id,
-        graph_version=creds.get("graph_version") or "v22.0",
-        limit=limit,
-    )
+        access_token, waba_id, graph_version=graph_version, limit=limit)
     if not result["ok"]:
         return {"ok": False, "templates": [], "error": result["error"]}
     # Enrich each template with body preview + variable count so the UI can render dropdowns cleanly.
@@ -2012,7 +2028,6 @@ async def list_wa_templates(status: Optional[str] = None, limit: int = 100,
             "variable_count": _template_variable_count(components),
             "components": components,
         })
-    # Sort: approved first, then by name
     templates.sort(key=lambda t: (0 if t["status"] == "APPROVED" else 1, t["name"] or ""))
     return {"ok": True, "templates": templates, "count": len(templates), "waba_id": waba_id}
 
