@@ -30,6 +30,8 @@ export default function ContactProfile() {
   const [waMode, setWaMode] = useState("freeform"); // "freeform" | "template"
   const [tplName, setTplName] = useState("hello_world");
   const [tplLang, setTplLang] = useState("en_US");
+  const [tplList, setTplList] = useState(null);       // null=not-loaded, []=loaded-empty, [...]=loaded
+  const [tplLoading, setTplLoading] = useState(false);
 
   const load = async () => {
     const c = await api.get(`/contacts/${id}`);
@@ -38,6 +40,23 @@ export default function ContactProfile() {
     setTimeline(t.data);
   };
   useEffect(() => { load(); }, [id]);
+
+  // Auto-load approved templates when user switches WhatsApp tab to Template mode
+  useEffect(() => {
+    if (channel !== "whatsapp" || waMode !== "template" || tplList !== null) return;
+    setTplLoading(true);
+    api.get("/whatsapp/templates?status=APPROVED")
+      .then(r => {
+        const list = r.data.ok ? (r.data.templates || []) : [];
+        setTplList(list);
+        // Pre-select first template if current selection isn't available
+        if (list.length > 0 && !list.find(t => t.name === tplName && t.language === tplLang)) {
+          setTplName(list[0].name); setTplLang(list[0].language);
+        }
+      })
+      .catch(() => setTplList([]))
+      .finally(() => setTplLoading(false));
+  }, [channel, waMode, tplList, tplName, tplLang]);
 
   const send = async (e) => {
     e.preventDefault();
@@ -161,15 +180,43 @@ export default function ContactProfile() {
 
             <form onSubmit={send} className="space-y-2">
               {channel === "whatsapp" && waMode === "template" ? (
-                <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-2">
                   <div className="space-y-1">
-                    <Label className="text-xs">Template name</Label>
-                    <Input value={tplName} onChange={e => setTplName(e.target.value)} placeholder="hello_world" className="rounded-sm font-mono" data-testid="wa-template-name-input" />
-                    <div className="text-[10px] text-muted-foreground">Default: <code className="bg-muted px-1 rounded">hello_world</code> (pre-approved by Meta)</div>
-                  </div>
-                  <div className="space-y-1">
-                    <Label className="text-xs">Language code</Label>
-                    <Input value={tplLang} onChange={e => setTplLang(e.target.value)} placeholder="en_US" className="rounded-sm font-mono" data-testid="wa-template-lang-input" />
+                    <Label className="text-xs">Approved template</Label>
+                    {tplLoading ? (
+                      <div className="text-xs text-muted-foreground p-2">Loading approved templates from Meta…</div>
+                    ) : (tplList && tplList.length > 0) ? (
+                      <>
+                        <select
+                          value={`${tplName}|${tplLang}`}
+                          onChange={e => {
+                            const [n, l] = e.target.value.split("|");
+                            setTplName(n); setTplLang(l);
+                          }}
+                          className="w-full rounded-sm border bg-background px-3 h-9 text-sm font-mono"
+                          data-testid="wa-template-select"
+                        >
+                          {tplList.map(t => (
+                            <option key={`${t.name}_${t.language}`} value={`${t.name}|${t.language}`}>
+                              {t.name} · {t.language} · [{t.category}]{t.variable_count > 0 ? ` · ${t.variable_count} var${t.variable_count > 1 ? "s" : ""}` : ""}
+                            </option>
+                          ))}
+                        </select>
+                        {(() => {
+                          const preview = (tplList.find(t => t.name === tplName && t.language === tplLang) || {}).body_preview;
+                          return preview ? (
+                            <div className="text-[11px] text-muted-foreground p-2 border rounded-sm bg-muted/30 whitespace-pre-wrap" data-testid="wa-template-preview">
+                              <span className="font-semibold text-foreground">Preview: </span>{preview}
+                            </div>
+                          ) : null;
+                        })()}
+                      </>
+                    ) : (
+                      <>
+                        <Input value={tplName} onChange={e => setTplName(e.target.value)} placeholder="hello_world" className="rounded-sm font-mono" data-testid="wa-template-name-input" />
+                        <div className="text-[10px] text-muted-foreground">No approved templates found. Type manually or create one in <a className="underline" href="https://business.facebook.com/wa/manage/message-templates/" target="_blank" rel="noreferrer">Meta Business Manager</a>.</div>
+                      </>
+                    )}
                   </div>
                 </div>
               ) : (

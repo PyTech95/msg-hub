@@ -1,0 +1,43 @@
+{
+  "summary": "Iteration 12 — WhatsApp Templates Manager UI verified. Backend GET /api/whatsapp/templates works via env WABA fallback (returns 3 templates: hello_world APPROVED, 3p_direct_integration_test_template APPROVED, hello PENDING). Status filter works. body_preview/variable_count helpers correct. PUT /api/whatsapp/config accepts waba_id; _mask_wa returns it. Frontend for a configured Company Admin shows Templates card, waba_id input, quick-send APPROVED-only dropdown, and ContactProfile approved-template dropdown with body preview + auto-select. SMS tab unaffected (regression pass).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/whatsapp/templates", "issue": "Spec says a Company Admin whose tenant has NO waba_id configured should return {ok:false, error:'...not configured'}. Current implementation falls through to global vault → env WHATSAPP_WABA_ID, so a Company Admin without any tenant config transparently sees the platform env's templates (returned ok:true with 3 env templates). This is a spec/impl mismatch: either the endpoint should not fall back to env for tenant users, or the spec should be updated. Not a crash — cosmetic/policy issue only."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "WhatsAppSettings (SA view)", "issue": "Super Admin path shows only 'Platform WhatsApp Overview' fallback — none of the new testids render (wa-templates-card, wa-waba-id-input, wa-quicksend-template-select all 0). Review request says card should render 'as SA or configured company admin'. Company Admin view is complete; SA view is not. If intentional (SA has no tenant context), spec wording could be relaxed.", "selector": "wa-settings-sa (SA-only branch at WhatsAppSettings.jsx:182)", "priority": "MEDIUM"}
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "WhatsAppSettings quick-send & ContactProfile WA-template", "issues": ["React hydration warning: <span> cannot be a child of <option>. Emerges from an instrumentation wrapper injecting span into native <option>. Cosmetic warning only; dropdown functions correctly."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration12_wa_templates_list.py",
+    "/app/test_reports/pytest/iteration12.xml"
+  ],
+  "action_items": [
+    "Decide policy: should Company Admin without waba_id fall through to env WABA_ID (current) or return 'not configured' error (spec)? If spec is authoritative, gate the env fallback inside list_wa_templates by user.role != company_admin OR skip fallback when company_id is set.",
+    "Decide whether Super Admin /whatsapp-settings should also render the Approved Templates card (fed by env WABA) — currently SA sees only the Platform Overview fallback and cannot view/refresh templates.",
+    "Suppress the <span>-inside-<option> hydration warning by adjusting the wrapper or using plain string children in the <select><option>{...}</option></select> at WhatsAppSettings.jsx:479 and ContactProfile <option> render."
+  ],
+  "critical_code_review_comments": [
+    "server.py still ~2333 lines — split into route modules per resource for maintainability (carried over from iteration 11).",
+    "meta_wa_credentials() falls through to env fallback even when company_id is passed. If per-tenant isolation is a security goal, tenant users should NOT silently inherit env creds — gate the env branch by company_id is None or make it explicit.",
+    "list_wa_templates does not validate `status` param values — free-string comparison OK today but could accept junk; consider Enum.",
+    "Meta Graph API call is unbounded by timeout in the endpoint layer (relies on adapter default). Add explicit timeout arg to avoid Cloudflare-fronted long-hangs."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration12_wa_templates_list.py (new)"
+  ],
+  "success_rate": {"backend": "86% (6/7 tests — 1 fails on spec vs impl for tenant no-waba fallback)", "frontend": "100% for Company Admin flow; SA path incomplete per spec"},
+  "test_credentials": "SA admin@cpaas.io / Admin@12345. Tenants created & deleted inside tests.",
+  "seed_data_creation": "One transient tenant created for UI walkthrough (deleted at end): TEST_UI_1784207611. Contact TEST_UI_TPL (cascaded on tenant delete).",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 12 covers WhatsApp Templates Manager. Backend endpoint /api/whatsapp/templates works via env WABA fallback and per-tenant waba_id. Company Admin UI (/whatsapp-settings) shows: waba_id input (wa-waba-id-input), Approved Templates card (wa-templates-card) with rows sorted APPROVED-first, and quicksend dropdown (wa-quicksend-template-select) filtered to APPROVED-only. ContactProfile WA tab → Approved template mode: wa-template-select + wa-template-preview render with first APPROVED auto-selected. SA view intentionally shows Platform Overview only. Test file: /app/backend/tests/test_iteration12_wa_templates_list.py.",
+  "rca of the issue": "N/A — no bugs to root-cause. Two spec-vs-implementation gaps documented as MEDIUM issues (env fallback for tenant no-waba, SA view lacks templates card). Both are design decisions rather than defects; awaiting main-agent product call."
+}

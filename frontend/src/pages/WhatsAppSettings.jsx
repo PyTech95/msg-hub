@@ -82,13 +82,20 @@ export default function WhatsAppSettings() {
     }
   };
   useEffect(() => { load(); }, []);
+  useEffect(() => {
+    if (cfg?.configured && cfg?.waba_id && templates === null) loadTemplates();
+  }, [cfg?.configured, cfg?.waba_id, templates]);
 
   const loadTemplates = async () => {
     setTplLoading(true); setTplError("");
     try {
       const { data } = await api.get("/whatsapp/templates");
       if (data.ok) {
-        setTemplates(data.templates || []);
+        const list = data.templates || [];
+        setTemplates(list);
+        // Pre-select first APPROVED template so the dropdown shows something valid
+        const firstApproved = list.find(t => t.status === "APPROVED");
+        if (firstApproved) { setQuickTpl(firstApproved.name); setQuickLang(firstApproved.language); }
       } else {
         setTemplates([]);
         setTplError(data.error || "Failed to load templates");
@@ -371,6 +378,70 @@ export default function WhatsAppSettings() {
         </CardContent>
       </Card>
 
+      {/* Step 2.5: Templates catalog (auto-fetched from Meta) */}
+      {isConfigured && (
+        <Card className="rounded-sm shadow-none" data-testid="wa-templates-card">
+          <CardContent className="p-4 space-y-3">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
+                  <FileText className="h-3.5 w-3.5" /> Approved Templates
+                </div>
+                <div className="text-[11px] text-muted-foreground mt-0.5">Fetched live from Meta Graph API using your WABA ID. Templates must be <strong>APPROVED</strong> before you can send them.</div>
+              </div>
+              <Button type="button" variant="outline" size="sm" onClick={loadTemplates} disabled={tplLoading} className="rounded-sm gap-1" data-testid="wa-templates-refresh">
+                <RefreshCw className={`h-3.5 w-3.5 ${tplLoading ? "animate-spin" : ""}`} /> {tplLoading ? "Loading…" : (templates === null ? "Load templates" : "Refresh")}
+              </Button>
+            </div>
+            {tplError && (
+              <div className="p-2 rounded-sm border border-red-300 bg-red-50 dark:bg-red-900/20 text-xs flex items-start gap-2" data-testid="wa-templates-error">
+                <AlertTriangle className="h-4 w-4 text-red-600 shrink-0 mt-0.5" />
+                <div>{tplError}</div>
+              </div>
+            )}
+            {templates && templates.length === 0 && !tplError && (
+              <div className="text-xs text-muted-foreground p-3 border border-dashed rounded-sm text-center" data-testid="wa-templates-empty">
+                No templates found. Create one in <a className="underline" href="https://business.facebook.com/wa/manage/message-templates/" target="_blank" rel="noreferrer">Meta Business Manager → Message Templates</a>.
+              </div>
+            )}
+            {templates && templates.length > 0 && (
+              <div className="border rounded-sm overflow-hidden" data-testid="wa-templates-list">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="bg-muted/40">
+                      <th className="text-left p-2 font-medium">Name</th>
+                      <th className="text-left p-2 font-medium">Language</th>
+                      <th className="text-left p-2 font-medium">Category</th>
+                      <th className="text-left p-2 font-medium">Status</th>
+                      <th className="text-left p-2 font-medium">Vars</th>
+                      <th className="text-left p-2 font-medium">Body preview</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {templates.map(t => (
+                      <tr key={`${t.name}_${t.language}`} className="border-t hover:bg-muted/20" data-testid={`wa-template-row-${t.name}`}>
+                        <td className="p-2 font-mono">{t.name}</td>
+                        <td className="p-2 font-mono text-muted-foreground">{t.language}</td>
+                        <td className="p-2"><Badge variant="outline" className="rounded-sm text-[10px]">{t.category || "—"}</Badge></td>
+                        <td className="p-2">
+                          {t.status === "APPROVED"
+                            ? <Badge variant="outline" className="rounded-sm text-[10px] border-emerald-300 text-emerald-700">APPROVED</Badge>
+                            : t.status === "PENDING"
+                              ? <Badge variant="outline" className="rounded-sm text-[10px] border-amber-300 text-amber-700">PENDING</Badge>
+                              : <Badge variant="outline" className="rounded-sm text-[10px] border-red-300 text-red-700">{t.status}</Badge>}
+                        </td>
+                        <td className="p-2 font-mono">{t.variable_count}</td>
+                        <td className="p-2 text-muted-foreground max-w-md truncate" title={t.body_preview}>{t.body_preview || "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
       {/* Step 3: quick send test */}
       {isConfigured && (
         <Card className="rounded-sm shadow-none">
@@ -389,10 +460,27 @@ export default function WhatsAppSettings() {
             </div>
             <form onSubmit={quickSend} className="space-y-2">
               {quickMode === "template" ? (
-                <div className="grid grid-cols-1 md:grid-cols-[220px_1fr_140px_auto] gap-2">
+                <div className="grid grid-cols-1 md:grid-cols-[220px_1fr_auto] gap-2">
                   <Input required placeholder="+91XXXXXXXXXX" value={to} onChange={e => setTo(e.target.value)} className="rounded-sm" data-testid="wa-quicksend-to" />
-                  <Input required placeholder="Template name" value={quickTpl} onChange={e => setQuickTpl(e.target.value)} className="rounded-sm font-mono" data-testid="wa-quicksend-template-name" />
-                  <Input placeholder="en_US" value={quickLang} onChange={e => setQuickLang(e.target.value)} className="rounded-sm font-mono" data-testid="wa-quicksend-template-lang" />
+                  <select
+                    required
+                    value={`${quickTpl}|${quickLang}`}
+                    onChange={e => {
+                      const [n, l] = e.target.value.split("|");
+                      setQuickTpl(n); setQuickLang(l);
+                    }}
+                    className="rounded-sm border bg-background px-3 h-9 text-sm font-mono"
+                    data-testid="wa-quicksend-template-select"
+                  >
+                    {(!templates || templates.length === 0) && (
+                      <option value="hello_world|en_US">hello_world (en_US) — load templates for full list</option>
+                    )}
+                    {templates && templates.filter(t => t.status === "APPROVED").map(t => (
+                      <option key={`${t.name}_${t.language}`} value={`${t.name}|${t.language}`}>
+                        {t.name} · {t.language} · [{t.category}]{t.variable_count > 0 ? ` · ${t.variable_count} var${t.variable_count > 1 ? "s" : ""}` : ""}
+                      </option>
+                    ))}
+                  </select>
                   <Button type="submit" disabled={sending} className="rounded-sm gap-1" data-testid="wa-quicksend-button">
                     <Send className="h-3.5 w-3.5" /> {sending ? "Sending…" : "Send"}
                   </Button>
