@@ -132,7 +132,7 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
         })
         await audit("bills_uploaded", "bill_batch", batch_id, user, {"filename": file.filename, "bills": len(rows), "llm_error": llm_error})
         if llm_error and not rows:
-            raise HTTPException(502, f"AI extraction failed: {llm_error}. PDF text was readable but no bills were parsed. The batch was not saved.")
+            raise HTTPException(400, f"AI extraction failed: {llm_error}. PDF text was readable but no bills were parsed. The batch was not saved.")
         return {"batch_id": batch_id, "bill_count": len(rows), "page_count": page_count, "warning": llm_error}
 
     @router.get("/bills/batches")

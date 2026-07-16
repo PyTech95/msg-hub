@@ -1,0 +1,25 @@
+{
+  "summary": "Verified Cloudflare-502 → 400 fix. Backend returns HTTP 400 application/json with Meta error detail intact through the external Cloudflare-fronted URL — no more Cloudflare HTML error page. Frontend send flow (Contacts → contact profile → WhatsApp tab → Approved template → hello_world → Send) confirmed to hit /api/messages/send and receive the exact expected JSON body: {\"detail\":\"Send failed: Meta API 400: (#131058) Hello World templates can only be sent from the Public Test Numbers\"}. Regression: SMS mock send still 200 mode=mock; SA login still works.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_iteration11_cloudflare_502_fix.py",
+    "/app/test_reports/pytest/iteration11.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is ~2266 lines — consider splitting into route modules per resource (contacts, messages, whatsapp, auth) for maintainability. Not a bug, just size guideline.",
+    "The choice of returning HTTP 400 for provider validation errors (e.g., Meta 131058) is semantically correct AND has the practical benefit of bypassing Cloudflare's 5xx interception. Well-reasoned fix.",
+    "Consider also mapping other outbound-provider errors (RCS, SMS live mode, email SMTP) to 4xx to avoid the same Cloudflare-swallow bug re-appearing in those channels."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration11_cloudflare_502_fix.py (new)"
+  ],
+  "success_rate": {"backend": "100% (4/4 relevant tests, 1 unrelated /api/health 404)", "frontend": "100% (send flow captured 400 JSON)"},
+  "test_credentials": "admin@cpaas.io / Admin@12345 (SA)",
+  "seed_data_creation": "Used existing contact rajeev2 (afb8f12d-c00f-4e3b-9113-2a6af22538fc). One TEST_it11 regression SMS created via API.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 11 verified the Cloudflare 502→400 fix. All three code paths (server.py send_message L1288, whatsapp_send_message L1787, features.py upload_bill_pdf L135) now raise HTTPException(400). External URL Cloudflare-fronted tests confirm 400 application/json bodies pass through untouched. Backend test file: /app/backend/tests/test_iteration11_cloudflare_502_fix.py",
+  "rca of the issue": "Cloudflare (in front of the K8s ingress) intercepts any 5xx status returned by origin and replaces the body with its own generic HTML error page ('The origin web server returned an invalid or incomplete response to Cloudflare'). Previously backend raised HTTPException(502, 'Send failed: <meta error>') for provider send failures — Cloudflare stripped the JSON detail so axios never saw the real Meta error. Fix: change to HTTPException(400) since provider validation errors are client-attributable (bad template, wrong number), not infra failures; Cloudflare passes 4xx bodies through unchanged. Verified via curl + playwright through https://msg-hub-59.preview.emergentagent.com."
+}

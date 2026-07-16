@@ -1284,7 +1284,8 @@ async def send_message(body: SendMessageIn, background: BackgroundTasks, user: d
             resp = await adapter.send(contact["phone"], body.body, body.media_url, company_id=user.get("company_id"))
     except Exception as e:
         await emit_event(mid, "failed", reason=str(e))
-        raise HTTPException(502, f"Send failed: {e}")
+        # Return 400 (not 502) so Cloudflare doesn't swallow the JSON body with its own 5xx page.
+        raise HTTPException(400, f"Send failed: {e}")
     await db.messages.update_one({"id": mid}, {"$set": {"provider_message_id": resp["provider_message_id"]}})
     await db.conversations.update_one(
         {"contact_id": body.contact_id, "channel": body.channel},
@@ -1782,7 +1783,8 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
             resp = await ADAPTERS["whatsapp"].send(phone, body.message, body.media_url, company_id=user.get("company_id"))
     except Exception as e:
         await emit_event(mid, "failed", reason=str(e), source="meta_whatsapp")
-        raise HTTPException(502, f"WhatsApp send failed: {e}")
+        # Return 400 (not 502) so Cloudflare passes the JSON error body through to the UI.
+        raise HTTPException(400, f"WhatsApp send failed: {e}")
     await db.messages.update_one({"id": mid}, {"$set": {"provider_message_id": resp["provider_message_id"]}})
     await db.conversations.update_one(
         {"contact_id": cid, "channel": "whatsapp"},
