@@ -8,7 +8,7 @@ import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import {
   MessageCircle, CheckCircle2, AlertTriangle, Copy, Check,
-  Save, Trash2, PlugZap, Eye, EyeOff, Send,
+  Save, Trash2, PlugZap, Eye, EyeOff, Send, RefreshCw, FileText,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
@@ -41,13 +41,18 @@ export default function WhatsAppSettings() {
   const { user } = useAuth();
   const [cfg, setCfg] = useState(null);
   const [form, setForm] = useState({
-    access_token: "", phone_number_id: "", app_secret: "",
+    access_token: "", phone_number_id: "", waba_id: "", app_secret: "",
     graph_version: "v22.0", mock: false, is_active: true,
   });
   const [reveal, setReveal] = useState({ token: false, secret: false });
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState(null);
+
+  // Templates catalog
+  const [templates, setTemplates] = useState(null);
+  const [tplLoading, setTplLoading] = useState(false);
+  const [tplError, setTplError] = useState("");
 
   // Quick send-test
   const [to, setTo] = useState("");
@@ -66,6 +71,7 @@ export default function WhatsAppSettings() {
         setForm(f => ({
           ...f,
           phone_number_id: data.phone_number_id || "",
+          waba_id: data.waba_id || "",
           graph_version: data.graph_version || "v22.0",
           mock: !!data.mock,
           is_active: data.is_active !== false,
@@ -77,6 +83,22 @@ export default function WhatsAppSettings() {
   };
   useEffect(() => { load(); }, []);
 
+  const loadTemplates = async () => {
+    setTplLoading(true); setTplError("");
+    try {
+      const { data } = await api.get("/whatsapp/templates");
+      if (data.ok) {
+        setTemplates(data.templates || []);
+      } else {
+        setTemplates([]);
+        setTplError(data.error || "Failed to load templates");
+      }
+    } catch (err) {
+      setTemplates([]);
+      setTplError(err.response?.data?.detail || err.message || "Failed to load templates");
+    } finally { setTplLoading(false); }
+  };
+
   const save = async (e) => {
     e.preventDefault();
     setSaving(true);
@@ -84,6 +106,7 @@ export default function WhatsAppSettings() {
       // Only send secrets if user typed something; empty string means "leave unchanged"
       const payload = {
         phone_number_id: form.phone_number_id?.trim(),
+        waba_id: form.waba_id?.trim(),
         graph_version: form.graph_version?.trim() || "v22.0",
         mock: form.mock,
         is_active: form.is_active,
@@ -105,7 +128,7 @@ export default function WhatsAppSettings() {
       await api.delete("/whatsapp/config");
       toast.success("Configuration removed");
       setCfg({ configured: false });
-      setForm({ access_token: "", phone_number_id: "", app_secret: "", graph_version: "v22.0", mock: false, is_active: true });
+      setForm({ access_token: "", phone_number_id: "", waba_id: "", app_secret: "", graph_version: "v22.0", mock: false, is_active: true });
     } catch (err) {
       toast.error(err.response?.data?.detail || "Delete failed");
     }
@@ -268,6 +291,16 @@ export default function WhatsAppSettings() {
                   onChange={e => setForm(f => ({ ...f, phone_number_id: e.target.value }))}
                   className="rounded-sm font-mono"
                   data-testid="wa-phone-id-input"
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs">WhatsApp Business Account (WABA) ID <span className="text-muted-foreground">— required to list templates</span></Label>
+                <Input
+                  placeholder="831164916601218"
+                  value={form.waba_id}
+                  onChange={e => setForm(f => ({ ...f, waba_id: e.target.value }))}
+                  className="rounded-sm font-mono"
+                  data-testid="wa-waba-id-input"
                 />
               </div>
               <div className="space-y-1">

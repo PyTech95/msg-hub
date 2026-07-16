@@ -83,6 +83,27 @@ async def health_check(creds: Dict[str, str]) -> Dict[str, Any]:
         return {"ok": False, "message": f"Handshake failed: {e}"}
 
 
+async def list_message_templates(access_token: str, waba_id: str,
+                                 graph_version: str = "v22.0", limit: int = 100) -> Dict[str, Any]:
+    """Fetch message templates from a WhatsApp Business Account.
+    Returns {ok, templates, error}. templates: [{name, language, status, category, components}]"""
+    url = f"{GRAPH_BASE}/{graph_version}/{waba_id}/message_templates"
+    params = {"fields": "name,language,status,category,components,quality_score,rejected_reason",
+              "limit": min(max(limit, 1), 200)}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, params=params,
+                                    headers={"Authorization": f"Bearer {access_token}"})
+        data = resp.json() if resp.content else {}
+        if resp.status_code >= 400:
+            return {"ok": False, "templates": [],
+                    "error": (data.get("error") or {}).get("message") or resp.text}
+        return {"ok": True, "templates": data.get("data") or [], "error": None,
+                "paging": data.get("paging") or {}}
+    except Exception as e:
+        return {"ok": False, "templates": [], "error": str(e)}
+
+
 def build_adapter(BaseAdapter, creds_provider: Callable[..., Awaitable[Optional[Dict[str, str]]]]):
     class MetaWhatsAppAdapter(BaseAdapter):
         channel = "whatsapp"

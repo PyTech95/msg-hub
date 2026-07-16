@@ -360,6 +360,7 @@ async def meta_wa_credentials(company_id: Optional[str] = None) -> Optional[Dict
                 "access_token": cfg["access_token"],
                 "phone_number_id": cfg["phone_number_id"],
                 "graph_version": cfg.get("graph_version") or os.environ.get("GRAPH_API_VERSION") or "v22.0",
+                "waba_id": cfg.get("waba_id") or "",
             }
     # 2) Global vault
     p = await db.provider_accounts.find_one({"provider_key": "meta_whatsapp", "is_active": True}, {"_id": 0})
@@ -369,9 +370,13 @@ async def meta_wa_credentials(company_id: Optional[str] = None) -> Optional[Dict
             "access_token": creds["access_token"],
             "phone_number_id": creds["phone_number_id"],
             "graph_version": creds.get("graph_version") or os.environ.get("GRAPH_API_VERSION") or "v22.0",
+            "waba_id": creds.get("waba_id") or os.environ.get("WHATSAPP_WABA_ID") or "",
         }
     # 3) Env fallback
-    return meta_wa.env_config()
+    env = meta_wa.env_config()
+    if env:
+        env["waba_id"] = os.environ.get("WHATSAPP_WABA_ID") or ""
+    return env
 
 ADAPTERS["whatsapp"] = meta_wa.build_adapter(BaseAdapter, meta_wa_credentials)
 log.info("Meta WhatsApp Cloud adapter wired (env_live=%s, multi-tenant capable)", bool(meta_wa.env_config()))
@@ -1822,6 +1827,7 @@ def _mask_wa(cfg: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "company_id": cfg.get("company_id"),
         "phone_number_id": cfg.get("phone_number_id") or "",
+        "waba_id": cfg.get("waba_id") or "",
         "graph_version": cfg.get("graph_version") or "v22.0",
         "verify_token": cfg.get("verify_token") or "",
         "is_active": cfg.get("is_active", True),
@@ -1841,6 +1847,7 @@ def _mask_wa(cfg: Dict[str, Any]) -> Dict[str, Any]:
 class WhatsAppConfigIn(BaseModel):
     access_token: Optional[str] = None
     phone_number_id: Optional[str] = None
+    waba_id: Optional[str] = None
     app_secret: Optional[str] = None
     graph_version: Optional[str] = None
     is_active: Optional[bool] = None
@@ -1889,7 +1896,7 @@ async def put_wa_config(body: WhatsAppConfigIn, user: dict = Depends(require_rol
     existing = await db.company_whatsapp_configs.find_one({"company_id": user["company_id"]}, {"_id": 0})
     now = iso(now_utc())
     upd: Dict[str, Any] = {"updated_at": now, "updated_by": user.get("email")}
-    for k in ("access_token", "phone_number_id", "app_secret", "graph_version"):
+    for k in ("access_token", "phone_number_id", "waba_id", "app_secret", "graph_version"):
         v = getattr(body, k, None)
         if v is None:
             continue
@@ -1948,6 +1955,66 @@ async def test_wa_config(user: dict = Depends(require_roles("super_admin","admin
                 "message": "No live credentials configured for this tenant. Add access_token + phone_number_id and set mock=false."}
     result = await meta_wa.health_check(creds)
     return {"ok": result["ok"], "mode": "live", "message": result["message"], "phone_number_id": creds.get("phone_number_id")}
+
+
+def _template_body_preview(components: List[Dict[str, Any]]) -> str:
+    """Extract the BODY text from a Meta template's components array (for UI preview)."""
+    for c in components or []:
+        if (c.get("type") or "").upper() == "BODY":
+            return (c.get("text") or "").strip()
+    return ""
+
+
+def _template_variable_count(components: List[Dict[str, Any]]) -> int:
+    """Count {{1}} {{2}} etc. placeholders in the BODY text."""
+    import re
+    body = _template_body_preview(components)
+    return len(set(re.findall(r"\{\{(\d+)\}\}", body)))
+
+
+@api.get("/whatsapp/templates")
+async def list_wa_templates(status: Optional[str] = None, limit: int = 100,
+                            user: dict = Depends(current_user)):
+    """Fetch approved WhatsApp message templates from Meta Graph API.
+    Filter by status (APPROVED / PENDING / REJECTED) — default returns all.
+    Requires WABA ID configured (per-tenant or env WHATSAPP_WABA_ID).
+    """
+    creds = await meta_wa_credentials(user.get("company_id"))
+    if not creds:
+        return {"ok": False, "templates": [],
+                "error": "No live WhatsApp credentials configured. Add access_token + phone_number_id in Step 2."}
+    waba_id = (creds.get("waba_id") or "").strip()
+    if not waba_id:
+        return {"ok": False, "templates": [],
+                "error": "WhatsApp Business Account (WABA) ID is not configured. Add it in Step 2 to fetch approved templates."}
+    result = await meta_wa.list_message_templates(
+        creds["access_token"], waba_id,
+        graph_version=creds.get("graph_version") or "v22.0",
+        limit=limit,
+    )
+    if not result["ok"]:
+        return {"ok": False, "templates": [], "error": result["error"]}
+    # Enrich each template with body preview + variable count so the UI can render dropdowns cleanly.
+    templates = []
+    for t in result["templates"]:
+        st = (t.get("status") or "").upper()
+        if status and st != status.upper():
+            continue
+        components = t.get("components") or []
+        templates.append({
+            "name": t.get("name"),
+            "language": t.get("language"),
+            "status": st,
+            "category": (t.get("category") or "").upper(),
+            "quality_score": (t.get("quality_score") or {}).get("score"),
+            "rejected_reason": t.get("rejected_reason") if st == "REJECTED" else None,
+            "body_preview": _template_body_preview(components),
+            "variable_count": _template_variable_count(components),
+            "components": components,
+        })
+    # Sort: approved first, then by name
+    templates.sort(key=lambda t: (0 if t["status"] == "APPROVED" else 1, t["name"] or ""))
+    return {"ok": True, "templates": templates, "count": len(templates), "waba_id": waba_id}
 
 
 # ─────────── Per-tenant Meta WhatsApp webhook ───────────
