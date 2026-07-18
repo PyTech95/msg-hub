@@ -468,6 +468,9 @@ async def on_startup():
     await db.system_settings.create_index("key", unique=True)
     await db.login_attempts.create_index("identifier")
     await db.company_whatsapp_configs.create_index("company_id", unique=True)
+    await db.wallets.create_index("company_id", unique=True)
+    await db.wallet_transactions.create_index([("company_id", 1), ("created_at", -1)])
+    await db.wallet_recharge_orders.create_index("razorpay_order_id", unique=True)
     await seed()
     asyncio.create_task(campaign_scheduler_loop())
     log.info("CPaaS backend ready.")
@@ -943,6 +946,7 @@ TENANT_COLLECTIONS = [
     "messages", "conversations", "call_logs", "bills", "bill_batches",
     "notice_templates", "notice_pdfs", "voice_campaigns", "reminder_schedules",
     "usage_records", "audit_logs", "company_whatsapp_configs",
+    "wallets", "wallet_transactions", "wallet_recharge_orders",
 ]
 
 @api.get("/companies")
@@ -1276,6 +1280,15 @@ async def send_message(body: SendMessageIn, background: BackgroundTasks, user: d
             "template_components": body.template_components or [],
         }
     await db.messages.insert_one(msg)
+    # Wallet check + debit (skipped for Super Admin / no-company sends)
+    price_paise = _price_paise(body.channel)
+    if user.get("company_id") and price_paise > 0:
+        ok = await _debit_wallet(user["company_id"], price_paise,
+                                 {"message_id": mid, "channel": body.channel, "contact_id": body.contact_id})
+        if not ok:
+            await db.messages.update_one({"id": mid}, {"$set": {"status": "failed"}})
+            await emit_event(mid, "failed", reason="Insufficient wallet balance")
+            raise HTTPException(402, "Insufficient wallet balance. Please recharge your wallet to send messages.")
     adapter = ADAPTERS[body.channel]
     try:
         if is_wa_template:
@@ -1288,6 +1301,16 @@ async def send_message(body: SendMessageIn, background: BackgroundTasks, user: d
         else:
             resp = await adapter.send(contact["phone"], body.body, body.media_url, company_id=user.get("company_id"))
     except Exception as e:
+        # Refund the wallet — send failed at provider level
+        if user.get("company_id") and price_paise > 0:
+            await db.wallets.update_one({"company_id": user["company_id"]},
+                                        {"$inc": {"balance_paise": price_paise},
+                                         "$set": {"updated_at": iso(now_utc())}})
+            await db.wallet_transactions.insert_one({
+                "id": new_id(), "company_id": user["company_id"], "type": "credit",
+                "amount_paise": price_paise, "meta": {"reason": "send_failed_refund", "message_id": mid},
+                "created_at": iso(now_utc()),
+            })
         await emit_event(mid, "failed", reason=str(e))
         # Return 400 (not 502) so Cloudflare doesn't swallow the JSON body with its own 5xx page.
         raise HTTPException(400, f"Send failed: {e}")
@@ -1776,6 +1799,15 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
             "template_components": body.template_components or [],
         }
     await db.messages.insert_one(msg_doc)
+    # Wallet check + debit
+    price_paise = _price_paise("whatsapp")
+    if user.get("company_id") and price_paise > 0:
+        ok = await _debit_wallet(user["company_id"], price_paise,
+                                 {"message_id": mid, "channel": "whatsapp", "to": phone})
+        if not ok:
+            await db.messages.update_one({"id": mid}, {"$set": {"status": "failed"}})
+            await emit_event(mid, "failed", reason="Insufficient wallet balance", source="wallet")
+            raise HTTPException(402, "Insufficient wallet balance. Please recharge your wallet to send messages.")
     try:
         if is_template:
             resp = await ADAPTERS["whatsapp"].send_template(
@@ -1787,6 +1819,16 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
         else:
             resp = await ADAPTERS["whatsapp"].send(phone, body.message, body.media_url, company_id=user.get("company_id"))
     except Exception as e:
+        # Refund the wallet on provider failure
+        if user.get("company_id") and price_paise > 0:
+            await db.wallets.update_one({"company_id": user["company_id"]},
+                                        {"$inc": {"balance_paise": price_paise},
+                                         "$set": {"updated_at": iso(now_utc())}})
+            await db.wallet_transactions.insert_one({
+                "id": new_id(), "company_id": user["company_id"], "type": "credit",
+                "amount_paise": price_paise, "meta": {"reason": "send_failed_refund", "message_id": mid},
+                "created_at": iso(now_utc()),
+            })
         await emit_event(mid, "failed", reason=str(e), source="meta_whatsapp")
         # Return 400 (not 502) so Cloudflare passes the JSON error body through to the UI.
         raise HTTPException(400, f"WhatsApp send failed: {e}")
@@ -2030,6 +2072,334 @@ async def list_wa_templates(status: Optional[str] = None, limit: int = 100,
         })
     templates.sort(key=lambda t: (0 if t["status"] == "APPROVED" else 1, t["name"] or ""))
     return {"ok": True, "templates": templates, "count": len(templates), "waba_id": waba_id}
+
+
+# ─────────── WhatsApp Template Builder (create + delete via Meta) ───────────
+class WATemplateButton(BaseModel):
+    type: str  # URL / PHONE_NUMBER / QUICK_REPLY
+    text: str
+    url: Optional[str] = None
+    phone_number: Optional[str] = None
+
+class WATemplateIn(BaseModel):
+    name: str
+    category: str  # MARKETING / UTILITY / AUTHENTICATION
+    language: str = "en_US"
+    header_format: Optional[str] = None  # NONE / TEXT / IMAGE / VIDEO / DOCUMENT
+    header_text: Optional[str] = None
+    header_example: Optional[str] = None
+    body_text: str
+    body_examples: Optional[List[str]] = None  # per-variable sample values
+    footer_text: Optional[str] = None
+    buttons: Optional[List[WATemplateButton]] = None
+
+
+async def _resolve_wa_creds_for_template_write(user: dict) -> Dict[str, str]:
+    """Get access_token + waba_id for template CREATE/DELETE (strict tenant isolation for CA)."""
+    if user.get("company_id"):
+        cfg = await db.company_whatsapp_configs.find_one(
+            {"company_id": user["company_id"], "is_active": True}, {"_id": 0})
+        if not cfg or not cfg.get("access_token") or not cfg.get("phone_number_id"):
+            raise HTTPException(400, "Tenant WhatsApp is not configured. Add access_token + phone_number_id in Step 2.")
+        if not (cfg.get("waba_id") or "").strip():
+            raise HTTPException(400, "WABA ID is not configured for this tenant.")
+        return {"access_token": cfg["access_token"], "waba_id": cfg["waba_id"].strip(),
+                "graph_version": cfg.get("graph_version") or "v22.0"}
+    creds = await meta_wa_credentials(None)
+    if not creds or not (creds.get("waba_id") or "").strip():
+        raise HTTPException(400, "Platform WABA_ID not configured.")
+    return {"access_token": creds["access_token"], "waba_id": creds["waba_id"].strip(),
+            "graph_version": creds.get("graph_version") or "v22.0"}
+
+
+def _build_template_components(body: WATemplateIn) -> List[Dict[str, Any]]:
+    """Build the Meta components array from the flat form input."""
+    import re
+    comps: List[Dict[str, Any]] = []
+    # HEADER
+    hf = (body.header_format or "").upper()
+    if hf == "TEXT" and (body.header_text or "").strip():
+        hcomp: Dict[str, Any] = {"type": "HEADER", "format": "TEXT", "text": body.header_text.strip()}
+        if body.header_example:
+            hcomp["example"] = {"header_text": [body.header_example]}
+        comps.append(hcomp)
+    elif hf in ("IMAGE", "VIDEO", "DOCUMENT") and body.header_example:
+        # header_example is a public sample media URL for these formats
+        comps.append({"type": "HEADER", "format": hf,
+                      "example": {"header_handle": [body.header_example]}})
+    # BODY (required)
+    body_comp: Dict[str, Any] = {"type": "BODY", "text": body.body_text.strip()}
+    vars_in_body = sorted(set(int(v) for v in re.findall(r"\{\{(\d+)\}\}", body.body_text)))
+    if vars_in_body:
+        examples = body.body_examples or []
+        # Pad examples with placeholder samples
+        while len(examples) < len(vars_in_body):
+            examples.append(f"sample{len(examples)+1}")
+        body_comp["example"] = {"body_text": [examples[: len(vars_in_body)]]}
+    comps.append(body_comp)
+    # FOOTER
+    if (body.footer_text or "").strip():
+        comps.append({"type": "FOOTER", "text": body.footer_text.strip()})
+    # BUTTONS
+    if body.buttons:
+        buttons: List[Dict[str, Any]] = []
+        for b in body.buttons[:3]:
+            btype = b.type.upper()
+            if btype == "URL" and b.url:
+                buttons.append({"type": "URL", "text": b.text, "url": b.url})
+            elif btype == "PHONE_NUMBER" and b.phone_number:
+                buttons.append({"type": "PHONE_NUMBER", "text": b.text, "phone_number": b.phone_number})
+            elif btype == "QUICK_REPLY":
+                buttons.append({"type": "QUICK_REPLY", "text": b.text})
+        if buttons:
+            comps.append({"type": "BUTTONS", "buttons": buttons})
+    return comps
+
+
+@api.post("/whatsapp/templates")
+async def create_wa_template(body: WATemplateIn,
+                             user: dict = Depends(require_roles("super_admin", "admin"))):
+    """Create a new WhatsApp template and submit it to Meta for approval."""
+    creds = await _resolve_wa_creds_for_template_write(user)
+    if body.category.upper() not in ("MARKETING", "UTILITY", "AUTHENTICATION"):
+        raise HTTPException(400, "category must be MARKETING, UTILITY or AUTHENTICATION")
+    components = _build_template_components(body)
+    payload = {
+        "name": body.name.strip().lower(),
+        "category": body.category.upper(),
+        "language": body.language.strip() or "en_US",
+        "components": components,
+    }
+    result = await meta_wa.create_message_template(
+        creds["access_token"], creds["waba_id"], payload, creds["graph_version"])
+    if not result["ok"]:
+        raise HTTPException(400, f"Meta rejected template: {result['error']}")
+    await audit("wa_template_created", "wa_template", result.get("id") or payload["name"], user,
+                {"name": payload["name"], "category": payload["category"], "language": payload["language"]})
+    return {"ok": True, "id": result.get("id"), "status": result.get("status", "PENDING"),
+            "name": payload["name"], "language": payload["language"]}
+
+
+@api.delete("/whatsapp/templates/{name}")
+async def delete_wa_template(name: str,
+                             user: dict = Depends(require_roles("super_admin", "admin"))):
+    creds = await _resolve_wa_creds_for_template_write(user)
+    result = await meta_wa.delete_message_template(
+        creds["access_token"], creds["waba_id"], name.strip(), creds["graph_version"])
+    if not result["ok"]:
+        raise HTTPException(400, result["error"])
+    await audit("wa_template_deleted", "wa_template", name, user)
+    return {"ok": True}
+
+
+# ─────────── Wallet + Billing (per-tenant balance, send-blocking, admin adjust) ───────────
+async def _get_or_create_wallet(company_id: str) -> Dict[str, Any]:
+    w = await db.wallets.find_one({"company_id": company_id}, {"_id": 0})
+    if not w:
+        w = {"id": new_id(), "company_id": company_id, "balance_paise": 0, "currency": "INR",
+             "low_balance_threshold_paise": 5000,  # ₹50 default
+             "created_at": iso(now_utc()), "updated_at": iso(now_utc())}
+        await db.wallets.insert_one(w)
+    return w
+
+
+async def _debit_wallet(company_id: Optional[str], amount_paise: int, meta_info: Dict[str, Any]) -> bool:
+    """Atomically deduct from wallet. Returns True if debited or SA (no company), False if insufficient."""
+    if not company_id:
+        return True  # SA / platform sends bypass wallet
+    if amount_paise <= 0:
+        return True
+    res = await db.wallets.find_one_and_update(
+        {"company_id": company_id, "balance_paise": {"$gte": amount_paise}},
+        {"$inc": {"balance_paise": -amount_paise}, "$set": {"updated_at": iso(now_utc())}},
+        return_document=True,
+    )
+    if not res:
+        return False
+    await db.wallet_transactions.insert_one({
+        "id": new_id(), "company_id": company_id, "type": "debit",
+        "amount_paise": amount_paise, "balance_paise_after": res["balance_paise"],
+        "meta": meta_info, "created_at": iso(now_utc()),
+    })
+    return True
+
+
+def _price_paise(channel: str) -> int:
+    """Convert channel price (₹) to paise (int)."""
+    p = PRICING.get(channel) or 0.0
+    return int(round(p * 100))
+
+
+class WalletAdjustIn(BaseModel):
+    amount_paise: int  # positive = credit, negative = debit
+    reason: str
+    company_id: Optional[str] = None  # SA targeting a specific company
+
+
+@api.get("/wallet")
+async def get_wallet(user: dict = Depends(current_user)):
+    """Company Admin: own tenant balance + last 50 transactions. Super Admin: 400."""
+    if not user.get("company_id"):
+        raise HTTPException(400, "Super Admin has no wallet. See /api/wallets for the platform view.")
+    w = await _get_or_create_wallet(user["company_id"])
+    txns = await db.wallet_transactions.find({"company_id": user["company_id"]}, {"_id": 0}
+                                              ).sort("created_at", -1).limit(50).to_list(50)
+    return {
+        "company_id": user["company_id"], "currency": "INR",
+        "balance_paise": w["balance_paise"], "balance_inr": w["balance_paise"] / 100.0,
+        "low_balance_threshold_paise": w.get("low_balance_threshold_paise", 5000),
+        "low_balance": w["balance_paise"] < w.get("low_balance_threshold_paise", 5000),
+        "transactions": txns,
+        "pricing_paise": {ch: _price_paise(ch) for ch in ("sms", "whatsapp", "rcs", "voice", "email")},
+    }
+
+
+@api.get("/wallets")
+async def list_all_wallets(_: dict = Depends(require_roles("super_admin"))):
+    """Super Admin: overview of all tenant wallets."""
+    ws = await db.wallets.find({}, {"_id": 0}).sort("balance_paise", -1).to_list(500)
+    for w in ws:
+        c = await db.companies.find_one({"id": w["company_id"]}, {"_id": 0, "name": 1, "admin_email": 1})
+        w["company_name"] = (c or {}).get("name", "—")
+        w["admin_email"] = (c or {}).get("admin_email", "")
+    return ws
+
+
+@api.post("/wallet/adjust")
+async def adjust_wallet(body: WalletAdjustIn, user: dict = Depends(require_roles("super_admin"))):
+    """Super Admin: manually credit/debit any tenant's wallet."""
+    target_company_id = body.company_id
+    if not target_company_id:
+        raise HTTPException(400, "company_id is required")
+    await _get_or_create_wallet(target_company_id)
+    res = await db.wallets.find_one_and_update(
+        {"company_id": target_company_id},
+        {"$inc": {"balance_paise": body.amount_paise},
+         "$set": {"updated_at": iso(now_utc())}},
+        return_document=True,
+    )
+    if res["balance_paise"] < 0:
+        # Roll back — we don't want negative balances
+        await db.wallets.update_one({"company_id": target_company_id},
+                                    {"$inc": {"balance_paise": -body.amount_paise}})
+        raise HTTPException(400, "This adjustment would make the balance negative")
+    await db.wallet_transactions.insert_one({
+        "id": new_id(), "company_id": target_company_id,
+        "type": "credit" if body.amount_paise > 0 else "debit",
+        "amount_paise": abs(body.amount_paise),
+        "balance_paise_after": res["balance_paise"],
+        "meta": {"reason": body.reason, "manual": True, "by": user.get("email")},
+        "created_at": iso(now_utc()),
+    })
+    await audit("wallet_adjusted", "wallet", target_company_id, user,
+                {"amount_paise": body.amount_paise, "reason": body.reason})
+    return {"ok": True, "balance_paise": res["balance_paise"]}
+
+
+# ─────────── Razorpay recharge (plumbing; activates when SA sets keys) ───────────
+def _razorpay_client():
+    """Return a razorpay.Client if keys are configured, else None."""
+    key_id = (os.environ.get("RAZORPAY_KEY_ID") or "").strip()
+    key_secret = (os.environ.get("RAZORPAY_KEY_SECRET") or "").strip()
+    if not (key_id and key_secret):
+        return None
+    try:
+        import razorpay
+        return razorpay.Client(auth=(key_id, key_secret))
+    except Exception as e:
+        log.error(f"Razorpay init failed: {e}")
+        return None
+
+
+class RechargeOrderIn(BaseModel):
+    amount_paise: int  # minimum 10000 (₹100)
+
+
+class RechargeVerifyIn(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
+
+@api.get("/wallet/recharge/config")
+async def recharge_config(user: dict = Depends(current_user)):
+    """Tenant checks if Razorpay is available before rendering the pay button."""
+    key_id = (os.environ.get("RAZORPAY_KEY_ID") or "").strip()
+    return {"configured": bool(key_id), "key_id": key_id if key_id else None,
+            "currency": "INR", "min_amount_paise": 10000}
+
+
+@api.post("/wallet/recharge/order")
+async def create_recharge_order(body: RechargeOrderIn, user: dict = Depends(current_user)):
+    if not user.get("company_id"):
+        raise HTTPException(400, "Super Admin does not have a wallet.")
+    if body.amount_paise < 10000:
+        raise HTTPException(400, "Minimum recharge is ₹100 (10000 paise).")
+    client = _razorpay_client()
+    if not client:
+        raise HTTPException(503, "Razorpay is not configured. Please contact your platform admin.")
+    try:
+        order = client.order.create({
+            "amount": body.amount_paise, "currency": "INR",
+            "notes": {"company_id": user["company_id"], "purpose": "wallet_recharge",
+                      "created_by": user.get("email", "")},
+        })
+    except Exception as e:
+        raise HTTPException(502, f"Razorpay order creation failed: {e}")
+    await db.wallet_recharge_orders.insert_one({
+        "id": new_id(), "company_id": user["company_id"],
+        "razorpay_order_id": order["id"], "amount_paise": body.amount_paise,
+        "status": "created", "created_at": iso(now_utc()),
+        "created_by": user.get("email"),
+    })
+    return {"order_id": order["id"], "amount_paise": body.amount_paise, "currency": "INR",
+            "key_id": (os.environ.get("RAZORPAY_KEY_ID") or "").strip()}
+
+
+@api.post("/wallet/recharge/verify")
+async def verify_recharge(body: RechargeVerifyIn, user: dict = Depends(current_user)):
+    if not user.get("company_id"):
+        raise HTTPException(400, "Super Admin does not have a wallet.")
+    client = _razorpay_client()
+    if not client:
+        raise HTTPException(503, "Razorpay is not configured.")
+    try:
+        client.utility.verify_payment_signature({
+            "razorpay_order_id": body.razorpay_order_id,
+            "razorpay_payment_id": body.razorpay_payment_id,
+            "razorpay_signature": body.razorpay_signature,
+        })
+    except Exception as e:
+        raise HTTPException(400, f"Signature verification failed: {e}")
+    order = await db.wallet_recharge_orders.find_one(
+        {"razorpay_order_id": body.razorpay_order_id, "company_id": user["company_id"]},
+        {"_id": 0})
+    if not order:
+        raise HTTPException(404, "Recharge order not found for this tenant.")
+    if order.get("status") == "paid":
+        w = await db.wallets.find_one({"company_id": user["company_id"]}, {"_id": 0})
+        return {"ok": True, "already_paid": True, "balance_paise": (w or {}).get("balance_paise", 0)}
+    await _get_or_create_wallet(user["company_id"])
+    res = await db.wallets.find_one_and_update(
+        {"company_id": user["company_id"]},
+        {"$inc": {"balance_paise": order["amount_paise"]}, "$set": {"updated_at": iso(now_utc())}},
+        return_document=True,
+    )
+    await db.wallet_transactions.insert_one({
+        "id": new_id(), "company_id": user["company_id"], "type": "credit",
+        "amount_paise": order["amount_paise"],
+        "balance_paise_after": res["balance_paise"],
+        "meta": {"source": "razorpay", "order_id": body.razorpay_order_id,
+                 "payment_id": body.razorpay_payment_id},
+        "created_at": iso(now_utc()),
+    })
+    await db.wallet_recharge_orders.update_one(
+        {"razorpay_order_id": body.razorpay_order_id},
+        {"$set": {"status": "paid", "paid_at": iso(now_utc()),
+                  "razorpay_payment_id": body.razorpay_payment_id}})
+    await audit("wallet_recharged", "wallet", user["company_id"], user,
+                {"amount_paise": order["amount_paise"], "razorpay_order_id": body.razorpay_order_id})
+    return {"ok": True, "balance_paise": res["balance_paise"]}
 
 
 # ─────────── Per-tenant Meta WhatsApp webhook ───────────

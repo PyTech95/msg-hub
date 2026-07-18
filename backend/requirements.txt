@@ -104,6 +104,7 @@ python-multipart==0.0.28
 pytokens==0.4.1
 PyYAML==6.0.3
 qrcode==8.2
+razorpay==2.0.1
 referencing==0.37.0
 regex==2026.5.9
 reportlab==5.0.0

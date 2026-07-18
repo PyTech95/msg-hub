@@ -1,0 +1,36 @@
+{
+  "summary": "Iteration 14 — Wallet, Razorpay plumbing, WhatsApp Template Builder. Backend: 18/18 pytest passing (wallet CRUD, SA adjust, negative-balance rollback, SMS 25p debit-on-send, 402 send-block, Razorpay 400/503/SA-400, Meta template create+delete lifecycle, invalid-category 400, missing body_text 422, CA-without-WA 400). Frontend: /wallet works for both CA (balance/pricing/txns/recharge-disabled label) and SA (all-tenant list + Adjust dialog); sidebar Wallet nav visible for both roles; TemplateBuilderDialog opens, auto-creates {{1}}{{2}} example inputs, enforces max 3 buttons. Fixed one CRITICAL UI mount bug: TemplateBuilderDialog was only mounted in the CA return branch of WhatsAppSettings.jsx — clicking 'New template' as SA did nothing. Added the same <TemplateBuilderDialog … /> mount to the SA branch.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "WhatsAppSettings.jsx (SA branch)", "issue": "TemplateBuilderDialog was mounted only inside the CA (company_admin) return; SA click on data-testid='wa-templates-create' toggled state but no dialog rendered. FIXED by testing agent: added <TemplateBuilderDialog open={showBuilder} onOpenChange={setShowBuilder} onCreated={loadTemplates} /> to the SA return block just before the closing </div>.", "selector": "[data-testid=template-builder-dialog]", "priority": "HIGH (fixed)"}
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration14_wallet_razorpay_templates.py",
+    "/app/test_reports/pytest/iteration14.xml"
+  ],
+  "action_items": [
+    "Verify the SA-branch TemplateBuilderDialog mount fix in WhatsAppSettings.jsx (line ~325). Consider hoisting the dialog to a single mount outside both role branches to avoid drift.",
+    "Consider adding an integration test that submits the SA template via the UI Submit button end-to-end (skipped here to avoid Meta rate churn — backend already covers create+delete)."
+  ],
+  "critical_code_review_comments": [
+    "server.py has grown to 2718 lines. Wallet + Razorpay + WA templates sections should be extracted to /app/backend/routers/wallet.py, /app/backend/routers/whatsapp_templates.py to stay under the 700-line-per-file guideline.",
+    "_debit_wallet uses atomic find_one_and_update with $gte guard — good. However adjust_wallet uses a two-step increment-then-rollback for the negative-balance guard, which is racy under concurrent adjust calls; consider a single find_one_and_update with a $gte guard on {balance_paise + amount_paise >= 0} via aggregation pipeline update.",
+    "WATemplateIn.body_text is `str` (required). FastAPI/pydantic rejects missing field with 422 (verified). But an empty string '' would still pass — add `min_length=1` to prevent Meta rejecting later.",
+    "Razorpay verify endpoint has a small idempotency gap: when order.status is already 'paid', we still return balance — good — but if a webhook and client verify race, both may try to credit. Consider atomic status-CAS: findOneAndUpdate({razorpay_order_id, status:'created'}, {$set:{status:'paid',...}}) and only credit when a doc is returned.",
+    "TemplateBuilderDialog mount was duplicated logic vs. SA branch — hoist to component root."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration14_wallet_razorpay_templates.py (new — 18 tests, all pass)",
+    "/app/frontend/src/pages/WhatsAppSettings.jsx (added TemplateBuilderDialog mount in SA return branch)"
+  ],
+  "success_rate": {"backend": "100% (18/18)", "frontend": "100% after 1 mount fix"},
+  "test_credentials": "SA admin@cpaas.io / Admin@12345. Ephemeral tenants created and deleted inside tests.",
+  "seed_data_creation": "Two ephemeral tenants TEST_WAL14_<ts> and TEST_UI14_<ts> plus one Meta template tzs_test_<ts> — all cleaned up in teardown.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 14 verified end-to-end. Wallet system live: /api/wallet, /api/wallets (SA), /api/wallet/adjust (SA-only), send-on-SMS debits exactly 25 paise, insufficient balance → HTTP 402 with 'Please recharge your wallet…' detail. Razorpay endpoints correctly gated (config → configured:false, order → 503 without env keys, <10000 paise → 400, SA → 400). Meta template create+delete lifecycle works via real WABA env creds. UI: /wallet uses data-testid='wallet-tenant-view' (CA) / 'wallets-sa-view' (SA); recharge button shows 'Recharge (unavailable)' when configured=false. TemplateBuilderDialog was previously only mounted in the CA branch of /whatsapp-settings — testing agent added the same mount to the SA branch."
+}

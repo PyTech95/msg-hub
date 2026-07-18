@@ -8,10 +8,11 @@ import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import {
   MessageCircle, CheckCircle2, AlertTriangle, Copy, Check,
-  Save, Trash2, PlugZap, Eye, EyeOff, Send, RefreshCw, FileText,
+  Save, Trash2, PlugZap, Eye, EyeOff, Send, RefreshCw, FileText, Plus,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
+import TemplateBuilderDialog from "@/components/TemplateBuilderDialog";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || window.location.origin;
 
@@ -53,6 +54,18 @@ export default function WhatsAppSettings() {
   const [templates, setTemplates] = useState(null);
   const [tplLoading, setTplLoading] = useState(false);
   const [tplError, setTplError] = useState("");
+  const [showBuilder, setShowBuilder] = useState(false);
+
+  const deleteTpl = async (name) => {
+    if (!window.confirm(`Delete template "${name}" from Meta? This cannot be undone.`)) return;
+    try {
+      await api.delete(`/whatsapp/templates/${encodeURIComponent(name)}`);
+      toast.success(`Template "${name}" deleted`);
+      loadTemplates();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Delete failed");
+    }
+  };
 
   // Quick send-test
   const [to, setTo] = useState("");
@@ -121,9 +134,14 @@ export default function WhatsAppSettings() {
             </div>
             <div className="text-[11px] text-muted-foreground mt-0.5">Fetched live from Meta Graph API. Templates must be <strong>APPROVED</strong> before you can send them.</div>
           </div>
-          <Button type="button" variant="outline" size="sm" onClick={loadTemplates} disabled={tplLoading} className="rounded-sm gap-1" data-testid="wa-templates-refresh">
-            <RefreshCw className={`h-3.5 w-3.5 ${tplLoading ? "animate-spin" : ""}`} /> {tplLoading ? "Loading…" : (templates === null ? "Load templates" : "Refresh")}
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button type="button" variant="outline" size="sm" onClick={loadTemplates} disabled={tplLoading} className="rounded-sm gap-1" data-testid="wa-templates-refresh">
+              <RefreshCw className={`h-3.5 w-3.5 ${tplLoading ? "animate-spin" : ""}`} /> {tplLoading ? "Loading…" : (templates === null ? "Load templates" : "Refresh")}
+            </Button>
+            <Button type="button" size="sm" onClick={() => setShowBuilder(true)} className="rounded-sm gap-1" data-testid="wa-templates-create">
+              <Plus className="h-3.5 w-3.5" /> New template
+            </Button>
+          </div>
         </div>
         {tplError && (
           <div className="p-2 rounded-sm border border-red-300 bg-red-50 dark:bg-red-900/20 text-xs flex items-start gap-2" data-testid="wa-templates-error">
@@ -147,6 +165,7 @@ export default function WhatsAppSettings() {
                   <th className="text-left p-2 font-medium">Status</th>
                   <th className="text-left p-2 font-medium">Vars</th>
                   <th className="text-left p-2 font-medium">Body preview</th>
+                  <th className="text-left p-2 font-medium">Action</th>
                 </tr>
               </thead>
               <tbody>
@@ -163,7 +182,12 @@ export default function WhatsAppSettings() {
                           : <Badge variant="outline" className="rounded-sm text-[10px] border-red-300 text-red-700">{t.status}</Badge>}
                     </td>
                     <td className="p-2 font-mono">{t.variable_count}</td>
-                    <td className="p-2 text-muted-foreground max-w-md truncate" title={t.body_preview}>{t.body_preview || "—"}</td>
+                    <td className="p-2 text-muted-foreground max-w-xs truncate" title={t.body_preview}>{t.body_preview || "—"}</td>
+                    <td className="p-2">
+                      <Button size="sm" variant="ghost" className="h-7 w-7 p-0" onClick={() => deleteTpl(t.name)} data-testid={`wa-template-delete-${t.name}`}>
+                        <Trash2 className="h-3 w-3 text-red-600" />
+                      </Button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -298,6 +322,7 @@ export default function WhatsAppSettings() {
         )}
         {/* Platform-level templates from env WABA */}
         {cfg.platform_env_configured && templatesCard}
+        <TemplateBuilderDialog open={showBuilder} onOpenChange={setShowBuilder} onCreated={loadTemplates} />
       </div>
     );
   }
@@ -517,6 +542,7 @@ export default function WhatsAppSettings() {
           </CardContent>
         </Card>
       )}
+      <TemplateBuilderDialog open={showBuilder} onOpenChange={setShowBuilder} onCreated={loadTemplates} />
     </div>
   );
 }

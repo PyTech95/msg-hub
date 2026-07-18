@@ -104,6 +104,43 @@ async def list_message_templates(access_token: str, waba_id: str,
         return {"ok": False, "templates": [], "error": str(e)}
 
 
+async def create_message_template(access_token: str, waba_id: str, payload: Dict[str, Any],
+                                  graph_version: str = "v22.0") -> Dict[str, Any]:
+    """Submit a new WhatsApp template for approval.
+    payload: {name, category, language, components: [...]}"""
+    url = f"{GRAPH_BASE}/{graph_version}/{waba_id}/message_templates"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(url,
+                                     headers={"Authorization": f"Bearer {access_token}",
+                                              "Content-Type": "application/json"},
+                                     json=payload)
+        data = resp.json() if resp.content else {}
+        if resp.status_code >= 400:
+            return {"ok": False, "error": (data.get("error") or {}).get("message") or resp.text}
+        return {"ok": True, "id": data.get("id"), "status": data.get("status") or "PENDING",
+                "category": data.get("category")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def delete_message_template(access_token: str, waba_id: str, name: str,
+                                  graph_version: str = "v22.0") -> Dict[str, Any]:
+    """Delete a WhatsApp template by name (all languages)."""
+    url = f"{GRAPH_BASE}/{graph_version}/{waba_id}/message_templates"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.delete(url,
+                                       headers={"Authorization": f"Bearer {access_token}"},
+                                       params={"name": name})
+        data = resp.json() if resp.content else {}
+        if resp.status_code >= 400:
+            return {"ok": False, "error": (data.get("error") or {}).get("message") or resp.text}
+        return {"ok": True, "success": data.get("success", True)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def build_adapter(BaseAdapter, creds_provider: Callable[..., Awaitable[Optional[Dict[str, str]]]]):
     class MetaWhatsAppAdapter(BaseAdapter):
         channel = "whatsapp"
