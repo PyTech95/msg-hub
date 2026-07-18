@@ -1,0 +1,39 @@
+{
+  "summary": "Iteration 15 backend + frontend tested. Backend: 18/18 pytest passing — WebSocket (connect w/ valid JWT, ping→pong, bad-token 4401 close, missing-token validation error, tenant isolation via message_event), RBAC v2 manager role (SA can create manager platform-user, CA can create manager scoped to company_id, CA blocked from creating admin/super_admin with correct error text, agent back-compat, hierarchy — manager can GET /contacts but 403 on DELETE /contacts), Email plumbing (config unconfigured for SA, 403 for CA, 503 on /test when key absent), Campaign control (pause running=200, pause completed=400, cancel running=200), Regression (single /api/messages/send still works, /api/wallets SA list). Frontend: SA login → /dashboard, /api/ws WSS connection auto-opens and receives {type:connected, role:super_admin, server_time}. Team page → Add Member dialog → member-role-select dropdown shows all 4 roles for SA (agent, manager, admin, super_admin).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Add Team Member dialog", "issues": ["React warning: 'Missing Description or aria-describedby={undefined} for {DialogContent}' — a11y warning from Radix Dialog. Add DialogDescription."]},
+      {"screen": "Dashboard charts", "issues": ["Recharts console warning: 'The width(-1) and height(-1) of chart should be greater than 0' — chart containers rendering at 0px before layout stabilises. Set minWidth/minHeight on ResponsiveContainer parent."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration15_ws_rbac_email_campaigns.py",
+    "/app/test_reports/pytest/iteration15.xml"
+  ],
+  "action_items": [
+    "OPTIONAL: Fix Radix DialogContent a11y — add DialogDescription to /team Add Member dialog (and audit others).",
+    "OPTIONAL: Give Recharts ResponsiveContainer parents an explicit min-height to silence width/height=-1 warnings on Dashboard.",
+    "Consider migrating in-memory WSHub to Redis pub/sub for horizontal scaling (already noted in code comment)."
+  ],
+  "critical_code_review_comments": [
+    "server.py has grown to 3012 lines — extract WS hub, email helpers, campaign runner, and wallet code into /app/backend/routers/*.py modules (previously flagged, still open).",
+    "adjust_wallet still uses two-step increment-then-rollback for negative-balance guard — racy under concurrent adjusts. Prefer aggregation-pipeline update with $expr guard (flagged iter 14).",
+    "run_campaign polls campaign status per-recipient via find_one — for large audiences this is O(N) DB reads. Consider a cached status + periodic refresh (e.g. every 10 recipients or every 5s).",
+    "WebSocket /api/ws token comes from query string — logged into supervisor access logs. Prefer sending token via first WS text frame after accept, or via subprotocol header, to avoid token leakage in log rotation.",
+    "useRealtime.js schedules reconnect even when the WS closes cleanly due to logout — check ws.close(1000, ...) code and skip reconnect on 1000/4401. Currently backoff still fires (harmless but noisy).",
+    "email_service (Resend/SendGrid) is env-gated. Verified 503 path works. When adding keys, verify the campaign-complete email hook actually runs (currently untested with real key)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration15_ws_rbac_email_campaigns.py (new — 18 tests, all pass in 77s)"
+  ],
+  "success_rate": {"backend": "100% (18/18)", "frontend": "100% (WS auto-connect + Team role dropdown verified)"},
+  "test_credentials": "SA admin@cpaas.io / Admin@12345. Ephemeral tenants TEST_IT15_A_<ts>, TEST_IT15_B_<ts> created and deleted per module.",
+  "seed_data_creation": "Two ephemeral tenants per test module (A + B) for tenant-isolation and RBAC checks — auto-cleaned via yield teardown.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 15 fully verified. Backend WS at /api/ws?token=<JWT> — closes with code 4401 on bad token, accepts+sends {type:connected} on valid, echoes pong for 'ping' text frames, keepalive every 45s. WSHub is in-memory keyed by company_id (or '__platform__' for SA). Tenant isolation confirmed via /api/messages/send emit_event path — SMS send by tenant A does not leak to tenant B's WS. RBAC v2 hierarchy in place: agent=1, manager=2, admin=3, super_admin=4; require_roles uses min-level check so manager satisfies agent-only endpoints. CA cannot create admin/super_admin (403 'Company admin can only create Manager or Agent users'). Email service env-gated — /api/email/config returns configured:false when RESEND_API_KEY/SENDGRID_API_KEY absent, /api/email/test returns 503. Campaign pause/resume/cancel wired to require_roles('super_admin','admin','manager') for pause+resume; cancel is admin+SA only. Note: tenant-webhook inbound_message test was replaced with message_event test because /api/webhook/whatsapp/{cid} requires a pre-existing company_whatsapp_configs doc + valid X-Hub signature — infeasible to simulate without real WA setup. If future iterations add a test-mode webhook bypass, wire it up.",
+  "rca of the issue": "No new bugs found. Two minor initial test-authoring issues self-fixed: (1) REACT_APP_BACKEND_URL not exported into pytest env — read from /app/frontend/.env fallback. (2) POST /api/messages/send returns 'message_id' key not 'id' — assertion relaxed. Tenant-webhook route requires WA config + Meta signature; test rewritten to use /api/messages/send which triggers the same WS broadcast path (emit_event → ws_hub.broadcast)."
+}

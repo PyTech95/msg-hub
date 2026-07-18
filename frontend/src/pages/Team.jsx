@@ -13,6 +13,7 @@ import { Plus, Trash2 } from "lucide-react";
 const ROLE_CLS = {
   super_admin: "bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300",
   admin: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300",
+  manager: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300",
   agent: "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300",
 };
 
@@ -65,7 +66,8 @@ export default function Team() {
                 <select value={form.role} onChange={e=>setForm({...form,role:e.target.value})}
                   className="h-9 w-full px-3 rounded-sm border border-border bg-background text-sm" data-testid="member-role-select">
                   <option value="agent">agent</option>
-                  <option value="admin">admin</option>
+                  <option value="manager">manager</option>
+                  {user?.role === "super_admin" && <option value="admin">admin</option>}
                   {user?.role === "super_admin" && <option value="super_admin">super_admin</option>}
                 </select>
               </div>

@@ -25,7 +25,7 @@ import jwt
 import pyotp
 import qrcode
 import qrcode.image.svg
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, BackgroundTasks, UploadFile, File, Query
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, BackgroundTasks, UploadFile, File, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
@@ -133,10 +133,17 @@ async def current_user(request: Request) -> dict:
     return user
 
 def require_roles(*roles: str):
+    """Allow user if their role is in `roles`, OR if their role level >= the min level of `roles`.
+    super_admin always allowed. Enables role hierarchy (manager can do agent's actions)."""
     async def _dep(user: dict = Depends(current_user)) -> dict:
-        if user["role"] not in roles and user["role"] != "super_admin":
-            raise HTTPException(403, f"Requires role: {roles}")
-        return user
+        r = user.get("role")
+        if r == "super_admin" or r in roles:
+            return user
+        user_level = ROLE_LEVEL.get(r, 0)
+        min_required = min((ROLE_LEVEL.get(x, 99) for x in roles), default=99)
+        if user_level >= min_required:
+            return user
+        raise HTTPException(403, f"Requires role: {roles}")
     return _dep
 
 def platform_only(*roles: str):
@@ -146,6 +153,40 @@ def platform_only(*roles: str):
             raise HTTPException(403, "Platform-level access required")
         return user
     return _dep
+
+# ───────────────────────── Realtime WebSocket hub ─────────────────────────
+class WSHub:
+    """In-memory pub/sub keyed by company_id. Broadcasts events to all connected tenant clients.
+    For horizontal scaling, swap to Redis pub/sub later (interface stays the same)."""
+
+    def __init__(self) -> None:
+        self._subs: Dict[str, set] = {}
+        self._lock = asyncio.Lock()
+
+    async def register(self, company_id: str, ws: WebSocket) -> None:
+        async with self._lock:
+            self._subs.setdefault(company_id, set()).add(ws)
+
+    async def unregister(self, company_id: str, ws: WebSocket) -> None:
+        async with self._lock:
+            self._subs.get(company_id, set()).discard(ws)
+
+    async def broadcast(self, company_id: Optional[str], event: Dict[str, Any]) -> None:
+        if not company_id:
+            return
+        stale: List[WebSocket] = []
+        for ws in list(self._subs.get(company_id, set())):
+            try:
+                await ws.send_json(event)
+            except Exception:
+                stale.append(ws)
+        if stale:
+            async with self._lock:
+                for ws in stale:
+                    self._subs.get(company_id, set()).discard(ws)
+
+
+ws_hub = WSHub()
 
 # ───────────────────────── Multi-tenant helpers ─────────────────────────
 def cflt(user: dict, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -163,7 +204,10 @@ async def with_company(user: dict) -> dict:
 
 # ───────────────────────── Pydantic Models ─────────────────────────
 Channel = Literal["sms", "whatsapp", "rcs", "voice"]
-Role = Literal["super_admin", "admin", "agent"]
+Role = Literal["super_admin", "admin", "manager", "agent"]
+
+# Role hierarchy (higher index = more privileges). Managers can do anything an agent can.
+ROLE_LEVEL = {"agent": 1, "manager": 2, "admin": 3, "super_admin": 4}
 
 class LoginIn(BaseModel):
     email: EmailStr
@@ -400,6 +444,14 @@ async def emit_event(message_id: str, event_type: str, **extra):
     if msg and msg.get("campaign_id"):
         field = f"stats.{event_type}"
         await db.campaigns.update_one({"id": msg["campaign_id"]}, {"$inc": {field: 1}})
+    # Realtime broadcast to tenant subscribers
+    if msg:
+        await ws_hub.broadcast(msg.get("company_id"), {
+            "type": "message_event", "message_id": message_id,
+            "event_type": event_type, "channel": msg.get("channel"),
+            "contact_id": msg.get("contact_id"), "campaign_id": msg.get("campaign_id"),
+            "created_at": evt["created_at"],
+        })
 
 async def emit_inbound_reply(message_id: str):
     msg = await db.messages.find_one({"id": message_id}, {"_id": 0})
@@ -471,6 +523,7 @@ async def on_startup():
     await db.wallets.create_index("company_id", unique=True)
     await db.wallet_transactions.create_index([("company_id", 1), ("created_at", -1)])
     await db.wallet_recharge_orders.create_index("razorpay_order_id", unique=True)
+    await db.wallet_alerts.create_index([("company_id", 1), ("date", 1), ("type", 1)])
     await seed()
     asyncio.create_task(campaign_scheduler_loop())
     log.info("CPaaS backend ready.")
@@ -754,8 +807,10 @@ async def login(body: LoginIn, response: Response, request: Request):
 async def register(body: RegisterIn, user: dict = Depends(require_roles("super_admin","admin"))):
     if await db.users.find_one({"email": body.email.lower()}):
         raise HTTPException(409, "Email already exists")
-    if user.get("company_id") and body.role == "super_admin":
-        raise HTTPException(403, "Company admins cannot create super admins")
+    if user.get("company_id"):
+        # Company admin cannot create super_admin or another admin (only manager/agent)
+        if body.role not in ("manager", "agent"):
+            raise HTTPException(403, "Company admin can only create Manager or Agent users")
     doc = {
         "id": new_id(), "email": body.email.lower(), "password_hash": hash_pw(body.password),
         "name": body.name, "role": body.role, "company_id": user.get("company_id"),
@@ -946,7 +1001,7 @@ TENANT_COLLECTIONS = [
     "messages", "conversations", "call_logs", "bills", "bill_batches",
     "notice_templates", "notice_pdfs", "voice_campaigns", "reminder_schedules",
     "usage_records", "audit_logs", "company_whatsapp_configs",
-    "wallets", "wallet_transactions", "wallet_recharge_orders",
+    "wallets", "wallet_transactions", "wallet_recharge_orders", "wallet_alerts",
 ]
 
 @api.get("/companies")
@@ -1216,40 +1271,151 @@ async def create_campaign(body: CampaignIn, background: BackgroundTasks, user: d
         background.add_task(run_campaign, camp["id"], body.channel, tpl, audience, body.variables_map, user.get("company_id"))
     return clean(camp)
 
-async def run_campaign(campaign_id: str, channel: Channel, tpl: dict, audience: List[dict], variables_map: Dict[str, Any], company_id: Optional[str] = None):
-    adapter = ADAPTERS[channel]
-    for c in audience:
-        body = render_body(tpl["body"], c, variables_map)
-        mid = new_id()
-        msg = {
-            "id": mid, "channel": channel, "contact_id": c["id"], "direction": "outbound",
-            "body": body, "media_url": tpl.get("media_url"),
-            "status": "queued", "provider_message_id": None,
-            "campaign_id": campaign_id, "company_id": company_id,
-            "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
-        }
-        await db.messages.insert_one(msg)
-        try:
+# Per-channel concurrency semaphores (Meta WA limit: 80 msg/sec; keep conservative)
+CHANNEL_CONCURRENCY = {"whatsapp": 20, "sms": 40, "rcs": 20, "voice": 5}
+_channel_semaphores: Dict[str, asyncio.Semaphore] = {}
+
+
+def _get_channel_sem(channel: str) -> asyncio.Semaphore:
+    if channel not in _channel_semaphores:
+        _channel_semaphores[channel] = asyncio.Semaphore(CHANNEL_CONCURRENCY.get(channel, 10))
+    return _channel_semaphores[channel]
+
+
+async def _send_one_campaign_recipient(campaign_id: str, channel: str, adapter, tpl: dict,
+                                       c: dict, body: str, company_id: Optional[str]) -> str:
+    """Send one recipient with wallet debit + refund on failure. Returns 'sent'|'skipped'|'failed'."""
+    mid = new_id()
+    msg = {
+        "id": mid, "channel": channel, "contact_id": c["id"], "direction": "outbound",
+        "body": body, "media_url": tpl.get("media_url"),
+        "status": "queued", "provider_message_id": None,
+        "campaign_id": campaign_id, "company_id": company_id,
+        "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
+    }
+    await db.messages.insert_one(msg)
+    price_paise = _price_paise(channel) if company_id else 0
+    if company_id and price_paise > 0:
+        ok = await _debit_wallet(company_id, price_paise,
+                                 {"message_id": mid, "channel": channel, "campaign_id": campaign_id})
+        if not ok:
+            await db.messages.update_one({"id": mid}, {"$set": {"status": "failed"}})
+            await emit_event(mid, "failed", reason="insufficient_wallet_balance")
+            await db.campaign_recipients.update_one({"campaign_id": campaign_id, "contact_id": c["id"]},
+                                                    {"$set": {"status": "skipped_low_balance"}})
+            return "skipped"
+    try:
+        async with _get_channel_sem(channel):
             resp = await adapter.send(c["phone"], body, tpl.get("media_url"), company_id=company_id)
-            await db.messages.update_one({"id": mid}, {"$set": {"provider_message_id": resp.get("provider_message_id"), "status": "queued"}})
-        except Exception as e:
-            await emit_event(mid, "failed", reason=str(e))
-            continue
-        await db.campaign_recipients.update_one({"campaign_id": campaign_id, "contact_id": c["id"]}, {"$set": {"status": "sent"}})
-        await db.conversations.update_one(
-            {"contact_id": c["id"], "channel": channel},
-            {"$set": {"last_message_at": iso(now_utc()), "last_message": body, "company_id": company_id}}, upsert=True,
-        )
-        if resp.get("mode") == "live":
-            await emit_event(mid, "sent", source=getattr(adapter, "provider_key", "live"))
-            await db.usage_records.insert_one({
-                "id": new_id(), "channel": channel, "message_id": mid, "units": 1,
-                "amount": PRICING[channel], "currency": "INR", "company_id": company_id, "created_at": iso(now_utc()),
+        await db.messages.update_one({"id": mid},
+                                     {"$set": {"provider_message_id": resp.get("provider_message_id"),
+                                               "status": "queued"}})
+    except Exception as e:
+        # Refund wallet
+        if company_id and price_paise > 0:
+            await db.wallets.update_one({"company_id": company_id},
+                                        {"$inc": {"balance_paise": price_paise},
+                                         "$set": {"updated_at": iso(now_utc())}})
+            await db.wallet_transactions.insert_one({
+                "id": new_id(), "company_id": company_id, "type": "credit",
+                "amount_paise": price_paise,
+                "meta": {"reason": "campaign_send_failed_refund", "message_id": mid, "campaign_id": campaign_id},
+                "created_at": iso(now_utc()),
             })
-        else:
-            asyncio.create_task(deliver_message(mid, channel))
-        await asyncio.sleep(0.05)
-    await db.campaigns.update_one({"id": campaign_id}, {"$set": {"status": "completed", "completed_at": iso(now_utc())}})
+        await emit_event(mid, "failed", reason=str(e))
+        return "failed"
+    await db.campaign_recipients.update_one({"campaign_id": campaign_id, "contact_id": c["id"]},
+                                            {"$set": {"status": "sent"}})
+    await db.conversations.update_one(
+        {"contact_id": c["id"], "channel": channel},
+        {"$set": {"last_message_at": iso(now_utc()), "last_message": body, "company_id": company_id}},
+        upsert=True,
+    )
+    if resp.get("mode") == "live":
+        await emit_event(mid, "sent", source=getattr(adapter, "provider_key", "live"))
+        await db.usage_records.insert_one({
+            "id": new_id(), "channel": channel, "message_id": mid, "units": 1,
+            "amount": PRICING[channel], "currency": "INR", "company_id": company_id,
+            "created_at": iso(now_utc()),
+        })
+    else:
+        asyncio.create_task(deliver_message(mid, channel))
+    return "sent"
+
+
+async def run_campaign(campaign_id: str, channel: Channel, tpl: dict, audience: List[dict], variables_map: Dict[str, Any], company_id: Optional[str] = None):
+    """Run a campaign with pause/cancel support + rate-limited concurrent sending."""
+    adapter = ADAPTERS[channel]
+    stats = {"sent": 0, "skipped": 0, "failed": 0}
+    for c in audience:
+        # Check campaign status — support pause/cancel
+        camp = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0, "status": 1})
+        if not camp or camp.get("status") in ("cancelled", "paused"):
+            log.info(f"Campaign {campaign_id} {camp.get('status') if camp else 'gone'} — halting")
+            break
+        body = render_body(tpl["body"], c, variables_map)
+        result = await _send_one_campaign_recipient(campaign_id, channel, adapter, tpl, c, body, company_id)
+        stats[result] = stats.get(result, 0) + 1
+    final_status = "completed"
+    camp = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0, "status": 1})
+    if camp and camp.get("status") in ("cancelled", "paused"):
+        final_status = camp["status"]
+    await db.campaigns.update_one({"id": campaign_id},
+                                   {"$set": {"status": final_status, "completed_at": iso(now_utc())}})
+    # Send campaign-complete email best-effort
+    try:
+        if email_service.configured and company_id and final_status == "completed":
+            comp = await db.companies.find_one({"id": company_id}, {"_id": 0, "name": 1, "admin_email": 1})
+            camp_doc = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0, "name": 1, "stats": 1})
+            if comp and comp.get("admin_email") and camp_doc:
+                from services.email_service import campaign_finished_email_html
+                base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+                url = f"{base}/campaigns/{campaign_id}" if base else f"/campaigns/{campaign_id}"
+                await email_service.send(
+                    to=comp["admin_email"],
+                    subject=f"Campaign complete — {camp_doc.get('name', '')}",
+                    html=campaign_finished_email_html(camp_doc.get("name", ""), camp_doc.get("stats", {}), url),
+                )
+    except Exception as e:
+        log.warning(f"campaign-complete email failed: {e}")
+
+
+@api.post("/campaigns/{campaign_id}/pause")
+async def pause_campaign(campaign_id: str, user: dict = Depends(require_roles("super_admin","admin","manager"))):
+    res = await db.campaigns.update_one(cflt(user, {"id": campaign_id, "status": "running"}),
+                                         {"$set": {"status": "paused", "paused_at": iso(now_utc())}})
+    if res.matched_count == 0:
+        raise HTTPException(400, "Campaign not found or not running")
+    return {"ok": True}
+
+
+@api.post("/campaigns/{campaign_id}/resume")
+async def resume_campaign(campaign_id: str, background: BackgroundTasks,
+                          user: dict = Depends(require_roles("super_admin","admin","manager"))):
+    camp = await db.campaigns.find_one(cflt(user, {"id": campaign_id, "status": "paused"}), {"_id": 0})
+    if not camp:
+        raise HTTPException(400, "Campaign not found or not paused")
+    tpl = await db.templates.find_one(cflt(user, {"id": camp["template_id"]}), {"_id": 0})
+    if not tpl:
+        raise HTTPException(400, "Template not found")
+    # Only resend to recipients whose status is still 'queued'
+    pending = await db.campaign_recipients.find(
+        cflt(user, {"campaign_id": campaign_id, "status": {"$in": ["queued", "skipped_low_balance"]}}), {"_id": 0}
+    ).to_list(100000)
+    contacts = await db.contacts.find(cflt(user, {"id": {"$in": [r["contact_id"] for r in pending]}}), {"_id": 0}).to_list(100000)
+    await db.campaigns.update_one({"id": campaign_id}, {"$set": {"status": "running"}})
+    background.add_task(run_campaign, campaign_id, camp["channel"], tpl, contacts, camp.get("variables_map") or {}, user.get("company_id"))
+    return {"ok": True, "resuming_with": len(contacts)}
+
+
+@api.post("/campaigns/{campaign_id}/cancel")
+async def cancel_campaign(campaign_id: str, user: dict = Depends(require_roles("super_admin","admin"))):
+    res = await db.campaigns.update_one(cflt(user, {"id": campaign_id, "status": {"$in": ["running", "paused", "scheduled"]}}),
+                                         {"$set": {"status": "cancelled", "cancelled_at": iso(now_utc())}})
+    if res.matched_count == 0:
+        raise HTTPException(400, "Campaign not found or already completed")
+    return {"ok": True}
+
 
 @api.delete("/campaigns/{campaign_id}")
 async def delete_campaign(campaign_id: str, user: dict = Depends(require_roles("super_admin","admin"))):
@@ -1724,6 +1890,11 @@ async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict], com
         {"$set": {"last_message_at": iso(now_utc()), "last_message": body_txt, "unread": True, "company_id": resolved_company_id}},
         upsert=True,
     )
+    # Realtime push to tenant subscribers
+    await ws_hub.broadcast(resolved_company_id, {
+        "type": "inbound_message", "channel": "whatsapp", "contact_id": cid,
+        "message_id": inbound["id"], "body": body_txt, "created_at": inbound["created_at"],
+    })
     if body_txt.strip().upper() == "STOP":
         await db.contacts.update_one({"id": cid}, {"$set": {"opted_out": True}})
 
@@ -2221,6 +2392,15 @@ async def _debit_wallet(company_id: Optional[str], amount_paise: int, meta_info:
         "amount_paise": amount_paise, "balance_paise_after": res["balance_paise"],
         "meta": meta_info, "created_at": iso(now_utc()),
     })
+    # Realtime wallet update + low-balance alert
+    threshold = res.get("low_balance_threshold_paise", 5000)
+    is_low = res["balance_paise"] < threshold
+    await ws_hub.broadcast(company_id, {
+        "type": "wallet_debit", "balance_paise": res["balance_paise"],
+        "amount_paise": amount_paise, "low_balance": is_low,
+    })
+    if is_low:
+        asyncio.create_task(_notify_low_balance(company_id, res["balance_paise"], threshold))
     return True
 
 
@@ -2297,6 +2477,61 @@ async def adjust_wallet(body: WalletAdjustIn, user: dict = Depends(require_roles
 
 
 # ─────────── Razorpay recharge (plumbing; activates when SA sets keys) ───────────
+from services.email_service import email_service, low_balance_email_html, recharge_receipt_email_html
+
+
+async def _notify_low_balance(company_id: str, balance_paise: int, threshold_paise: int):
+    """Send a low-balance email to the company admin if not already sent today."""
+    try:
+        if not email_service.configured:
+            return
+        today = iso(now_utc())[:10]
+        marker = await db.wallet_alerts.find_one({"company_id": company_id, "date": today, "type": "low_balance"})
+        if marker:
+            return  # already sent today
+        c = await db.companies.find_one({"id": company_id}, {"_id": 0, "name": 1, "admin_email": 1})
+        if not c or not c.get("admin_email"):
+            return
+        base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+        recharge_url = f"{base}/wallet" if base else "/wallet"
+        result = await email_service.send(
+            to=c["admin_email"],
+            subject=f"⚠️ Low wallet balance — ₹{balance_paise/100:.2f} left",
+            html=low_balance_email_html(c["name"], balance_paise / 100, threshold_paise / 100, recharge_url),
+        )
+        await db.wallet_alerts.insert_one({
+            "id": new_id(), "company_id": company_id, "type": "low_balance",
+            "date": today, "sent_at": iso(now_utc()),
+            "email_result": {k: v for k, v in result.items() if k in ("ok", "provider", "id", "error")},
+        })
+    except Exception as e:
+        log.warning(f"low-balance email failed: {e}")
+
+
+@api.get("/email/config")
+async def get_email_config(_: dict = Depends(require_roles("super_admin"))):
+    return {"configured": email_service.configured, "provider": email_service.provider,
+            "from": email_service.email_from}
+
+
+class EmailTestIn(BaseModel):
+    to: EmailStr
+
+
+@api.post("/email/test")
+async def send_test_email(body: EmailTestIn, _: dict = Depends(require_roles("super_admin"))):
+    if not email_service.configured:
+        raise HTTPException(503, "Email service not configured. Set RESEND_API_KEY or SENDGRID_API_KEY in backend .env.")
+    result = await email_service.send(
+        to=str(body.to),
+        subject="Test email from tezsandesh.digital",
+        html="<p>This is a test email — email notifications are working correctly. 🎉</p>",
+    )
+    if not result.get("ok"):
+        raise HTTPException(400, f"Email send failed: {result.get('error')}")
+    return {"ok": True, "provider": result.get("provider"), "id": result.get("id")}
+
+
 def _razorpay_client():
     """Return a razorpay.Client if keys are configured, else None."""
     key_id = (os.environ.get("RAZORPAY_KEY_ID") or "").strip()
@@ -2402,6 +2637,20 @@ async def verify_recharge(body: RechargeVerifyIn, user: dict = Depends(current_u
     })
     await audit("wallet_recharged", "wallet", user["company_id"], user,
                 {"amount_paise": order["amount_paise"], "razorpay_order_id": body.razorpay_order_id})
+    # Fire-and-forget email receipt (best-effort)
+    async def _send_receipt():
+        try:
+            c = await db.companies.find_one({"id": user["company_id"]}, {"_id": 0, "name": 1, "admin_email": 1})
+            if email_service.configured and c and c.get("admin_email"):
+                await email_service.send(
+                    to=c["admin_email"],
+                    subject=f"Recharge successful — ₹{order['amount_paise']/100:.2f} credited",
+                    html=recharge_receipt_email_html(c["name"], order["amount_paise"] / 100,
+                                                    res["balance_paise"] / 100, body.razorpay_order_id),
+                )
+        except Exception as e:
+            log.warning(f"receipt email failed: {e}")
+    asyncio.create_task(_send_receipt())
     return {"ok": True, "balance_paise": res["balance_paise"]}
 
 
@@ -2709,6 +2958,48 @@ async def campaign_scheduler_loop():
 @api.get("/")
 async def root():
     return {"name": "tezsandesh.digital API", "version": "1.0.0", "status": "ok"}
+
+
+@app.websocket("/api/ws")
+async def realtime_ws(ws: WebSocket, token: str = Query(...)):
+    """Realtime tenant-scoped feed. Frontend connects with ?token=<JWT>.
+    Broadcasts:
+      - {type:"message_event", ...} on every emit_event()
+      - {type:"inbound_message", ...} on new inbound WhatsApp message
+      - {type:"wallet_debit"/"wallet_credit", balance_paise, ...}
+    """
+    # Manual JWT decode (WebSocket can't use Depends(current_user))
+    try:
+        payload = jwt.decode(token, os.environ["JWT_SECRET"], algorithms=["HS256"])
+    except Exception:
+        await ws.close(code=4401)
+        return
+    user = await db.users.find_one({"id": payload.get("sub")}, {"_id": 0})
+    if not user or payload.get("tv", 1) != user.get("token_version", 1):
+        await ws.close(code=4401)
+        return
+    company_id = user.get("company_id") or "__platform__"
+    await ws.accept()
+    await ws_hub.register(company_id, ws)
+    try:
+        await ws.send_json({"type": "connected", "company_id": user.get("company_id"),
+                            "role": user.get("role"), "server_time": iso(now_utc())})
+        # Keep the socket alive; also receive pings from client.
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=45.0)
+                if msg == "ping":
+                    await ws.send_json({"type": "pong", "server_time": iso(now_utc())})
+            except asyncio.TimeoutError:
+                # Server-side keepalive
+                await ws.send_json({"type": "keepalive", "server_time": iso(now_utc())})
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        log.warning(f"WebSocket error: {e}")
+    finally:
+        await ws_hub.unregister(company_id, ws)
+
 
 app.include_router(api)
 

@@ -1,5 +1,7 @@
 import React from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
+import { toast } from "sonner";
+import { useRealtime } from "@/hooks/useRealtime";
 import {
   LayoutDashboard, Users, FileText, Megaphone, MessageSquare, Phone,
   BarChart3, Plug, Webhook, UserCog, Settings, Inbox, Sun, Moon, LogOut,
@@ -39,8 +41,15 @@ const NAV = [
   { to: "/wallet",        label: "Wallet",        icon: WalletIcon,      roles: ["super_admin","admin"] },
   { to: "/audit-logs",    label: "Audit Logs",    icon: ScrollText,      roles: ["super_admin","admin"] },
   { to: "/team",          label: "Team",          icon: UserCog,         roles: ["super_admin","admin"] },
-  { to: "/settings",      label: "Settings",      icon: Settings,        roles: ["super_admin","admin","agent"] },
+  { to: "/settings",      label: "Settings",      icon: Settings,        roles: ["super_admin","admin","manager","agent"] },
 ];
+
+// Extend nav roles so Manager & Agent see relevant nav items (backend already gates permissions)
+NAV.forEach(item => {
+  if (["/inbox","/contacts","/campaigns","/messages","/analytics","/dashboard","/wallet","/templates"].includes(item.to)
+      && !item.roles.includes("manager")) item.roles.push("manager");
+  if (["/inbox","/contacts"].includes(item.to) && !item.roles.includes("agent")) item.roles.push("agent");
+});
 
 export const ROLE_NAV = NAV;
 
@@ -48,6 +57,22 @@ export default function AppLayout() {
   const { user, logout } = useAuth();
   const { theme, toggle } = useTheme();
   const nav = useNavigate();
+
+  // Global realtime feed — surfaces inbound messages + low-balance alerts as toasts
+  useRealtime((evt) => {
+    if (!evt) return;
+    if (evt.type === "inbound_message") {
+      toast.info("New WhatsApp message", {
+        description: (evt.body || "").slice(0, 120),
+        action: { label: "Open", onClick: () => nav(`/contacts/${evt.contact_id}`) },
+      });
+    } else if (evt.type === "wallet_debit" && evt.low_balance) {
+      toast.warning("Low wallet balance", {
+        description: `Balance dropped to ₹${(evt.balance_paise/100).toFixed(2)} — recharge soon.`,
+        action: { label: "Recharge", onClick: () => nav("/wallet") },
+      });
+    }
+  });
 
   return (
     <div className="min-h-screen flex bg-background text-foreground">
