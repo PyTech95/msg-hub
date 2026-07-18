@@ -2371,6 +2371,7 @@ async def _get_or_create_wallet(company_id: str) -> Dict[str, Any]:
              "low_balance_threshold_paise": 5000,  # ₹50 default
              "created_at": iso(now_utc()), "updated_at": iso(now_utc())}
         await db.wallets.insert_one(w)
+        w.pop("_id", None)
     return w
 
 
@@ -2436,13 +2437,25 @@ async def get_wallet(user: dict = Depends(current_user)):
 
 @api.get("/wallets")
 async def list_all_wallets(_: dict = Depends(require_roles("super_admin"))):
-    """Super Admin: overview of all tenant wallets."""
-    ws = await db.wallets.find({}, {"_id": 0}).sort("balance_paise", -1).to_list(500)
-    for w in ws:
-        c = await db.companies.find_one({"id": w["company_id"]}, {"_id": 0, "name": 1, "admin_email": 1})
-        w["company_name"] = (c or {}).get("name", "—")
-        w["admin_email"] = (c or {}).get("admin_email", "")
-    return ws
+    """Super Admin: overview of all tenant wallets. Includes companies whose wallet
+    hasn't been auto-created yet (shown with balance 0) so SA can top them up."""
+    companies = await db.companies.find({}, {"_id": 0, "id": 1, "name": 1, "admin_email": 1, "is_active": 1}
+                                        ).sort("created_at", -1).to_list(1000)
+    existing = {w["company_id"]: w for w in await db.wallets.find({}, {"_id": 0}).to_list(1000)}
+    out = []
+    for c in companies:
+        w = existing.get(c["id"])
+        if not w:
+            # Auto-create wallet row so subsequent adjusts/sends have a target
+            w = await _get_or_create_wallet(c["id"])
+        out.append({
+            **w,
+            "company_name": c.get("name", "—"),
+            "admin_email": c.get("admin_email", ""),
+            "is_active": c.get("is_active", True),
+        })
+    out.sort(key=lambda w: w["balance_paise"], reverse=True)
+    return out
 
 
 @api.post("/wallet/adjust")
