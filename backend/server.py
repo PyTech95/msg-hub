@@ -25,9 +25,9 @@ import jwt
 import pyotp
 import qrcode
 import qrcode.image.svg
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, BackgroundTasks, UploadFile, File, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, BackgroundTasks, UploadFile, File, Form, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 
 # ───────────────────────────── Setup ─────────────────────────────
@@ -42,6 +42,7 @@ ACCESS_TTL_MIN = 60 * 24  # 1 day for demo convenience
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
+media_fs = AsyncIOMotorGridFSBucket(db, bucket_name="wa_media")
 
 app = FastAPI(title="tezsandesh.digital API", version="1.0.0")
 api = APIRouter(prefix="/api")
@@ -1834,6 +1835,7 @@ async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict], com
     frm = m.get("from") or ""
     phone = frm if frm.startswith("+") else f"+{frm}"
     msg_type = m.get("type")
+    media_meta: Optional[Dict[str, Any]] = None
     if msg_type == "text":
         body_txt = (m.get("text") or {}).get("body") or ""
     elif msg_type == "button":
@@ -1841,6 +1843,24 @@ async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict], com
     elif msg_type == "interactive":
         inter = m.get("interactive") or {}
         body_txt = ((inter.get("button_reply") or inter.get("list_reply") or {}).get("title")) or "[interactive reply]"
+    elif msg_type in ("image", "video", "audio", "document", "sticker", "voice"):
+        media_obj = m.get(msg_type) or {}
+        caption = media_obj.get("caption") or ""
+        filename = media_obj.get("filename") or ""
+        body_txt = caption or filename or f"[{msg_type}]"
+        media_meta = {
+            "type": msg_type, "meta_media_id": media_obj.get("id"),
+            "mime_type": media_obj.get("mime_type"),
+            "sha256": media_obj.get("sha256"), "filename": filename,
+            "caption": caption, "download_status": "pending",
+        }
+    elif msg_type == "location":
+        loc = m.get("location") or {}
+        body_txt = f"[location] {loc.get('latitude')}, {loc.get('longitude')}" + (
+            f" — {loc.get('name')}" if loc.get('name') else "")
+        media_meta = {"type": "location", "latitude": loc.get("latitude"),
+                      "longitude": loc.get("longitude"),
+                      "name": loc.get("name") or "", "address": loc.get("address") or ""}
     else:
         body_txt = f"[{msg_type} message]"
     profile_name = ""
@@ -1880,7 +1900,13 @@ async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict], com
         "campaign_id": None, "company_id": resolved_company_id,
         "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
     }
+    if media_meta:
+        inbound["media"] = media_meta
     await db.messages.insert_one(inbound)
+    # Fire-and-forget: fetch actual media bytes into GridFS
+    if media_meta and media_meta.get("type") != "location" and media_meta.get("meta_media_id"):
+        asyncio.create_task(_download_inbound_media(inbound["id"], resolved_company_id,
+                                                    media_meta["meta_media_id"]))
     await db.message_events.insert_one({
         "id": new_id(), "message_id": inbound["id"], "type": "received",
         "payload": {"body": body_txt, "source": "meta_whatsapp"}, "created_at": iso(now_utc()),
@@ -2667,6 +2693,219 @@ async def verify_recharge(body: RechargeVerifyIn, user: dict = Depends(current_u
             log.warning(f"receipt email failed: {e}")
     asyncio.create_task(_send_receipt())
     return {"ok": True, "balance_paise": res["balance_paise"]}
+
+
+# ─────────── WhatsApp Media Inbox (upload → send / receive → GridFS) ───────────
+MAX_MEDIA_BYTES = 25 * 1024 * 1024  # 25 MB — safely under Meta's 100 MB limit + our proxy
+ALLOWED_MEDIA_TYPES = {
+    "image": ("image/jpeg", "image/png", "image/webp"),
+    "video": ("video/mp4", "video/3gpp"),
+    "audio": ("audio/aac", "audio/mp4", "audio/mpeg", "audio/amr", "audio/ogg"),
+    "document": ("application/pdf", "application/msword",
+                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                 "application/vnd.ms-excel",
+                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                 "application/vnd.ms-powerpoint",
+                 "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                 "text/plain", "text/csv"),
+    "sticker": ("image/webp",),
+}
+
+
+def _detect_media_kind(mime: str) -> str:
+    mime = (mime or "").lower()
+    for kind, types in ALLOWED_MEDIA_TYPES.items():
+        if mime in types:
+            return kind
+    if mime.startswith("image/"):
+        return "image"
+    if mime.startswith("video/"):
+        return "video"
+    if mime.startswith("audio/"):
+        return "audio"
+    return "document"
+
+
+async def _download_inbound_media(message_id: str, company_id: Optional[str], meta_media_id: str):
+    """Background: pull Meta media bytes into GridFS. Idempotent per message_id."""
+    try:
+        creds = await meta_wa_credentials(company_id)
+        if not creds:
+            log.warning("inbound media %s: no credentials for company %s", meta_media_id, company_id)
+            return
+        url_info = await meta_wa.get_media_url(creds["access_token"], meta_media_id,
+                                               creds.get("graph_version", "v22.0"))
+        if not url_info["ok"]:
+            log.warning("inbound media %s: get_media_url failed: %s", meta_media_id, url_info["error"])
+            await db.messages.update_one({"id": message_id},
+                                          {"$set": {"media.download_status": "failed",
+                                                    "media.error": url_info["error"]}})
+            return
+        blob = await meta_wa.download_media_bytes(creds["access_token"], url_info["url"])
+        if not blob["ok"]:
+            log.warning("inbound media %s: download failed: %s", meta_media_id, blob["error"])
+            await db.messages.update_one({"id": message_id},
+                                          {"$set": {"media.download_status": "failed",
+                                                    "media.error": blob["error"]}})
+            return
+        mime = url_info.get("mime_type") or blob.get("mime_type") or "application/octet-stream"
+        filename = f"{meta_media_id}"
+        file_id = await media_fs.upload_from_stream(
+            filename, io.BytesIO(blob["bytes"]),
+            metadata={"company_id": company_id, "message_id": message_id,
+                      "mime_type": mime, "source": "meta_inbound",
+                      "meta_media_id": meta_media_id, "size": len(blob["bytes"]),
+                      "created_at": iso(now_utc())},
+        )
+        await db.messages.update_one({"id": message_id},
+                                      {"$set": {"media.gridfs_id": str(file_id),
+                                                "media.mime_type": mime,
+                                                "media.size": len(blob["bytes"]),
+                                                "media.download_status": "done"}})
+        log.info("inbound media %s → gridfs %s (%d bytes)", meta_media_id, file_id, len(blob["bytes"]))
+    except Exception as e:
+        log.exception("inbound media download crash: %s", e)
+        try:
+            await db.messages.update_one({"id": message_id},
+                                          {"$set": {"media.download_status": "failed",
+                                                    "media.error": str(e)}})
+        except Exception:
+            pass
+
+
+@api.post("/whatsapp/send-media")
+async def whatsapp_send_media(
+    to: str = Form(...),
+    caption: str = Form(""),
+    file: UploadFile = File(...),
+    user: dict = Depends(current_user),
+):
+    """Upload media to Meta → send as WhatsApp message → store in GridFS → wallet debit."""
+    phone = to.strip()
+    if not phone.startswith("+"):
+        phone = f"+{phone}"
+    content = await file.read()
+    if not content:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_MEDIA_BYTES:
+        raise HTTPException(413, f"File too large (max {MAX_MEDIA_BYTES // (1024*1024)} MB)")
+    mime = file.content_type or "application/octet-stream"
+    kind = _detect_media_kind(mime)
+    filename = file.filename or f"upload.{mime.split('/')[-1] or 'bin'}"
+
+    contact = await db.contacts.find_one(cflt(user, {"phone": {"$in": [phone, phone.lstrip('+')]}}), {"_id": 0})
+    if contact and contact.get("opted_out"):
+        raise HTTPException(400, "Contact has opted out")
+    if contact:
+        cid = contact["id"]
+    else:
+        cid = new_id()
+        await db.contacts.insert_one({
+            "id": cid, "name": phone, "phone": phone, "email": None, "tags": ["wa-direct"],
+            "list_ids": [], "dnd": False, "opted_out": False, "notes": "", "custom_fields": {},
+            "company_id": user.get("company_id"), "created_at": iso(now_utc()),
+        })
+
+    creds = await meta_wa_credentials(user.get("company_id"))
+    if not creds:
+        raise HTTPException(400, "WhatsApp is not configured for this tenant. Ask your admin to set up Meta credentials.")
+
+    # Persist to GridFS first so UI can render even if send fails
+    gridfs_id = await media_fs.upload_from_stream(
+        filename, io.BytesIO(content),
+        metadata={"company_id": user.get("company_id"), "mime_type": mime,
+                  "source": "outbound_upload", "size": len(content),
+                  "created_at": iso(now_utc())},
+    )
+
+    mid = new_id()
+    await db.messages.insert_one({
+        "id": mid, "channel": "whatsapp", "contact_id": cid, "direction": "outbound",
+        "body": caption, "status": "queued", "provider_message_id": None, "campaign_id": None,
+        "company_id": user.get("company_id"),
+        "media": {"type": kind, "mime_type": mime, "filename": filename,
+                  "size": len(content), "gridfs_id": str(gridfs_id),
+                  "caption": caption, "download_status": "done"},
+        "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
+    })
+
+    # Wallet debit
+    price_paise = _price_paise("whatsapp")
+    if user.get("company_id") and price_paise > 0:
+        ok = await _debit_wallet(user["company_id"], price_paise,
+                                 {"message_id": mid, "channel": "whatsapp", "to": phone, "media": kind})
+        if not ok:
+            await db.messages.update_one({"id": mid}, {"$set": {"status": "failed"}})
+            await emit_event(mid, "failed", reason="Insufficient wallet balance", source="wallet")
+            raise HTTPException(402, "Insufficient wallet balance. Please recharge your wallet to send messages.")
+
+    try:
+        up = await meta_wa.upload_media(creds, content, filename, mime)
+        if not up["ok"]:
+            raise RuntimeError(up["error"])
+        resp = await meta_wa.send_media_message(
+            creds, phone, kind, media_id=up["media_id"],
+            caption=caption if kind in ("image", "video", "document") else None,
+            filename=filename if kind == "document" else None,
+        )
+    except Exception as e:
+        # Refund on failure
+        if user.get("company_id") and price_paise > 0:
+            await db.wallets.update_one({"company_id": user["company_id"]},
+                                        {"$inc": {"balance_paise": price_paise},
+                                         "$set": {"updated_at": iso(now_utc())}})
+            await db.wallet_transactions.insert_one({
+                "id": new_id(), "company_id": user["company_id"], "type": "credit",
+                "amount_paise": price_paise, "meta": {"reason": "send_failed_refund", "message_id": mid},
+                "created_at": iso(now_utc()),
+            })
+        await db.messages.update_one({"id": mid}, {"$set": {"status": "failed"}})
+        await emit_event(mid, "failed", reason=str(e), source="meta_whatsapp")
+        raise HTTPException(400, f"WhatsApp media send failed: {e}")
+
+    await db.messages.update_one({"id": mid},
+                                  {"$set": {"provider_message_id": resp["provider_message_id"],
+                                            "status": "sent", "media.meta_media_id": up["media_id"]}})
+    await db.conversations.update_one(
+        {"contact_id": cid, "channel": "whatsapp"},
+        {"$set": {"last_message_at": iso(now_utc()),
+                  "last_message": caption or f"[{kind}]",
+                  "company_id": user.get("company_id")}}, upsert=True,
+    )
+    await audit("whatsapp_media_sent", "message", mid, user,
+                {"kind": kind, "size": len(content), "to": phone})
+    return {"id": mid, "media_kind": kind, "provider_message_id": resp["provider_message_id"],
+            "gridfs_id": str(gridfs_id), "size": len(content)}
+
+
+@api.get("/media/{gridfs_id}")
+async def get_media(gridfs_id: str, user: dict = Depends(current_user)):
+    """Stream a media file from GridFS. Enforces company scope."""
+    from bson import ObjectId
+    from fastapi.responses import StreamingResponse
+    try:
+        oid = ObjectId(gridfs_id)
+    except Exception:
+        raise HTTPException(400, "Invalid media id")
+    try:
+        stream = await media_fs.open_download_stream(oid)
+    except Exception:
+        raise HTTPException(404, "Media not found")
+    meta = getattr(stream, "metadata", None) or {}
+    # Scope: SA can access anything; tenant users only own company_id
+    if user.get("company_id") and meta.get("company_id") != user["company_id"]:
+        raise HTTPException(403, "Media belongs to another tenant")
+    mime = meta.get("mime_type") or "application/octet-stream"
+
+    async def _iter():
+        while True:
+            chunk = await stream.readchunk()
+            if not chunk:
+                break
+            yield chunk
+
+    headers = {"Cache-Control": "private, max-age=3600"}
+    return StreamingResponse(_iter(), media_type=mime, headers=headers)
 
 
 # ─────────── Per-tenant Meta WhatsApp webhook ───────────

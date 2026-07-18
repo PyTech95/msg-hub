@@ -124,6 +124,91 @@ async def create_message_template(access_token: str, waba_id: str, payload: Dict
         return {"ok": False, "error": str(e)}
 
 
+async def upload_media(creds: Dict[str, str], file_bytes: bytes,
+                      filename: str, mime_type: str) -> Dict[str, Any]:
+    """Upload media to Meta Cloud API. Returns {ok, media_id, error}.
+    Meta caches uploaded media for ~30 days; media_id is then used in send_media_message."""
+    url = f"{GRAPH_BASE}/{creds.get('graph_version', 'v22.0')}/{creds['phone_number_id']}/media"
+    try:
+        files = {
+            "file": (filename, file_bytes, mime_type),
+            "type": (None, mime_type),
+            "messaging_product": (None, "whatsapp"),
+        }
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(url, files=files,
+                                     headers={"Authorization": f"Bearer {creds['access_token']}"})
+        data = resp.json() if resp.content else {}
+        if resp.status_code >= 400:
+            return {"ok": False, "media_id": None,
+                    "error": (data.get("error") or {}).get("message") or resp.text}
+        return {"ok": True, "media_id": str(data.get("id")), "error": None}
+    except Exception as e:
+        return {"ok": False, "media_id": None, "error": str(e)}
+
+
+async def get_media_url(access_token: str, media_id: str,
+                        graph_version: str = "v22.0") -> Dict[str, Any]:
+    """Resolve a Meta media_id to a temporary download URL (~5 min TTL)."""
+    url = f"{GRAPH_BASE}/{graph_version}/{media_id}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {access_token}"})
+        data = resp.json() if resp.content else {}
+        if resp.status_code >= 400:
+            return {"ok": False, "url": None, "mime_type": None,
+                    "error": (data.get("error") or {}).get("message") or resp.text}
+        return {"ok": True, "url": data.get("url"),
+                "mime_type": data.get("mime_type"),
+                "file_size": data.get("file_size"),
+                "sha256": data.get("sha256"), "error": None}
+    except Exception as e:
+        return {"ok": False, "url": None, "mime_type": None, "error": str(e)}
+
+
+async def download_media_bytes(access_token: str, download_url: str) -> Dict[str, Any]:
+    """Download raw bytes from the Meta media CDN URL (requires Bearer token)."""
+    try:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            resp = await client.get(download_url,
+                                    headers={"Authorization": f"Bearer {access_token}"})
+        if resp.status_code >= 400:
+            return {"ok": False, "bytes": None, "error": f"CDN {resp.status_code}: {resp.text[:200]}"}
+        return {"ok": True, "bytes": resp.content,
+                "mime_type": resp.headers.get("content-type", "application/octet-stream"),
+                "error": None}
+    except Exception as e:
+        return {"ok": False, "bytes": None, "error": str(e)}
+
+
+async def send_media_message(creds: Dict[str, str], to: str, media_type: str,
+                             media_id: Optional[str] = None,
+                             link: Optional[str] = None,
+                             caption: Optional[str] = None,
+                             filename: Optional[str] = None) -> Dict[str, Any]:
+    """Send a media message (image/video/audio/document/sticker) via Meta Cloud API.
+    media_type: 'image' | 'video' | 'audio' | 'document' | 'sticker'
+    Provide either media_id (preferred, from upload_media) or link (public URL)."""
+    if media_type not in ("image", "video", "audio", "document", "sticker"):
+        raise ValueError(f"Unsupported media type: {media_type}")
+    payload_media: Dict[str, Any] = {}
+    if media_id:
+        payload_media["id"] = media_id
+    elif link:
+        payload_media["link"] = link
+    else:
+        raise ValueError("Either media_id or link is required")
+    if caption and media_type in ("image", "video", "document"):
+        payload_media["caption"] = caption
+    if filename and media_type == "document":
+        payload_media["filename"] = filename
+    payload = {"messaging_product": "whatsapp", "to": _clean_number(to),
+               "type": media_type, media_type: payload_media}
+    data = await graph_post_message(creds, payload)
+    pid = ((data.get("messages") or [{}])[0]).get("id") or f"meta_{secrets.token_hex(8)}"
+    return {"provider_message_id": str(pid), "accepted": True, "mode": "live", "raw": data}
+
+
 async def delete_message_template(access_token: str, waba_id: str, name: str,
                                   graph_version: str = "v22.0") -> Dict[str, Any]:
     """Delete a WhatsApp template by name (all languages)."""

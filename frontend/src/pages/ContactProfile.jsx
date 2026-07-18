@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import api from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
@@ -7,8 +7,62 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { ChannelBadge, StatusBadge } from "@/components/Badges";
-import { Phone, ArrowLeft, Send, MessageSquare, MessageCircle, Smartphone, AlertTriangle, Info } from "lucide-react";
+import { Phone, ArrowLeft, Send, MessageSquare, MessageCircle, Smartphone, AlertTriangle, Info, Paperclip, X, FileText, Video, Music, MapPin, Loader2 } from "lucide-react";
 import { toast } from "sonner";
+
+// GET media as blob so we can include the Authorization header, then convert to object URL
+async function fetchMediaBlob(id) {
+  const r = await api.get(`/media/${id}`, { responseType: "blob" });
+  return URL.createObjectURL(r.data);
+}
+
+function MediaPreview({ media }) {
+  const [blobUrl, setBlobUrl] = useState(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    if (!media?.gridfs_id || media.type === "location") return;
+    fetchMediaBlob(media.gridfs_id)
+      .then(url => { if (alive) setBlobUrl(url); })
+      .catch(() => { if (alive) setFailed(true); });
+    return () => {
+      alive = false;
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+    };
+  }, [media?.gridfs_id]);
+
+  if (!media) return null;
+  if (media.type === "location") {
+    const url = `https://www.google.com/maps?q=${media.latitude},${media.longitude}`;
+    return (
+      <a href={url} target="_blank" rel="noreferrer" className="flex items-center gap-2 text-sm text-blue-600 hover:underline" data-testid="media-location">
+        <MapPin className="h-4 w-4" /> {media.name || `${media.latitude}, ${media.longitude}`}
+      </a>
+    );
+  }
+  if (media.download_status === "pending") {
+    return <div className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="h-3 w-3 animate-spin" /> Downloading {media.type}…</div>;
+  }
+  if (media.download_status === "failed" || failed) {
+    return <div className="text-xs text-red-600" data-testid="media-failed">Media unavailable {media.error ? `— ${media.error}` : ""}</div>;
+  }
+  if (!blobUrl) return <div className="text-xs text-muted-foreground"><Loader2 className="h-3 w-3 inline animate-spin mr-1" /> Loading…</div>;
+  if (media.type === "image" || media.type === "sticker") {
+    return <img src={blobUrl} alt={media.filename || "image"} className="max-w-xs max-h-64 rounded-sm object-contain border" data-testid="media-image" />;
+  }
+  if (media.type === "video") {
+    return <video src={blobUrl} controls className="max-w-xs max-h-64 rounded-sm border" data-testid="media-video" />;
+  }
+  if (media.type === "audio" || media.type === "voice") {
+    return <audio src={blobUrl} controls className="w-full max-w-xs" data-testid="media-audio" />;
+  }
+  return (
+    <a href={blobUrl} download={media.filename || "document"} className="flex items-center gap-2 text-sm text-blue-600 hover:underline" data-testid="media-document">
+      <FileText className="h-4 w-4" /> {media.filename || "Document"}
+      {media.size ? <span className="text-xs text-muted-foreground">({Math.round(media.size / 1024)} KB)</span> : null}
+    </a>
+  );
+}
 
 const CHANNELS = [
   { key: "sms", label: "SMS", icon: MessageSquare },
@@ -32,6 +86,11 @@ export default function ContactProfile() {
   const [tplLang, setTplLang] = useState("en_US");
   const [tplList, setTplList] = useState(null);       // null=not-loaded, []=loaded-empty, [...]=loaded
   const [tplLoading, setTplLoading] = useState(false);
+
+  // WhatsApp Media Inbox (outbound)
+  const fileInputRef = useRef(null);
+  const [pendingFile, setPendingFile] = useState(null);
+  const [pendingPreview, setPendingPreview] = useState(null); // object URL for image preview
 
   const load = async () => {
     const c = await api.get(`/contacts/${id}`);
@@ -58,23 +117,51 @@ export default function ContactProfile() {
       .finally(() => setTplLoading(false));
   }, [channel, waMode, tplList, tplName, tplLang]);
 
+  const pickFile = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (f.size > 25 * 1024 * 1024) { toast.error("File too large (max 25 MB)"); return; }
+    setPendingFile(f);
+    if (pendingPreview) URL.revokeObjectURL(pendingPreview);
+    setPendingPreview(f.type.startsWith("image/") ? URL.createObjectURL(f) : null);
+  };
+
+  const clearPendingFile = () => {
+    setPendingFile(null);
+    if (pendingPreview) URL.revokeObjectURL(pendingPreview);
+    setPendingPreview(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
   const send = async (e) => {
     e.preventDefault();
     const isTemplate = channel === "whatsapp" && waMode === "template";
-    if (!isTemplate && !body.trim()) return;
+    const isMedia = channel === "whatsapp" && waMode === "freeform" && pendingFile;
+    if (!isTemplate && !isMedia && !body.trim()) return;
     if (isTemplate && !tplName.trim()) { toast.error("Template name required"); return; }
     setSending(true);
     try {
-      const payload = { channel, contact_id: id, body: isTemplate ? "" : body };
-      if (isTemplate) {
-        payload.template_name = tplName.trim();
-        payload.template_language = tplLang.trim() || "en_US";
+      if (isMedia) {
+        const fd = new FormData();
+        fd.append("to", contact.phone);
+        fd.append("caption", body || "");
+        fd.append("file", pendingFile);
+        await api.post("/whatsapp/send-media", fd, { headers: { "Content-Type": "multipart/form-data" } });
+        toast.success(`${pendingFile.type.split("/")[0] || "Media"} sent via WhatsApp`);
+        setBody("");
+        clearPendingFile();
+      } else {
+        const payload = { channel, contact_id: id, body: isTemplate ? "" : body };
+        if (isTemplate) {
+          payload.template_name = tplName.trim();
+          payload.template_language = tplLang.trim() || "en_US";
+        }
+        await api.post("/messages/send", payload);
+        toast.success(isTemplate
+          ? `Template "${tplName}" queued — this always delivers when the template is approved by Meta.`
+          : "Message queued");
+        setBody("");
       }
-      await api.post("/messages/send", payload);
-      toast.success(isTemplate
-        ? `Template "${tplName}" queued — this always delivers when the template is approved by Meta.`
-        : "Message queued");
-      setBody("");
       setTimeout(load, 700);
       setTimeout(load, 2200);
     } catch (err) {
@@ -220,12 +307,46 @@ export default function ContactProfile() {
                   </div>
                 </div>
               ) : (
-                <Textarea value={body} onChange={e => setBody(e.target.value)} rows={3}
-                  placeholder={`Write a ${channel} message…`} className="rounded-sm" data-testid="compose-message-input" />
+                <>
+                  <Textarea value={body} onChange={e => setBody(e.target.value)} rows={3}
+                    placeholder={pendingFile ? "Add a caption (optional)…" : `Write a ${channel} message…`} className="rounded-sm" data-testid="compose-message-input" />
+                  {channel === "whatsapp" && (
+                    <>
+                      <input ref={fileInputRef} type="file" className="hidden"
+                        accept="image/*,video/*,audio/*,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv"
+                        onChange={pickFile} data-testid="wa-media-file-input" />
+                      {pendingFile ? (
+                        <div className="flex items-center gap-3 p-2 border border-dashed rounded-sm bg-muted/30" data-testid="wa-media-pending">
+                          {pendingPreview ? (
+                            <img src={pendingPreview} alt="preview" className="h-14 w-14 object-cover rounded-sm border" />
+                          ) : (
+                            <div className="h-14 w-14 flex items-center justify-center border rounded-sm bg-background">
+                              {pendingFile.type.startsWith("video/") ? <Video className="h-6 w-6 text-muted-foreground" /> :
+                               pendingFile.type.startsWith("audio/") ? <Music className="h-6 w-6 text-muted-foreground" /> :
+                               <FileText className="h-6 w-6 text-muted-foreground" />}
+                            </div>
+                          )}
+                          <div className="flex-1 min-w-0 text-xs">
+                            <div className="font-mono truncate">{pendingFile.name}</div>
+                            <div className="text-muted-foreground">{Math.round(pendingFile.size / 1024)} KB · {pendingFile.type || "file"}</div>
+                          </div>
+                          <Button type="button" size="sm" variant="ghost" className="rounded-sm h-7 w-7 p-0" onClick={clearPendingFile} data-testid="wa-media-clear">
+                            <X className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      ) : (
+                        <Button type="button" size="sm" variant="outline" className="rounded-sm h-8 text-xs gap-1"
+                          onClick={() => fileInputRef.current?.click()} data-testid="wa-attach-media-button">
+                          <Paperclip className="h-3.5 w-3.5" /> Attach image / video / document
+                        </Button>
+                      )}
+                    </>
+                  )}
+                </>
               )}
               <div className="flex justify-end">
-                <Button type="submit" disabled={sending || (channel === "whatsapp" && waMode === "template" ? !tplName.trim() : !body.trim())} className="rounded-sm gap-2" data-testid="send-message-button">
-                  <Send className="h-4 w-4" /> {sending ? "Sending…" : "Send"}
+                <Button type="submit" disabled={sending || (channel === "whatsapp" && waMode === "template" ? !tplName.trim() : (!body.trim() && !pendingFile))} className="rounded-sm gap-2" data-testid="send-message-button">
+                  <Send className="h-4 w-4" /> {sending ? "Sending…" : (pendingFile ? "Send media" : "Send")}
                 </Button>
               </div>
             </form>
@@ -264,7 +385,10 @@ export default function ContactProfile() {
                     <span className="text-xs text-muted-foreground ml-auto">{fmt(ev.ts)}</span>
                   </div>
                   {ev.kind === "message" ? (
-                    <div className={`text-sm p-3 rounded-sm bg-card border border-border max-w-2xl row-${ev.channel}`}>{ev.body}</div>
+                    <div className={`text-sm p-3 rounded-sm bg-card border border-border max-w-2xl row-${ev.channel} space-y-2`}>
+                      {ev.media ? <MediaPreview media={ev.media} /> : null}
+                      {ev.body ? <div className="whitespace-pre-wrap">{ev.body}</div> : null}
+                    </div>
                   ) : (
                     <div className="text-sm p-3 rounded-sm bg-card border border-border max-w-2xl row-voice space-y-1">
                       <div>Duration: <span className="font-mono">{ev.duration_sec || 0}s</span></div>
