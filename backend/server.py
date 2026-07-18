@@ -2088,8 +2088,8 @@ class WATemplateIn(BaseModel):
     header_format: Optional[str] = None  # NONE / TEXT / IMAGE / VIDEO / DOCUMENT
     header_text: Optional[str] = None
     header_example: Optional[str] = None
-    body_text: str
-    body_examples: Optional[List[str]] = None  # per-variable sample values
+    body_text: str = Field(min_length=1)
+    body_examples: Optional[List[str]] = None
     footer_text: Optional[str] = None
     buttons: Optional[List[WATemplateButton]] = None
 
@@ -2371,12 +2371,19 @@ async def verify_recharge(body: RechargeVerifyIn, user: dict = Depends(current_u
         })
     except Exception as e:
         raise HTTPException(400, f"Signature verification failed: {e}")
-    order = await db.wallet_recharge_orders.find_one(
-        {"razorpay_order_id": body.razorpay_order_id, "company_id": user["company_id"]},
-        {"_id": 0})
+    # Atomic CAS: only credit if the order is still in 'created' state (prevents race with webhook).
+    order = await db.wallet_recharge_orders.find_one_and_update(
+        {"razorpay_order_id": body.razorpay_order_id, "company_id": user["company_id"], "status": "created"},
+        {"$set": {"status": "paid", "paid_at": iso(now_utc()),
+                  "razorpay_payment_id": body.razorpay_payment_id}},
+        return_document=True,
+    )
     if not order:
-        raise HTTPException(404, "Recharge order not found for this tenant.")
-    if order.get("status") == "paid":
+        # Already paid (race) — return current balance idempotently
+        existing = await db.wallet_recharge_orders.find_one(
+            {"razorpay_order_id": body.razorpay_order_id, "company_id": user["company_id"]}, {"_id": 0})
+        if not existing:
+            raise HTTPException(404, "Recharge order not found for this tenant.")
         w = await db.wallets.find_one({"company_id": user["company_id"]}, {"_id": 0})
         return {"ok": True, "already_paid": True, "balance_paise": (w or {}).get("balance_paise", 0)}
     await _get_or_create_wallet(user["company_id"])
@@ -2393,10 +2400,6 @@ async def verify_recharge(body: RechargeVerifyIn, user: dict = Depends(current_u
                  "payment_id": body.razorpay_payment_id},
         "created_at": iso(now_utc()),
     })
-    await db.wallet_recharge_orders.update_one(
-        {"razorpay_order_id": body.razorpay_order_id},
-        {"$set": {"status": "paid", "paid_at": iso(now_utc()),
-                  "razorpay_payment_id": body.razorpay_payment_id}})
     await audit("wallet_recharged", "wallet", user["company_id"], user,
                 {"amount_paise": order["amount_paise"], "razorpay_order_id": body.razorpay_order_id})
     return {"ok": True, "balance_paise": res["balance_paise"]}
