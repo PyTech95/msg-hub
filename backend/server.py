@@ -2810,7 +2810,16 @@ async def whatsapp_send_media(
     if not creds:
         raise HTTPException(400, "WhatsApp is not configured for this tenant. Ask your admin to set up Meta credentials.")
 
-    # Persist to GridFS first so UI can render even if send fails
+    # Wallet check + debit BEFORE writing to GridFS to avoid orphans on 402
+    price_paise = _price_paise("whatsapp")
+    mid = new_id()
+    if user.get("company_id") and price_paise > 0:
+        ok = await _debit_wallet(user["company_id"], price_paise,
+                                 {"message_id": mid, "channel": "whatsapp", "to": phone, "media": kind})
+        if not ok:
+            raise HTTPException(402, "Insufficient wallet balance. Please recharge your wallet to send messages.")
+
+    # Persist to GridFS so UI can render even if Meta send fails
     gridfs_id = await media_fs.upload_from_stream(
         filename, io.BytesIO(content),
         metadata={"company_id": user.get("company_id"), "mime_type": mime,
@@ -2818,7 +2827,6 @@ async def whatsapp_send_media(
                   "created_at": iso(now_utc())},
     )
 
-    mid = new_id()
     await db.messages.insert_one({
         "id": mid, "channel": "whatsapp", "contact_id": cid, "direction": "outbound",
         "body": caption, "status": "queued", "provider_message_id": None, "campaign_id": None,
@@ -2828,16 +2836,6 @@ async def whatsapp_send_media(
                   "caption": caption, "download_status": "done"},
         "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
     })
-
-    # Wallet debit
-    price_paise = _price_paise("whatsapp")
-    if user.get("company_id") and price_paise > 0:
-        ok = await _debit_wallet(user["company_id"], price_paise,
-                                 {"message_id": mid, "channel": "whatsapp", "to": phone, "media": kind})
-        if not ok:
-            await db.messages.update_one({"id": mid}, {"$set": {"status": "failed"}})
-            await emit_event(mid, "failed", reason="Insufficient wallet balance", source="wallet")
-            raise HTTPException(402, "Insufficient wallet balance. Please recharge your wallet to send messages.")
 
     try:
         up = await meta_wa.upload_media(creds, content, filename, mime)

@@ -59,7 +59,7 @@ function MediaPreview({ media }) {
   return (
     <a href={blobUrl} download={media.filename || "document"} className="flex items-center gap-2 text-sm text-blue-600 hover:underline" data-testid="media-document">
       <FileText className="h-4 w-4" /> {media.filename || "Document"}
-      {media.size ? <span className="text-xs text-muted-foreground">({Math.round(media.size / 1024)} KB)</span> : null}
+      {media.size ? <span className="text-xs text-muted-foreground">({media.size < 1024 ? `${media.size} B` : `${Math.round(media.size / 1024)} KB`})</span> : null}
     </a>
   );
 }
@@ -328,7 +328,7 @@ export default function ContactProfile() {
                           )}
                           <div className="flex-1 min-w-0 text-xs">
                             <div className="font-mono truncate">{pendingFile.name}</div>
-                            <div className="text-muted-foreground">{Math.round(pendingFile.size / 1024)} KB · {pendingFile.type || "file"}</div>
+                            <div className="text-muted-foreground">{pendingFile.size < 1024 ? `${pendingFile.size} B` : `${Math.round(pendingFile.size / 1024)} KB`} · {pendingFile.type || "file"}</div>
                           </div>
                           <Button type="button" size="sm" variant="ghost" className="rounded-sm h-7 w-7 p-0" onClick={clearPendingFile} data-testid="wa-media-clear">
                             <X className="h-4 w-4" />
