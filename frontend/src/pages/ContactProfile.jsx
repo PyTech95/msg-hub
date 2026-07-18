@@ -92,6 +92,49 @@ export default function ContactProfile() {
   const [pendingFile, setPendingFile] = useState(null);
   const [pendingPreview, setPendingPreview] = useState(null); // object URL for image preview
 
+  // Template variable inputs — keyed by "header_N" / "body_N" / "btnK_N"
+  const [tplVars, setTplVars] = useState({});
+
+  // Currently selected template metadata
+  const selectedTpl = (tplList || []).find(t => t.name === tplName && t.language === tplLang) || null;
+  const tplVarMeta = selectedTpl?.variables || { header: 0, body: 0, button_urls: [] };
+  const tplTotalVars = (tplVarMeta.header || 0) + (tplVarMeta.body || 0) + (tplVarMeta.button_urls || []).reduce((a, b) => a + b, 0);
+
+  // Build Meta components[] payload from user-entered variable values
+  const buildTemplateComponents = () => {
+    const out = [];
+    if (tplVarMeta.header > 0) {
+      out.push({
+        type: "header",
+        parameters: Array.from({ length: tplVarMeta.header }, (_, i) => ({
+          type: "text", text: (tplVars[`header_${i + 1}`] || "").trim() || contact?.name || "there",
+        })),
+      });
+    }
+    if (tplVarMeta.body > 0) {
+      out.push({
+        type: "body",
+        parameters: Array.from({ length: tplVarMeta.body }, (_, i) => ({
+          type: "text", text: (tplVars[`body_${i + 1}`] || "").trim() || contact?.name || "there",
+        })),
+      });
+    }
+    (tplVarMeta.button_urls || []).forEach((count, kIdx) => {
+      if (count > 0) {
+        out.push({
+          type: "button", sub_type: "url", index: String(kIdx),
+          parameters: Array.from({ length: count }, (_, i) => ({
+            type: "text", text: (tplVars[`btn${kIdx}_${i + 1}`] || "").trim(),
+          })),
+        });
+      }
+    });
+    return out;
+  };
+
+  // Reset variable values when the selected template changes
+  useEffect(() => { setTplVars({}); }, [tplName, tplLang]);
+
   const load = async () => {
     const c = await api.get(`/contacts/${id}`);
     setContact(c.data);
@@ -156,6 +199,8 @@ export default function ContactProfile() {
         if (isTemplate) {
           payload.template_name = tplName.trim();
           payload.template_language = tplLang.trim() || "en_US";
+          const comps = buildTemplateComponents();
+          if (comps.length > 0) payload.template_components = comps;
         }
         await api.post("/messages/send", payload);
         toast.success(isTemplate
@@ -316,6 +361,48 @@ export default function ContactProfile() {
                             </div>
                           ) : null;
                         })()}
+                        {tplTotalVars > 0 && (
+                          <div className="space-y-2 p-3 rounded-sm border border-blue-200 bg-blue-50/50 dark:bg-blue-900/10" data-testid="wa-template-vars">
+                            <div className="text-[11px] font-semibold text-blue-900 dark:text-blue-200">
+                              This template needs {tplTotalVars} variable{tplTotalVars > 1 ? "s" : ""} — fill in below
+                            </div>
+                            {tplVarMeta.header > 0 && Array.from({ length: tplVarMeta.header }, (_, i) => (
+                              <div key={`h${i}`} className="space-y-0.5">
+                                <Label className="text-[10px] text-muted-foreground">Header {`{{${i + 1}}}`}</Label>
+                                <Input
+                                  value={tplVars[`header_${i + 1}`] || ""}
+                                  onChange={e => setTplVars(v => ({ ...v, [`header_${i + 1}`]: e.target.value }))}
+                                  placeholder={i === 0 ? (contact?.name || "e.g. Rajeev") : `value ${i + 1}`}
+                                  className="rounded-sm h-8 text-xs" data-testid={`wa-tpl-var-header-${i + 1}`}
+                                />
+                              </div>
+                            ))}
+                            {tplVarMeta.body > 0 && Array.from({ length: tplVarMeta.body }, (_, i) => (
+                              <div key={`b${i}`} className="space-y-0.5">
+                                <Label className="text-[10px] text-muted-foreground">Body {`{{${i + 1}}}`}</Label>
+                                <Input
+                                  value={tplVars[`body_${i + 1}`] || ""}
+                                  onChange={e => setTplVars(v => ({ ...v, [`body_${i + 1}`]: e.target.value }))}
+                                  placeholder={i === 0 ? (contact?.name || "e.g. Rajeev") : `value ${i + 1}`}
+                                  className="rounded-sm h-8 text-xs" data-testid={`wa-tpl-var-body-${i + 1}`}
+                                />
+                              </div>
+                            ))}
+                            {(tplVarMeta.button_urls || []).map((count, kIdx) => (
+                              count > 0 ? Array.from({ length: count }, (_, i) => (
+                                <div key={`btn${kIdx}_${i}`} className="space-y-0.5">
+                                  <Label className="text-[10px] text-muted-foreground">Button {kIdx + 1} URL {`{{${i + 1}}}`}</Label>
+                                  <Input
+                                    value={tplVars[`btn${kIdx}_${i + 1}`] || ""}
+                                    onChange={e => setTplVars(v => ({ ...v, [`btn${kIdx}_${i + 1}`]: e.target.value }))}
+                                    placeholder={`url path ${i + 1}`}
+                                    className="rounded-sm h-8 text-xs" data-testid={`wa-tpl-var-btn${kIdx}-${i + 1}`}
+                                  />
+                                </div>
+                              )) : null
+                            ))}
+                          </div>
+                        )}
                       </>
                     ) : (
                       <>

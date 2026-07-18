@@ -2204,11 +2204,38 @@ def _template_body_preview(components: List[Dict[str, Any]]) -> str:
     return ""
 
 
-def _template_variable_count(components: List[Dict[str, Any]]) -> int:
-    """Count {{1}} {{2}} etc. placeholders in the BODY text."""
+def _count_placeholders(text: str) -> int:
+    """Count unique {{N}} placeholders in a text string."""
     import re
-    body = _template_body_preview(components)
-    return len(set(re.findall(r"\{\{(\d+)\}\}", body)))
+    return len(set(re.findall(r"\{\{(\d+)\}\}", text or "")))
+
+
+def _template_variables_by_component(components: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Return placeholder counts per component type. Structure:
+    {'header': N, 'body': N, 'button_urls': [N per url button, ...]}"""
+    out: Dict[str, Any] = {"header": 0, "body": 0, "button_urls": []}
+    for c in components or []:
+        ctype = (c.get("type") or "").upper()
+        if ctype == "HEADER":
+            fmt = (c.get("format") or "").upper()
+            # Only TEXT headers use {{N}}; MEDIA headers use one example URL param
+            if fmt == "TEXT":
+                out["header"] = _count_placeholders(c.get("text") or "")
+            elif fmt in ("IMAGE", "VIDEO", "DOCUMENT"):
+                out["header_media_format"] = fmt
+        elif ctype == "BODY":
+            out["body"] = _count_placeholders(c.get("text") or "")
+        elif ctype == "BUTTONS":
+            for b in c.get("buttons") or []:
+                if (b.get("type") or "").upper() == "URL":
+                    out["button_urls"].append(_count_placeholders(b.get("url") or ""))
+    return out
+
+
+def _template_variable_count(components: List[Dict[str, Any]]) -> int:
+    """Total number of variables across HEADER + BODY + URL buttons."""
+    v = _template_variables_by_component(components)
+    return int(v.get("header", 0)) + int(v.get("body", 0)) + sum(v.get("button_urls") or [])
 
 
 @api.get("/whatsapp/templates")
@@ -2265,6 +2292,7 @@ async def list_wa_templates(status: Optional[str] = None, limit: int = 100,
             "rejected_reason": t.get("rejected_reason") if st == "REJECTED" else None,
             "body_preview": _template_body_preview(components),
             "variable_count": _template_variable_count(components),
+            "variables": _template_variables_by_component(components),
             "components": components,
         })
     templates.sort(key=lambda t: (0 if t["status"] == "APPROVED" else 1, t["name"] or ""))
