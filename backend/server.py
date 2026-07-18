@@ -2447,21 +2447,23 @@ async def list_all_wallets(_: dict = Depends(require_roles("super_admin"))):
 
 @api.post("/wallet/adjust")
 async def adjust_wallet(body: WalletAdjustIn, user: dict = Depends(require_roles("super_admin"))):
-    """Super Admin: manually credit/debit any tenant's wallet."""
+    """Super Admin: manually credit/debit any tenant's wallet.
+    Uses a single-shot conditional update to avoid race between two concurrent SA adjusts."""
     target_company_id = body.company_id
     if not target_company_id:
         raise HTTPException(400, "company_id is required")
     await _get_or_create_wallet(target_company_id)
+    # Guard: if debit, ensure balance stays >= 0
+    filter_q: Dict[str, Any] = {"company_id": target_company_id}
+    if body.amount_paise < 0:
+        filter_q["balance_paise"] = {"$gte": -body.amount_paise}
     res = await db.wallets.find_one_and_update(
-        {"company_id": target_company_id},
+        filter_q,
         {"$inc": {"balance_paise": body.amount_paise},
          "$set": {"updated_at": iso(now_utc())}},
         return_document=True,
     )
-    if res["balance_paise"] < 0:
-        # Roll back — we don't want negative balances
-        await db.wallets.update_one({"company_id": target_company_id},
-                                    {"$inc": {"balance_paise": -body.amount_paise}})
+    if not res:
         raise HTTPException(400, "This adjustment would make the balance negative")
     await db.wallet_transactions.insert_one({
         "id": new_id(), "company_id": target_company_id,

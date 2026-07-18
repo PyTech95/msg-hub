@@ -52,9 +52,11 @@ export function useRealtime(onEvent) {
       } catch (_) { /* ignore malformed */ }
     };
     ws.onerror = () => { /* onclose fires next */ };
-    ws.onclose = () => {
+    ws.onclose = (evt) => {
       setConnected(false);
       if (pingTimer) clearInterval(pingTimer);
+      // Don't reconnect on clean close (1000) or auth failure (4401)
+      if (evt?.code === 1000 || evt?.code === 4401) return;
       scheduleReconnect();
     };
   }, []);
