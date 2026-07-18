@@ -108,9 +108,10 @@ export default function ContactProfile() {
       .then(r => {
         const list = r.data.ok ? (r.data.templates || []) : [];
         setTplList(list);
-        // Pre-select first template if current selection isn't available
-        if (list.length > 0 && !list.find(t => t.name === tplName && t.language === tplLang)) {
-          setTplName(list[0].name); setTplLang(list[0].language);
+        // Prefer first REAL business template (not Meta's sandbox-only 'hello_world')
+        const preferred = list.find(t => t.name !== "hello_world") || list[0];
+        if (preferred && !list.find(t => t.name === tplName && t.language === tplLang)) {
+          setTplName(preferred.name); setTplLang(preferred.language);
         }
       })
       .catch(() => setTplList([]))
@@ -285,10 +286,28 @@ export default function ContactProfile() {
                         >
                           {tplList.map(t => (
                             <option key={`${t.name}_${t.language}`} value={`${t.name}|${t.language}`}>
-                              {t.name} · {t.language} · [{t.category}]{t.variable_count > 0 ? ` · ${t.variable_count} var${t.variable_count > 1 ? "s" : ""}` : ""}
+                              {t.name === "hello_world" ? "⚠ " : ""}{t.name} · {t.language} · [{t.category}]{t.variable_count > 0 ? ` · ${t.variable_count} var${t.variable_count > 1 ? "s" : ""}` : ""}{t.name === "hello_world" ? " · SANDBOX-ONLY" : ""}
                             </option>
                           ))}
                         </select>
+                        {tplName === "hello_world" && (
+                          <div className="flex items-start gap-2 p-3 rounded-sm border border-red-300 bg-red-50 dark:bg-red-900/20 text-xs" data-testid="hello-world-warning">
+                            <AlertTriangle className="h-4 w-4 text-red-600 shrink-0 mt-0.5" />
+                            <div className="space-y-1">
+                              <div className="font-semibold text-red-900 dark:text-red-200">
+                                Meta&apos;s <code className="font-mono">hello_world</code> template will fail on your business number.
+                              </div>
+                              <div className="text-red-800 dark:text-red-300">
+                                Meta only allows <code className="font-mono">hello_world</code> from their public sandbox test number. Real business numbers must use a template you&apos;ve created and gotten approved yourself.
+                              </div>
+                              <Link to="/whatsapp-settings" className="inline-block mt-1">
+                                <Button type="button" size="sm" variant="outline" className="rounded-sm h-7 border-red-400 text-red-700 hover:bg-red-100" data-testid="create-template-cta">
+                                  Create your first template →
+                                </Button>
+                              </Link>
+                            </div>
+                          </div>
+                        )}
                         {(() => {
                           const preview = (tplList.find(t => t.name === tplName && t.language === tplLang) || {}).body_preview;
                           return preview ? (

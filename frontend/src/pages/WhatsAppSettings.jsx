@@ -482,7 +482,7 @@ export default function WhatsAppSettings() {
           <CardContent className="p-4 space-y-3">
             <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Step 3 · Send a test message</div>
             <div className="text-[11px] text-muted-foreground -mt-1">
-              Free-form text is only delivered if the recipient messaged your business in the last 24h. Use an approved template like <code className="bg-muted px-1 rounded">hello_world</code> to always deliver.
+              Free-form text is only delivered if the recipient messaged your business in the last 24h. Use an approved template that you&apos;ve created and gotten approved by Meta. <strong className="text-red-600">Note: <code className="bg-muted px-1 rounded">hello_world</code> only works from Meta&apos;s sandbox test number — not from real business numbers.</strong>
             </div>
             <div className="flex items-center gap-2">
               <Button type="button" size="sm" variant={quickMode === "freeform" ? "default" : "outline"} className="rounded-sm h-7 text-xs" onClick={() => setQuickMode("freeform")} data-testid="quick-mode-freeform">
@@ -511,7 +511,7 @@ export default function WhatsAppSettings() {
                     )}
                     {templates && templates.filter(t => t.status === "APPROVED").map(t => (
                       <option key={`${t.name}_${t.language}`} value={`${t.name}|${t.language}`}>
-                        {t.name} · {t.language} · [{t.category}]{t.variable_count > 0 ? ` · ${t.variable_count} var${t.variable_count > 1 ? "s" : ""}` : ""}
+                        {t.name === "hello_world" ? "⚠ " : ""}{t.name} · {t.language} · [{t.category}]{t.variable_count > 0 ? ` · ${t.variable_count} var${t.variable_count > 1 ? "s" : ""}` : ""}{t.name === "hello_world" ? " · SANDBOX-ONLY" : ""}
                       </option>
                     ))}
                   </select>
