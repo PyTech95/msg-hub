@@ -76,6 +76,77 @@ export default function WhatsAppSettings() {
   const [sending, setSending] = useState(false);
   const [sendResult, setSendResult] = useState(null);
 
+  // Meta Embedded Signup config (loaded once on mount)
+  const [signupCfg, setSignupCfg] = useState(null);
+  const [signupBusy, setSignupBusy] = useState(false);
+  useEffect(() => {
+    api.get("/whatsapp/embedded-signup/config")
+      .then(r => setSignupCfg(r.data))
+      .catch(() => setSignupCfg({ enabled: false, reason: "Failed to load signup config" }));
+  }, []);
+
+  // Load FB JS SDK once, only when signup is enabled and user is a company admin
+  useEffect(() => {
+    if (!signupCfg?.enabled || !user?.company_id) return;
+    if (window.FB || document.getElementById("fb-jssdk-loader")) return;
+    const s = document.createElement("script");
+    s.id = "fb-jssdk-loader";
+    s.async = true; s.defer = true; s.crossOrigin = "anonymous";
+    s.src = `https://connect.facebook.net/en_US/sdk.js`;
+    s.onload = () => {
+      window.fbAsyncInit = () => {
+        window.FB.init({ appId: signupCfg.app_id, cookie: true, xfbml: true, version: signupCfg.graph_version });
+      };
+      window.fbAsyncInit();
+    };
+    document.body.appendChild(s);
+  }, [signupCfg, user?.company_id]);
+
+  const startEmbeddedSignup = () => {
+    if (!window.FB) { toast.error("Facebook SDK not loaded yet — retry in a moment."); return; }
+    setSignupBusy(true);
+    window.FB.login(
+      (response) => {
+        setSignupBusy(false);
+        if (response.status !== "connected" || !response.authResponse?.code) {
+          toast.error("Meta signup cancelled or failed");
+          return;
+        }
+        const code = response.authResponse.code;
+        const evtWaba = window.__lastWabaEvent || {};
+        api.post("/whatsapp/embedded-signup/exchange", {
+          code, waba_id: evtWaba.waba_id || "", phone_number_id: evtWaba.phone_number_id || "",
+          business_id: evtWaba.business_id, display_phone_number: evtWaba.display_phone_number,
+          verified_name: evtWaba.verified_name,
+        }).then(() => {
+          toast.success("WhatsApp connected via Meta! Refreshing…");
+          setTimeout(load, 500);
+        }).catch(err => toast.error(err.response?.data?.detail || "Exchange failed"));
+      },
+      {
+        config_id: signupCfg.config_id,
+        response_type: "code",
+        override_default_response_type: true,
+        extras: { setup: {}, featureType: "whatsapp_business_app_onboarding", sessionInfoVersion: 3 },
+      },
+    );
+  };
+
+  // Capture WABA/phone-number-id from Meta's postMessage during signup
+  useEffect(() => {
+    const onMsg = (e) => {
+      if (e.origin !== "https://www.facebook.com" && e.origin !== "https://web.facebook.com") return;
+      try {
+        const data = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
+        if (data?.type === "WA_EMBEDDED_SIGNUP") {
+          window.__lastWabaEvent = { ...(window.__lastWabaEvent || {}), ...(data.data || {}) };
+        }
+      } catch (_) { /* not our message */ }
+    };
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, []);
+
   const load = async () => {
     try {
       const { data } = await api.get("/whatsapp/config");
@@ -345,6 +416,31 @@ export default function WhatsAppSettings() {
           ? <Badge variant="outline" className="rounded-sm text-[10px] border-emerald-300 text-emerald-700 gap-1"><CheckCircle2 className="h-3 w-3" />LIVE</Badge>
           : <Badge variant="outline" className="rounded-sm text-[10px] border-amber-300 text-amber-700">{isConfigured ? "MOCK" : "Not configured"}</Badge>}
       </div>
+
+      {/* Meta Embedded Signup — one-click WhatsApp onboarding (tenant admins only) */}
+      {user?.company_id && (
+        <Card className="rounded-sm shadow-none border-blue-200 dark:border-blue-900/50 bg-blue-50/30 dark:bg-blue-900/10" data-testid="wa-embedded-signup-card">
+          <CardContent className="p-4 space-y-3">
+            <div className="flex items-center gap-2">
+              <PlugZap className="h-4 w-4 text-blue-600" />
+              <div className="text-xs font-semibold uppercase tracking-wider text-blue-900 dark:text-blue-200">Recommended · Meta Embedded Signup</div>
+            </div>
+            <div className="text-xs text-muted-foreground">
+              Connect your WhatsApp Business Account with one click via Meta&apos;s official signup dialog. No manual token copy-paste — we exchange the code server-side and store your credentials securely.
+            </div>
+            {signupCfg?.enabled ? (
+              <Button type="button" onClick={startEmbeddedSignup} disabled={signupBusy}
+                className="rounded-sm gap-2 bg-blue-600 hover:bg-blue-700 text-white" data-testid="wa-embedded-signup-button">
+                <MessageCircle className="h-3.5 w-3.5" /> {signupBusy ? "Opening Meta dialog…" : "Connect WhatsApp with Facebook"}
+              </Button>
+            ) : (
+              <div className="p-2 rounded-sm border border-dashed border-blue-300 bg-white/50 dark:bg-black/20 text-[11px] text-muted-foreground">
+                Embedded Signup is not yet configured on this platform. Your Super Admin can enable it by setting <code className="bg-muted px-1 rounded">FB_APP_ID</code>, <code className="bg-muted px-1 rounded">FB_APP_SECRET</code>, and <code className="bg-muted px-1 rounded">FB_CONFIG_ID</code> in the backend env, then restart. Until then, use manual credential setup below.
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {/* Step 1: webhook info shown only after config exists (verify_token is generated) */}
       {isConfigured && (

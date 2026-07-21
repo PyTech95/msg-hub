@@ -21,6 +21,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any, Literal
 
 import bcrypt
+import httpx
 import jwt
 import pyotp
 import qrcode
@@ -38,7 +39,8 @@ MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = os.environ["DB_NAME"]
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALG = "HS256"
-ACCESS_TTL_MIN = 60 * 24  # 1 day for demo convenience
+ACCESS_TTL_MIN = 60         # 1 hour access token
+REFRESH_TTL_DAYS = 7        # 7 day refresh token
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -80,7 +82,22 @@ def make_token(user: dict) -> str:
         "email": user["email"],
         "role": user["role"],
         "tv": user.get("token_version", 1),
+        "type": "access",
         "exp": now_utc() + timedelta(minutes=ACCESS_TTL_MIN),
+        "iat": now_utc(),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+
+def make_refresh_token(user: dict) -> str:
+    """Long-lived refresh token — same signing key, distinct `type` claim so it can never be
+    used as an access token. Revocation happens automatically via `token_version` bump
+    (change-password / disable-user)."""
+    payload = {
+        "sub": user["id"],
+        "tv": user.get("token_version", 1),
+        "type": "refresh",
+        "exp": now_utc() + timedelta(days=REFRESH_TTL_DAYS),
         "iat": now_utc(),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
@@ -126,6 +143,10 @@ async def current_user(request: Request) -> dict:
         raise HTTPException(401, "Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(401, "Invalid token")
+    # Refresh tokens must NEVER be accepted as access tokens (older tokens without
+    # a `type` claim are treated as access for backwards compatibility).
+    if payload.get("type") == "refresh":
+        raise HTTPException(401, "Refresh token cannot be used for API calls")
     user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
     if not user:
         raise HTTPException(401, "User not found")
@@ -799,10 +820,13 @@ async def login(body: LoginIn, response: Response, request: Request):
 
     # Success: clear attempts
     await db.login_attempts.delete_one({"identifier": ident})
-    token = make_token({"id": user["id"], "email": user["email"], "role": user["role"], "token_version": user.get("token_version", 1)})
+    user_ctx = {"id": user["id"], "email": user["email"], "role": user["role"], "token_version": user.get("token_version", 1)}
+    token = make_token(user_ctx)
+    refresh = make_refresh_token(user_ctx)
     response.set_cookie("access_token", token, httponly=True, samesite="lax", max_age=ACCESS_TTL_MIN*60, path="/")
+    response.set_cookie("refresh_token", refresh, httponly=True, samesite="lax", max_age=REFRESH_TTL_DAYS*24*3600, path="/")
     await audit("login", "user", user["id"], user, {"ip": ip})
-    return {"token": token, "user": await with_company(clean(user))}
+    return {"token": token, "refresh_token": refresh, "user": await with_company(clean(user))}
 
 @api.post("/auth/register")
 async def register(body: RegisterIn, user: dict = Depends(require_roles("super_admin","admin"))):
@@ -824,7 +848,45 @@ async def register(body: RegisterIn, user: dict = Depends(require_roles("super_a
 @api.post("/auth/logout")
 async def logout(response: Response, _: dict = Depends(current_user)):
     response.delete_cookie("access_token", path="/")
+    response.delete_cookie("refresh_token", path="/")
     return {"ok": True}
+
+
+class RefreshIn(BaseModel):
+    refresh_token: Optional[str] = None  # optional; also read from cookie
+
+
+@api.post("/auth/refresh")
+async def refresh_access_token(body: RefreshIn, request: Request, response: Response):
+    """Exchange a valid refresh token for a fresh access + refresh token pair.
+    Revocation is automatic via `token_version` bump (password change / disable).
+    Accepts token from JSON body OR from the httpOnly `refresh_token` cookie."""
+    token = (body.refresh_token or "").strip() or request.cookies.get("refresh_token") or ""
+    if not token:
+        raise HTTPException(401, "Refresh token missing")
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Refresh token expired — please log in again")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid refresh token")
+    if payload.get("type") != "refresh":
+        raise HTTPException(401, "Not a refresh token")
+    user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
+    if not user:
+        raise HTTPException(401, "User not found")
+    if payload.get("tv", 1) != user.get("token_version", 1):
+        raise HTTPException(401, "Refresh token revoked. Please log in again.")
+    if user.get("company_id"):
+        comp = await db.companies.find_one({"id": user["company_id"]}, {"_id": 0})
+        if not comp or comp.get("is_active") is False:
+            raise HTTPException(403, "Company account is deactivated")
+    user_ctx = {"id": user["id"], "email": user["email"], "role": user["role"], "token_version": user.get("token_version", 1)}
+    new_access = make_token(user_ctx)
+    new_refresh = make_refresh_token(user_ctx)
+    response.set_cookie("access_token", new_access, httponly=True, samesite="lax", max_age=ACCESS_TTL_MIN*60, path="/")
+    response.set_cookie("refresh_token", new_refresh, httponly=True, samesite="lax", max_age=REFRESH_TTL_DAYS*24*3600, path="/")
+    return {"token": new_access, "refresh_token": new_refresh}
 
 @api.get("/auth/me")
 async def me(user: dict = Depends(current_user)):
@@ -2194,6 +2256,102 @@ async def test_wa_config(user: dict = Depends(require_roles("super_admin","admin
                 "message": "No live credentials configured for this tenant. Add access_token + phone_number_id and set mock=false."}
     result = await meta_wa.health_check(creds)
     return {"ok": result["ok"], "mode": "live", "message": result["message"], "phone_number_id": creds.get("phone_number_id")}
+
+
+# ─────────── Meta Embedded Signup (one-click WhatsApp onboarding) ───────────
+# Docs: https://developers.facebook.com/docs/whatsapp/embedded-signup
+# Requires a Meta Tech Partner-verified FB App with WhatsApp Business Management
+# and a Configuration ID from Meta Business Manager. Env vars:
+#   FB_APP_ID           — public FB App ID (exposed to browser via /config)
+#   FB_APP_SECRET       — server-only; used to exchange code → long-lived access token
+#   FB_CONFIG_ID        — Meta-approved WhatsApp signup configuration id
+#   FB_GRAPH_VERSION    — default v22.0
+
+class EmbeddedSignupIn(BaseModel):
+    code: str                                     # authorization code from FB.login callback
+    waba_id: str                                  # WABA id returned by the Meta signup dialog
+    phone_number_id: str                          # first phone number id chosen by user
+    business_id: Optional[str] = None
+    display_phone_number: Optional[str] = None
+    verified_name: Optional[str] = None
+
+
+@api.get("/whatsapp/embedded-signup/config")
+async def embedded_signup_config():
+    """Public config for the FB JS SDK. Returns 200 with `enabled:false` when the
+    platform hasn't configured a Tech Partner-verified FB App yet."""
+    app_id = (os.environ.get("FB_APP_ID") or "").strip()
+    cfg_id = (os.environ.get("FB_CONFIG_ID") or "").strip()
+    graph_v = (os.environ.get("FB_GRAPH_VERSION") or "v22.0").strip() or "v22.0"
+    if not app_id or not cfg_id:
+        return {"enabled": False,
+                "reason": "Meta Embedded Signup is not configured on this platform. "
+                          "Set FB_APP_ID, FB_APP_SECRET, and FB_CONFIG_ID in the platform env."}
+    return {"enabled": True, "app_id": app_id, "config_id": cfg_id, "graph_version": graph_v}
+
+
+@api.post("/whatsapp/embedded-signup/exchange")
+async def embedded_signup_exchange(body: EmbeddedSignupIn,
+                                   user: dict = Depends(require_roles("super_admin","admin"))):
+    """Exchange the OAuth authorization code for a long-lived business access token,
+    then persist the WABA credentials to the tenant's `company_whatsapp_configs`.
+    User just clicked through the Meta signup dialog — we handle the token exchange server-side."""
+    if not user.get("company_id"):
+        raise HTTPException(400, "Super Admin cannot use embedded signup — connect through a company account.")
+    app_id = (os.environ.get("FB_APP_ID") or "").strip()
+    app_secret = (os.environ.get("FB_APP_SECRET") or "").strip()
+    graph_v = (os.environ.get("FB_GRAPH_VERSION") or "v22.0").strip() or "v22.0"
+    if not app_id or not app_secret:
+        raise HTTPException(503, "Meta Embedded Signup is not configured on this platform.")
+    # 1) Exchange code for user access token
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(f"https://graph.facebook.com/{graph_v}/oauth/access_token",
+                             params={"client_id": app_id, "client_secret": app_secret,
+                                     "code": body.code,
+                                     "redirect_uri": (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/") + "/whatsapp-settings"})
+    if r.status_code >= 400:
+        detail = (r.json() or {}).get("error", {}).get("message") or r.text
+        raise HTTPException(400, f"Token exchange failed: {detail}")
+    tok_data = r.json() or {}
+    access_token = tok_data.get("access_token") or ""
+    if not access_token:
+        raise HTTPException(400, "No access_token returned from Meta")
+    # 2) Persist per-tenant credentials
+    verify_token = f"tzs_{secrets.token_urlsafe(24)}"
+    cfg_doc = {
+        "company_id": user["company_id"],
+        "access_token": access_token,
+        "phone_number_id": body.phone_number_id,
+        "waba_id": body.waba_id,
+        "business_id": body.business_id,
+        "display_phone_number": body.display_phone_number,
+        "verified_name": body.verified_name,
+        "graph_version": graph_v,
+        "is_active": True, "mock": False,
+        "verify_token": verify_token,
+        "onboarded_via": "embedded_signup",
+        "updated_at": iso(now_utc()), "updated_by": user["email"],
+    }
+    existing = await db.company_whatsapp_configs.find_one({"company_id": user["company_id"]}, {"_id": 0, "verify_token": 1})
+    if existing and existing.get("verify_token"):
+        cfg_doc["verify_token"] = existing["verify_token"]
+    else:
+        cfg_doc["created_at"] = iso(now_utc()); cfg_doc["created_by"] = user["email"]
+    await db.company_whatsapp_configs.update_one(
+        {"company_id": user["company_id"]},
+        {"$set": cfg_doc, "$setOnInsert": {"id": new_id()}}, upsert=True,
+    )
+    # 3) Subscribe the app to WABA webhooks (best-effort; ignore failure so onboarding still completes)
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            await client.post(f"https://graph.facebook.com/{graph_v}/{body.waba_id}/subscribed_apps",
+                              headers={"Authorization": f"Bearer {access_token}"})
+    except Exception as e:
+        log.warning("subscribed_apps registration failed (best-effort): %s", e)
+    await audit("wa_embedded_signup", "wa_config", user["company_id"], user,
+                {"waba_id": body.waba_id, "phone_number_id": body.phone_number_id})
+    return {"ok": True, "waba_id": body.waba_id, "phone_number_id": body.phone_number_id,
+            "verify_token": cfg_doc["verify_token"]}
 
 
 def _template_body_preview(components: List[Dict[str, Any]]) -> str:
