@@ -33,6 +33,7 @@ import WhatsAppSettings from "@/pages/WhatsAppSettings";
 import WhatsAppNumbers from "@/pages/WhatsAppNumbers";
 import Inbox from "@/pages/Inbox";
 import Wallet from "@/pages/Wallet";
+import Billing from "@/pages/Billing";
 import ForgotPassword from "@/pages/ForgotPassword";
 import ResetPassword from "@/pages/ResetPassword";
 
@@ -73,6 +74,7 @@ export default function App() {
               <Route path="/whatsapp-settings" element={<RoleRoute allow={["super_admin","admin"]}><WhatsAppSettings /></RoleRoute>} />
               <Route path="/whatsapp-numbers" element={<RoleRoute allow={["super_admin","admin","manager","agent"]}><WhatsAppNumbers /></RoleRoute>} />
               <Route path="/wallet" element={<Wallet />} />
+              <Route path="/billing" element={<Billing />} />
             </Route>
             <Route path="*" element={<Navigate to="/dashboard" replace />} />
           </Routes>

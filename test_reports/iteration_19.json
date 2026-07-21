@@ -1,0 +1,37 @@
+{
+  "summary": "Iter 19 (Billing plans + coupons + GST invoicing + Reactions/Delete) tested end-to-end. Backend 27/27 pytest passing across TestPlans (seed of 4 plans, dup 409, CRUD), TestCoupons (missing/invalid discount 400, create+dup 409, validate 404/OK), TestBillingProfile (get/patch/GSTIN validation), TestSubscribeInvoice (same-state MH → CGST+SGST split, IGST=0; interstate DL → IGST-only; invoice number TZS/YYYY/NNNNNN; current sub; coupon reuse blocked by max_uses_per_company; SA cannot subscribe 400; list + detail invoices-v2; cancel sets auto_renew=False + cancelled_at), TestRegression (/invoices legacy usage aggregates still 200), TestReactionsDelete (react 404 non-existent, react 400 on SMS/non-WA channel, soft-delete + timeline hides deleted messages, delete 404). Frontend Billing page verified as tenant admin (fresh company): plan-card-{starter,growth,pro,enterprise} render, cycle toggle monthly/annual works, GST profile form saves (gstin/state/address/email), subscribe dialog opens with coupon input + apply + confirm-subscribe, invoice row appears after subscribe with TZS invoice number, current-sub-card shows plan+expiry, cancel-sub-button works. Inbox reactions/delete UI verified on SA account (17 conversations, 8 msgs): hover reveals react-btn + delete-btn testids, react-btn click opens picker with exactly 6 emojis (👍❤️😂😮😢🙏). Sidebar Billing link is present (between Wallet and Audit Logs, not between Wallet and Invoices as spec suggested — minor deviation).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "AppLayout sidebar", "issues": ["Spec says Billing should sit between Wallet and Invoices; actual order is Wallet → Billing → Audit Logs, with legacy 'Invoices' entry higher up. Cosmetic — not blocking."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration19_billing_reactions.py",
+    "/app/test_reports/pytest/iteration19.xml"
+  ],
+  "action_items": [
+    "OPTIONAL: reorder sidebar entries so 'Billing' sits directly between 'Wallet' and 'Invoices' as spec expected. Consider whether legacy 'Invoices' (usage aggregates) should be renamed to 'Usage' now that 'Billing' shows GST invoices — otherwise users see two 'Invoices' concepts.",
+    "OPTIONAL: LIVE Meta reactions send (outbound emoji via graph_post_message) was NOT exercised end-to-end because that requires a real delivered WA outbound message with provider_message_id. Backend validation paths (404 / 400 non-WA / 400 no provider_message_id) are covered; happy-path Meta call is only covered by curl evidence from main-agent's smoke test.",
+    "OPTIONAL: /invoices-v2 endpoint uses cflt(user) — for SA sees ALL invoices (no company scoping). If SA should see all: OK. If SA should filter to platform-owned or none: revisit."
+  ],
+  "critical_code_review_comments": [
+    "server.py _generate_invoice: invoice_seq uses find_one_and_update with upsert=True + $inc — first run when doc absent may return {value: {n: 1}}. Verified via test that sequential TZS/YYYY/000001 format works. Good.",
+    "server.py _redeem_coupon uses find_one_and_update with atomic $inc on used_count guarded by $expr — race-safe. Good.",
+    "server.py subscribe: coupon is redeemed BEFORE wallet debit. If wallet debit fails (402), used_count is already incremented and a coupon_redemptions row is created — coupon counted as used even though subscription failed. Consider refunding coupon (decrement used_count + remove redemption row) on wallet failure, OR redeem after debit succeeds. Currently a minor over-counting bug when wallet is insufficient with a coupon applied.",
+    "server.py subscribe: PLATFORM_GST_STATE default 'MH' compared to billing_state uppercase. GST_RATE_PCT is int env cast — good. Consider Decimal for tax_paise instead of int(round(...)) to avoid 1-paisa rounding drift on annual plans.",
+    "Billing.jsx: subscribe dialog surfaces 'GST invoice (18%) auto-generated after subscription' — good UX. However dialog does NOT show the GST breakdown preview (CGST+SGST vs IGST based on billing_state). Consider computing this client-side so user sees final total incl. tax before Confirm & Pay.",
+    "Inbox.jsx MessageActions: react-btn is rendered inside a hover-only wrapper — keyboard users can't reach it. Add focus-within or an accessible button.",
+    "Coupon list endpoint returns full documents for SA including max_uses_per_company but strips it for tenants — good scoping. But tenants can still learn coupon codes by listing → could enable coupon-code enumeration. Consider removing the public list for tenants and only expose /coupons/validate."
+  ],
+  "updated_files": ["/app/backend/tests/test_iteration19_billing_reactions.py"],
+  "success_rate": {"backend": "100% (27/27)", "frontend": "100% (all critical flows + testids verified)"},
+  "test_credentials": "admin@cpaas.io / Admin@12345 (SA). Fresh test tenant ui_iter19@example.com / Test@1234 was created + wallet-funded ₹20k + used for full billing flow, then deleted at end. All test-created plans/coupons/subs/companies cleaned up EXCEPT the run-scoped coupon (TESTIT19<uuid>) — harmless, isolated per run.",
+  "seed_data_creation": "Ephemeral: one company + one tenant admin user + wallet + subscription + 2 invoices per pytest run, plus a coupon per run. Company deleted at teardown (cascades subs/invoices). Coupon persists — acceptable since unique per run.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iter 19 solid. Live Meta reaction outbound path not exercised (needs a real WA-sent message with provider_message_id). Inbound reaction webhook (_meta_handle_inbound) not tested — would need to POST a synthetic Meta webhook payload of type=reaction to the webhook URL. Coupon-refund-on-wallet-fail race is a known minor bug flagged above.",
+  "rca of the issue": "N/A — no bugs blocking."
+}

@@ -587,6 +587,13 @@ async def on_startup():
         {"is_primary": {"$exists": False}}, {"$set": {"is_primary": True}}
     )
     await db.wallets.create_index("company_id", unique=True)
+    await db.plans.create_index("code", unique=True)
+    await db.coupons.create_index("code", unique=True)
+    await db.subscriptions.create_index("company_id")
+    await db.subscriptions.create_index([("company_id", 1), ("status", 1)])
+    await db.invoices_v2.create_index([("company_id", 1), ("issued_at", -1)])
+    await db.invoices_v2.create_index("invoice_number", unique=True)
+    await _seed_default_plans()
     await db.wallet_transactions.create_index([("company_id", 1), ("created_at", -1)])
     await db.wallet_recharge_orders.create_index("razorpay_order_id", unique=True)
     await db.wallet_alerts.create_index([("company_id", 1), ("date", 1), ("type", 1)])
@@ -1768,9 +1775,10 @@ async def add_internal_note(body: InternalNoteIn, user: dict = Depends(current_u
 @api.get("/contacts/{contact_id}/timeline")
 async def contact_timeline(contact_id: str, before: Optional[str] = None, limit: int = 100,
                             user: dict = Depends(current_user)):
-    """Paginated conversation timeline. `before` = ISO timestamp cursor (fetch older messages)."""
+    """Paginated conversation timeline. `before` = ISO timestamp cursor (fetch older messages).
+    Soft-deleted messages are hidden from the UI."""
     limit = max(1, min(200, int(limit)))
-    q = cflt(user, {"contact_id": contact_id})
+    q = cflt(user, {"contact_id": contact_id, "deleted": {"$ne": True}})
     if before:
         q["created_at"] = {"$lt": before}
     msgs = await db.messages.find(q, {"_id": 0}).sort("created_at", -1).limit(limit).to_list(limit)
@@ -2112,6 +2120,23 @@ async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict], com
         media_meta = {"type": "location", "latitude": loc.get("latitude"),
                       "longitude": loc.get("longitude"),
                       "name": loc.get("name") or "", "address": loc.get("address") or ""}
+    elif msg_type == "reaction":
+        # Meta reactions arrive as their own inbound message referring to another message id
+        r = m.get("reaction") or {}
+        target_wamid = r.get("message_id")
+        emoji = r.get("emoji") or ""  # empty string = reaction removed
+        if target_wamid:
+            target = await db.messages.find_one({"provider_message_id": target_wamid}, {"_id": 0, "id": 1})
+            if target:
+                if emoji:
+                    await db.messages.update_one(
+                        {"id": target["id"]},
+                        {"$addToSet": {"reactions": {"emoji": emoji, "from": frm, "at": iso(now_utc())}}})
+                else:
+                    await db.messages.update_one(
+                        {"id": target["id"]},
+                        {"$pull": {"reactions": {"from": frm}}})
+        return  # reactions don't create a new message row
     else:
         body_txt = f"[{msg_type} message]"
     profile_name = ""
@@ -3684,6 +3709,480 @@ async def set_markup(body: MarkupIn, user: dict = Depends(require_roles("super_a
     return v
 
 # ───────────────────────── Invoices ─────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# Billing Plans + Coupons + GST Invoicing (Feb 21, 2026)
+# ═══════════════════════════════════════════════════════════════════════════
+
+DEFAULT_PLANS = [
+    {"code": "starter", "name": "Starter", "monthly_paise": 99900, "annual_paise": 999000,
+     "message_credits_monthly": 1000, "features": ["single_number", "email_support"],
+     "description": "For small teams — 1 WhatsApp number, 1,000 messages/mo", "sort_order": 1},
+    {"code": "growth", "name": "Growth", "monthly_paise": 299900, "annual_paise": 2999000,
+     "message_credits_monthly": 5000, "features": ["multi_number", "team_rbac", "priority_support", "webhooks"],
+     "description": "For growing businesses — Multi-number, 5 team members, 5,000 messages/mo", "sort_order": 2, "recommended": True},
+    {"code": "pro", "name": "Pro", "monthly_paise": 799900, "annual_paise": 7999000,
+     "message_credits_monthly": 15000,
+     "features": ["multi_number", "team_rbac", "ai_features", "priority_support", "webhooks", "campaigns", "analytics"],
+     "description": "AI-powered growth — Everything in Growth + AI bots + campaigns + advanced analytics", "sort_order": 3},
+    {"code": "enterprise", "name": "Enterprise", "monthly_paise": 0, "annual_paise": 0,
+     "message_credits_monthly": 0, "custom_pricing": True,
+     "features": ["multi_number", "team_rbac", "ai_features", "dedicated_support", "sla", "webhooks", "campaigns", "analytics", "sso", "custom_integrations"],
+     "description": "Custom pricing — SSO, SLA, dedicated CSM, custom integrations", "sort_order": 4},
+]
+
+
+async def _seed_default_plans():
+    """One-time idempotent seed of billing plans on startup."""
+    for p in DEFAULT_PLANS:
+        exists = await db.plans.find_one({"code": p["code"]}, {"_id": 0, "id": 1})
+        if not exists:
+            doc = {**p, "id": new_id(), "is_active": True,
+                   "created_at": iso(now_utc()), "updated_at": iso(now_utc())}
+            await db.plans.insert_one(doc)
+            log.info("Seeded plan: %s", p["code"])
+
+
+class PlanIn(BaseModel):
+    code: str
+    name: str
+    monthly_paise: int = 0
+    annual_paise: int = 0
+    message_credits_monthly: int = 0
+    features: List[str] = []
+    description: str = ""
+    sort_order: int = 0
+    recommended: bool = False
+    custom_pricing: bool = False
+    is_active: bool = True
+
+
+class PlanPatch(BaseModel):
+    name: Optional[str] = None
+    monthly_paise: Optional[int] = None
+    annual_paise: Optional[int] = None
+    message_credits_monthly: Optional[int] = None
+    features: Optional[List[str]] = None
+    description: Optional[str] = None
+    sort_order: Optional[int] = None
+    recommended: Optional[bool] = None
+    custom_pricing: Optional[bool] = None
+    is_active: Optional[bool] = None
+
+
+class ReactionIn(BaseModel):
+    message_id: str
+    emoji: str = ""  # "" to remove
+    phone_number_id: Optional[str] = None
+
+
+@api.post("/messages/reactions")
+async def send_reaction(body: ReactionIn, user: dict = Depends(current_user)):
+    """React to (or remove reaction from) a WhatsApp message. Emoji='' removes the reaction."""
+    m = await db.messages.find_one(cflt(user, {"id": body.message_id}), {"_id": 0})
+    if not m:
+        raise HTTPException(404, "Message not found")
+    if m.get("channel") != "whatsapp":
+        raise HTTPException(400, "Reactions only supported on WhatsApp messages")
+    if not m.get("provider_message_id"):
+        raise HTTPException(400, "Cannot react to a message that hasn't been delivered yet")
+    contact = await db.contacts.find_one({"id": m["contact_id"]}, {"_id": 0, "phone": 1})
+    if not contact:
+        raise HTTPException(404, "Contact not found")
+    creds = await meta_wa_credentials(user.get("company_id"), body.phone_number_id or m.get("phone_number_id"))
+    if not creds:
+        raise HTTPException(400, "WhatsApp not configured for this tenant")
+    payload = {
+        "messaging_product": "whatsapp", "to": contact["phone"].lstrip("+"),
+        "type": "reaction",
+        "reaction": {"message_id": m["provider_message_id"], "emoji": body.emoji},
+    }
+    try:
+        await meta_wa.graph_post_message(creds, payload)
+    except Exception as e:
+        raise HTTPException(400, f"Reaction failed: {e}")
+    # Persist locally on the message doc
+    if body.emoji:
+        await db.messages.update_one({"id": body.message_id},
+            {"$addToSet": {"reactions": {"emoji": body.emoji, "from": "us", "author": user["email"], "at": iso(now_utc())}}})
+    else:
+        await db.messages.update_one({"id": body.message_id},
+            {"$pull": {"reactions": {"from": "us"}}})
+    return {"ok": True, "emoji": body.emoji or None}
+
+
+@api.delete("/messages/{message_id}")
+async def delete_message(message_id: str, user: dict = Depends(current_user)):
+    """Soft-delete a message from the tenant's UI. Does NOT unsend on WhatsApp
+    (Meta Cloud API doesn't support 'delete for everyone' server-side). Meta's own
+    delete-for-everyone happens client-side on the recipient's phone."""
+    m = await db.messages.find_one(cflt(user, {"id": message_id}), {"_id": 0})
+    if not m:
+        raise HTTPException(404, "Message not found")
+    await db.messages.update_one({"id": message_id},
+        {"$set": {"deleted": True, "deleted_at": iso(now_utc()), "deleted_by": user["email"]}})
+    await audit("message_deleted", "message", message_id, user, {"channel": m.get("channel")})
+    return {"ok": True, "message_id": message_id}
+
+
+@api.get("/plans")
+async def list_plans(user: Optional[dict] = Depends(current_user)):
+    """Public list of plans (only active ones for tenants; SA sees all)."""
+    q: Dict[str, Any] = {}
+    if not user or user.get("role") != "super_admin":
+        q["is_active"] = True
+    return await db.plans.find(q, {"_id": 0}).sort([("sort_order", 1), ("monthly_paise", 1)]).to_list(50)
+
+
+@api.post("/plans")
+async def create_plan(body: PlanIn, user: dict = Depends(require_roles("super_admin"))):
+    if await db.plans.find_one({"code": body.code}):
+        raise HTTPException(409, f"Plan code '{body.code}' already exists")
+    doc = {**body.dict(), "id": new_id(), "created_at": iso(now_utc()), "updated_at": iso(now_utc())}
+    await db.plans.insert_one(doc)
+    await audit("plan_created", "plan", doc["id"], user, {"code": body.code})
+    doc.pop("_id", None)
+    return doc
+
+
+@api.patch("/plans/{plan_id}")
+async def update_plan(plan_id: str, body: PlanPatch, user: dict = Depends(require_roles("super_admin"))):
+    upd = {k: v for k, v in body.dict(exclude_unset=True).items() if v is not None}
+    if not upd:
+        raise HTTPException(400, "No fields to update")
+    upd["updated_at"] = iso(now_utc())
+    res = await db.plans.update_one({"id": plan_id}, {"$set": upd})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Plan not found")
+    await audit("plan_updated", "plan", plan_id, user, {"fields": list(upd.keys())})
+    return await db.plans.find_one({"id": plan_id}, {"_id": 0})
+
+
+@api.delete("/plans/{plan_id}")
+async def delete_plan(plan_id: str, user: dict = Depends(require_roles("super_admin"))):
+    n_subs = await db.subscriptions.count_documents({"plan_id": plan_id, "status": "active"})
+    if n_subs > 0:
+        raise HTTPException(400, f"Cannot delete: {n_subs} active subscription(s) on this plan. Deactivate it instead.")
+    res = await db.plans.delete_one({"id": plan_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Plan not found")
+    await audit("plan_deleted", "plan", plan_id, user)
+    return {"ok": True}
+
+
+# ─────────── Coupons ───────────
+class CouponIn(BaseModel):
+    code: str
+    discount_percent: Optional[int] = None       # 0-100
+    discount_paise: Optional[int] = None         # flat discount
+    valid_until: Optional[str] = None            # ISO
+    max_uses: Optional[int] = None               # global usage cap
+    max_uses_per_company: Optional[int] = 1      # per-tenant cap
+    min_amount_paise: Optional[int] = 0
+    applies_to: List[str] = ["subscription", "wallet"]  # ["subscription"] or ["wallet"] or both
+    applicable_plans: Optional[List[str]] = None  # plan codes; None = all
+    description: str = ""
+    is_active: bool = True
+
+
+@api.get("/coupons")
+async def list_coupons(user: dict = Depends(require_roles("super_admin","admin"))):
+    """SA sees all; tenant admin sees active + applicable ones (usable in their billing UI)."""
+    if user.get("role") == "super_admin" and not user.get("company_id"):
+        return await db.coupons.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    now = iso(now_utc())
+    q = {"is_active": True, "$or": [{"valid_until": None}, {"valid_until": {"$gte": now}}]}
+    return await db.coupons.find(q, {"_id": 0, "max_uses_per_company": 0}).sort("created_at", -1).to_list(50)
+
+
+@api.post("/coupons")
+async def create_coupon(body: CouponIn, user: dict = Depends(require_roles("super_admin"))):
+    if not (body.discount_percent or body.discount_paise):
+        raise HTTPException(400, "Coupon must have either discount_percent or discount_paise")
+    if body.discount_percent and (body.discount_percent < 1 or body.discount_percent > 100):
+        raise HTTPException(400, "discount_percent must be 1-100")
+    code_up = body.code.strip().upper()
+    if not code_up or " " in code_up:
+        raise HTTPException(400, "Invalid coupon code")
+    if await db.coupons.find_one({"code": code_up}):
+        raise HTTPException(409, f"Coupon '{code_up}' already exists")
+    doc = {**body.dict(), "code": code_up, "id": new_id(),
+           "used_count": 0, "created_at": iso(now_utc()), "created_by": user["email"]}
+    await db.coupons.insert_one(doc)
+    await audit("coupon_created", "coupon", doc["id"], user, {"code": code_up})
+    doc.pop("_id", None)
+    return doc
+
+
+@api.delete("/coupons/{coupon_id}")
+async def delete_coupon(coupon_id: str, user: dict = Depends(require_roles("super_admin"))):
+    res = await db.coupons.delete_one({"id": coupon_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Coupon not found")
+    await audit("coupon_deleted", "coupon", coupon_id, user)
+    return {"ok": True}
+
+
+class CouponValidateIn(BaseModel):
+    code: str
+    amount_paise: int = 0
+    context: str = "subscription"  # "subscription" or "wallet"
+    plan_code: Optional[str] = None
+
+
+@api.post("/coupons/validate")
+async def validate_coupon(body: CouponValidateIn, user: dict = Depends(current_user)):
+    """Check if a coupon code is valid for the caller + returns discount preview."""
+    c = await db.coupons.find_one({"code": body.code.strip().upper(), "is_active": True}, {"_id": 0})
+    if not c:
+        raise HTTPException(404, "Invalid coupon code")
+    now = iso(now_utc())
+    if c.get("valid_until") and c["valid_until"] < now:
+        raise HTTPException(400, "Coupon expired")
+    if body.context not in (c.get("applies_to") or ["subscription", "wallet"]):
+        raise HTTPException(400, f"Coupon not applicable for {body.context}")
+    if c.get("max_uses") and c.get("used_count", 0) >= c["max_uses"]:
+        raise HTTPException(400, "Coupon usage limit reached")
+    if body.context == "subscription" and c.get("applicable_plans") and body.plan_code not in c["applicable_plans"]:
+        raise HTTPException(400, f"Coupon not applicable for plan '{body.plan_code}'")
+    if body.amount_paise < (c.get("min_amount_paise") or 0):
+        raise HTTPException(400, f"Minimum amount ₹{(c['min_amount_paise'] or 0) / 100:.2f} required")
+    if user.get("company_id") and c.get("max_uses_per_company"):
+        used = await db.coupon_redemptions.count_documents({
+            "coupon_id": c["id"], "company_id": user["company_id"]})
+        if used >= c["max_uses_per_company"]:
+            raise HTTPException(400, "You have already used this coupon")
+    if c.get("discount_percent"):
+        discount = int(round(body.amount_paise * c["discount_percent"] / 100))
+    else:
+        discount = int(c.get("discount_paise") or 0)
+    discount = min(discount, body.amount_paise)  # cap to amount
+    return {"code": c["code"], "discount_paise": discount,
+            "final_paise": body.amount_paise - discount,
+            "discount_percent": c.get("discount_percent"),
+            "description": c.get("description", "")}
+
+
+async def _redeem_coupon(coupon_code: str, company_id: str, subscription_id: Optional[str],
+                        amount_paise: int, context: str) -> int:
+    """Atomically increment coupon.used_count + create redemption row. Returns discount_paise."""
+    c = await db.coupons.find_one_and_update(
+        {"code": coupon_code.upper(), "is_active": True,
+         "$or": [{"max_uses": None}, {"$expr": {"$lt": ["$used_count", "$max_uses"]}}]},
+        {"$inc": {"used_count": 1}}, return_document=True)
+    if not c:
+        raise HTTPException(400, "Coupon is not valid or is exhausted")
+    if c.get("discount_percent"):
+        discount = int(round(amount_paise * c["discount_percent"] / 100))
+    else:
+        discount = int(c.get("discount_paise") or 0)
+    discount = min(discount, amount_paise)
+    await db.coupon_redemptions.insert_one({
+        "id": new_id(), "coupon_id": c["id"], "coupon_code": c["code"],
+        "company_id": company_id, "subscription_id": subscription_id,
+        "context": context, "amount_paise": amount_paise, "discount_paise": discount,
+        "created_at": iso(now_utc()),
+    })
+    return discount
+
+
+# ─────────── Subscriptions ───────────
+class SubscribeIn(BaseModel):
+    plan_code: str
+    billing_cycle: str = "monthly"  # "monthly" | "annual"
+    coupon_code: Optional[str] = None
+
+
+@api.get("/subscriptions/current")
+async def current_subscription(user: dict = Depends(current_user)):
+    """Get the tenant's active subscription (returns None-shaped placeholder if none)."""
+    if not user.get("company_id"):
+        return {"subscription": None, "message": "Super Admin does not have a per-tenant subscription."}
+    sub = await db.subscriptions.find_one({"company_id": user["company_id"], "status": "active"}, {"_id": 0})
+    if not sub:
+        return {"subscription": None, "plan": None}
+    plan = await db.plans.find_one({"id": sub["plan_id"]}, {"_id": 0})
+    return {"subscription": sub, "plan": plan}
+
+
+@api.post("/subscriptions/subscribe")
+async def subscribe(body: SubscribeIn, user: dict = Depends(require_roles("super_admin","admin"))):
+    """Subscribe the tenant to a plan. Debits wallet by (plan price - coupon discount). Auto-renew ON."""
+    if not user.get("company_id"):
+        raise HTTPException(400, "Super Admin cannot subscribe. Use a Company Admin account.")
+    if body.billing_cycle not in ("monthly", "annual"):
+        raise HTTPException(400, "billing_cycle must be 'monthly' or 'annual'")
+    plan = await db.plans.find_one({"code": body.plan_code, "is_active": True}, {"_id": 0})
+    if not plan:
+        raise HTTPException(404, "Plan not found or inactive")
+    if plan.get("custom_pricing"):
+        raise HTTPException(400, "Contact sales for Enterprise plan pricing")
+    price_paise = plan["annual_paise"] if body.billing_cycle == "annual" else plan["monthly_paise"]
+    if price_paise <= 0:
+        raise HTTPException(400, "Plan has no price configured")
+    discount_paise = 0
+    if body.coupon_code:
+        discount_paise = await _redeem_coupon(body.coupon_code, user["company_id"], None,
+                                              price_paise, "subscription")
+    final_paise = price_paise - discount_paise
+
+    # Debit wallet
+    ok = await _debit_wallet(user["company_id"], final_paise,
+                             {"reason": "subscription", "plan": body.plan_code, "cycle": body.billing_cycle,
+                              "coupon": body.coupon_code, "discount_paise": discount_paise})
+    if not ok:
+        raise HTTPException(402, f"Insufficient wallet balance. Need ₹{final_paise / 100:.2f} — recharge first.")
+
+    # Cancel existing active sub (if any)
+    await db.subscriptions.update_many(
+        {"company_id": user["company_id"], "status": "active"},
+        {"$set": {"status": "replaced", "replaced_at": iso(now_utc())}})
+
+    period_days = 365 if body.billing_cycle == "annual" else 30
+    sub_id = new_id()
+    now = now_utc()
+    expires = now + timedelta(days=period_days)
+    sub_doc = {
+        "id": sub_id, "company_id": user["company_id"], "plan_id": plan["id"],
+        "plan_code": plan["code"], "plan_name": plan["name"],
+        "billing_cycle": body.billing_cycle, "status": "active", "auto_renew": True,
+        "price_paise": price_paise, "coupon_code": body.coupon_code, "discount_paise": discount_paise,
+        "final_paise": final_paise, "message_credits_monthly": plan.get("message_credits_monthly", 0),
+        "started_at": iso(now), "expires_at": iso(expires),
+        "created_by": user["email"], "created_at": iso(now),
+    }
+    await db.subscriptions.insert_one(sub_doc)
+    await audit("subscribed", "subscription", sub_id, user,
+                {"plan": body.plan_code, "cycle": body.billing_cycle, "amount_paise": final_paise})
+
+    # Generate invoice
+    invoice = await _generate_invoice(user["company_id"], "subscription", sub_id,
+                                       price_paise, discount_paise, body.coupon_code,
+                                       description=f"{plan['name']} plan ({body.billing_cycle})",
+                                       user=user)
+    sub_doc.pop("_id", None)
+    return {"subscription": sub_doc, "invoice": invoice}
+
+
+@api.post("/subscriptions/cancel")
+async def cancel_subscription(user: dict = Depends(require_roles("super_admin","admin"))):
+    """Cancel the current active subscription (does NOT refund; stays active till expires_at)."""
+    if not user.get("company_id"):
+        raise HTTPException(400, "SA has no subscription to cancel.")
+    res = await db.subscriptions.update_one(
+        {"company_id": user["company_id"], "status": "active"},
+        {"$set": {"auto_renew": False, "cancelled_at": iso(now_utc()), "cancelled_by": user["email"]}})
+    if res.matched_count == 0:
+        raise HTTPException(404, "No active subscription")
+    await audit("subscription_cancelled", "subscription", user["company_id"], user)
+    return {"ok": True, "message": "Auto-renew disabled. Subscription remains active until expiry."}
+
+
+# ─────────── GST Invoicing ───────────
+GST_RATE_PCT = int(os.environ.get("GST_RATE_PCT", "18"))
+PLATFORM_GST_STATE = (os.environ.get("PLATFORM_GST_STATE") or "MH").upper()  # Maharashtra
+
+
+class CompanyBillingIn(BaseModel):
+    gstin: Optional[str] = None
+    billing_address: Optional[str] = None
+    billing_state: Optional[str] = None  # 2-letter state code
+    billing_email: Optional[str] = None
+
+
+@api.get("/company/billing")
+async def get_company_billing(user: dict = Depends(current_user)):
+    """Fetch the tenant's GST/billing profile."""
+    if not user.get("company_id"):
+        return {"gstin": None, "billing_address": None, "billing_state": None}
+    c = await db.companies.find_one({"id": user["company_id"]},
+                                     {"_id": 0, "gstin": 1, "billing_address": 1, "billing_state": 1, "billing_email": 1, "admin_email": 1, "name": 1})
+    return c or {}
+
+
+@api.patch("/company/billing")
+async def update_company_billing(body: CompanyBillingIn,
+                                  user: dict = Depends(require_roles("super_admin","admin"))):
+    if not user.get("company_id"):
+        raise HTTPException(400, "SA has no company billing profile.")
+    upd = {k: v for k, v in body.dict(exclude_unset=True).items() if v is not None}
+    if not upd:
+        raise HTTPException(400, "No fields to update")
+    if "gstin" in upd and upd["gstin"]:
+        # Basic GSTIN format: 15 chars, alphanum
+        g = upd["gstin"].strip().upper()
+        if len(g) != 15 or not g.isalnum():
+            raise HTTPException(400, "Invalid GSTIN — must be 15 alphanumeric characters")
+        upd["gstin"] = g
+    if "billing_state" in upd and upd["billing_state"]:
+        upd["billing_state"] = upd["billing_state"].strip().upper()
+    await db.companies.update_one({"id": user["company_id"]}, {"$set": upd})
+    await audit("company_billing_updated", "company", user["company_id"], user, {"fields": list(upd.keys())})
+    return await get_company_billing(user)
+
+
+async def _generate_invoice(company_id: str, kind: str, ref_id: Optional[str],
+                            amount_paise: int, discount_paise: int, coupon_code: Optional[str],
+                            description: str, user: dict) -> Dict[str, Any]:
+    """Create a GST-compliant invoice row. Splits CGST/SGST for same-state, IGST for interstate."""
+    company = await db.companies.find_one({"id": company_id}, {"_id": 0}) or {}
+    same_state = (company.get("billing_state") or "").upper() == PLATFORM_GST_STATE
+    subtotal = amount_paise - discount_paise
+    # amount_paise here is the pre-tax total user is paying (tax-inclusive OR tax-exclusive?)
+    # Convention: We treat plan price as TAX-EXCLUSIVE, so GST is added on top.
+    tax_paise = int(round(subtotal * GST_RATE_PCT / 100))
+    total_paise = subtotal + tax_paise
+    if same_state:
+        cgst_paise = tax_paise // 2
+        sgst_paise = tax_paise - cgst_paise
+        igst_paise = 0
+    else:
+        cgst_paise = 0
+        sgst_paise = 0
+        igst_paise = tax_paise
+    # Sequential invoice number
+    seq_row = await db.system_settings.find_one_and_update(
+        {"key": "invoice_seq"}, {"$inc": {"value.n": 1}}, upsert=True, return_document=True)
+    seq_n = ((seq_row or {}).get("value") or {}).get("n", 1)
+    inv_year = datetime.now(timezone.utc).strftime("%Y")
+    invoice_number = f"TZS/{inv_year}/{seq_n:06d}"
+    doc = {
+        "id": new_id(), "invoice_number": invoice_number,
+        "company_id": company_id, "company_name": company.get("name"),
+        "company_gstin": company.get("gstin"),
+        "company_billing_address": company.get("billing_address"),
+        "company_billing_state": company.get("billing_state"),
+        "kind": kind, "ref_id": ref_id,
+        "description": description,
+        "amount_paise": amount_paise, "discount_paise": discount_paise, "coupon_code": coupon_code,
+        "subtotal_paise": subtotal,
+        "gst_rate_pct": GST_RATE_PCT,
+        "cgst_paise": cgst_paise, "sgst_paise": sgst_paise, "igst_paise": igst_paise,
+        "tax_paise": tax_paise, "total_paise": total_paise,
+        "currency": "INR", "status": "paid",
+        "issued_at": iso(now_utc()), "created_by": user.get("email"),
+    }
+    await db.invoices_v2.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.get("/invoices-v2")
+async def list_invoices_v2(user: dict = Depends(require_roles("super_admin","admin")),
+                            limit: int = 100):
+    """New GST invoices (subscription + one-time). Legacy /invoices endpoint remains for usage aggregates."""
+    q = cflt(user)
+    docs = await db.invoices_v2.find(q, {"_id": 0}).sort("issued_at", -1).limit(min(500, limit)).to_list(limit)
+    return docs
+
+
+@api.get("/invoices-v2/{invoice_id}")
+async def invoice_v2_detail(invoice_id: str, user: dict = Depends(require_roles("super_admin","admin"))):
+    inv = await db.invoices_v2.find_one(cflt(user, {"id": invoice_id}), {"_id": 0})
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+    return inv
+
+
 @api.get("/invoices")
 async def list_invoices(user: dict = Depends(require_roles("super_admin","admin"))):
     """Return monthly invoice summaries (last 6 months that have usage)."""

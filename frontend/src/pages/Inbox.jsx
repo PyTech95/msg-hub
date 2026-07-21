@@ -6,9 +6,11 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
-import { Send, Search, MessageCircle, User, Paperclip, X, FileText, Video, Music, MapPin, Loader2, Users, Filter, StickyNote, ChevronLeft } from "lucide-react";
+import { Send, Search, MessageCircle, User, Paperclip, X, FileText, Video, Music, MapPin, Loader2, Users, Filter, StickyNote, ChevronLeft, SmilePlus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
+
+const REACTION_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
 
 // Blob fetch with auth header for media
 async function fetchMediaBlob(id) {
@@ -82,6 +84,43 @@ const dayLabel = (iso) => {
   if (d.toDateString() === y.toDateString()) return "Yesterday";
   return d.toLocaleDateString([], { day: "2-digit", month: "short", year: "numeric" });
 };
+
+function MessageActions({ message, onReact, onDelete, showDelete = true }) {
+  const [showPicker, setShowPicker] = useState(false);
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setShowPicker(v => !v)}
+        className="h-6 w-6 rounded-full bg-white dark:bg-slate-800 border shadow-sm flex items-center justify-center hover:scale-110 transition"
+        title="React"
+        data-testid={`react-btn-${message.id}`}
+      >
+        <SmilePlus className="h-3 w-3" />
+      </button>
+      {showPicker && (
+        <div className="absolute bottom-full mb-1 right-0 bg-white dark:bg-slate-900 border rounded-full shadow-md flex gap-0.5 p-1 z-10" data-testid={`picker-${message.id}`}>
+          {REACTION_EMOJIS.map(e => (
+            <button key={e}
+              onClick={() => { onReact(message.id, e); setShowPicker(false); }}
+              className="text-base hover:scale-125 transition"
+              data-testid={`emoji-${e}`}
+            >{e}</button>
+          ))}
+        </div>
+      )}
+      {showDelete && (
+        <button
+          onClick={() => onDelete(message.id)}
+          className="mt-0.5 h-6 w-6 rounded-full bg-white dark:bg-slate-800 border shadow-sm flex items-center justify-center hover:scale-110 transition text-red-500"
+          title="Delete from inbox"
+          data-testid={`delete-btn-${message.id}`}
+        >
+          <Trash2 className="h-3 w-3" />
+        </button>
+      )}
+    </div>
+  );
+}
 
 export default function Inbox() {
   const { user } = useAuth();
@@ -213,6 +252,23 @@ export default function Inbox() {
       setTimeout(loadConversations, 800);
     } catch (e) { toast.error(e.response?.data?.detail || "Send failed"); }
     finally { setSending(false); }
+  };
+
+  const react = async (messageId, emoji) => {
+    try {
+      await api.post("/messages/reactions", { message_id: messageId, emoji });
+      toast.success(emoji ? `Reacted ${emoji}` : "Reaction removed");
+      loadChat(activeId);
+    } catch (e) { toast.error(e.response?.data?.detail || "Reaction failed"); }
+  };
+
+  const deleteMessage = async (messageId) => {
+    if (!window.confirm("Delete this message from your inbox? (Recipient's phone will still show it — Meta does not support server-side unsend.)")) return;
+    try {
+      await api.delete(`/messages/${messageId}`);
+      setMsgs(prev => prev.filter(m => m.id !== messageId));
+      toast.success("Message deleted from inbox");
+    } catch (e) { toast.error(e.response?.data?.detail || "Delete failed"); }
   };
 
   // Filter & group messages by day
@@ -376,21 +432,38 @@ export default function Inbox() {
                   const isOut = m.direction === "outbound";
                   const isInternalMsg = m.direction === "internal" || m.is_internal;
                   return (
-                    <div key={m.id} className={`flex ${isOut ? "justify-end" : isInternalMsg ? "justify-center" : "justify-start"}`} data-testid={`msg-${m.id}`}>
-                      <div className={`max-w-[75%] p-2 rounded-lg text-xs shadow-sm ${
-                        isInternalMsg ? "bg-yellow-100 dark:bg-yellow-900/40 border border-yellow-300 dark:border-yellow-700 max-w-[85%]"
-                        : isOut ? "bg-green-100 dark:bg-green-900/40" : "bg-white dark:bg-slate-800"}`}>
-                        {isInternalMsg && (
-                          <div className="text-[9px] uppercase tracking-wider text-yellow-700 dark:text-yellow-300 mb-1 flex items-center gap-1">
-                            <StickyNote className="h-2.5 w-2.5" /> Internal note · {m.author}
+                    <div key={m.id} className={`flex ${isOut ? "justify-end" : isInternalMsg ? "justify-center" : "justify-start"} group`} data-testid={`msg-${m.id}`}>
+                      <div className="flex items-end gap-1 max-w-[75%]">
+                        {isOut && (
+                          <div className="opacity-0 group-hover:opacity-100 transition flex flex-col gap-0.5">
+                            <MessageActions message={m} onReact={react} onDelete={deleteMessage} />
                           </div>
                         )}
-                        {m.media && <div className="mb-1"><MediaBubble media={m.media} /></div>}
-                        {m.body && <div className="whitespace-pre-wrap">{m.body}</div>}
-                        <div className="text-[9px] text-muted-foreground mt-0.5 text-right flex items-center justify-end gap-1">
-                          <span>{timeShort(m.created_at)}</span>
-                          {statusTick(m)}
+                        <div className={`p-2 rounded-lg text-xs shadow-sm relative ${
+                          isInternalMsg ? "bg-yellow-100 dark:bg-yellow-900/40 border border-yellow-300 dark:border-yellow-700 max-w-[85%]"
+                          : isOut ? "bg-green-100 dark:bg-green-900/40" : "bg-white dark:bg-slate-800"}`}>
+                          {isInternalMsg && (
+                            <div className="text-[9px] uppercase tracking-wider text-yellow-700 dark:text-yellow-300 mb-1 flex items-center gap-1">
+                              <StickyNote className="h-2.5 w-2.5" /> Internal note · {m.author}
+                            </div>
+                          )}
+                          {m.media && <div className="mb-1"><MediaBubble media={m.media} /></div>}
+                          {m.body && <div className="whitespace-pre-wrap">{m.body}</div>}
+                          {(m.reactions || []).length > 0 && (
+                            <div className="absolute -bottom-2 right-1 bg-white dark:bg-slate-900 border rounded-full px-1.5 py-0.5 text-[10px] shadow-sm flex gap-0.5" data-testid={`reactions-${m.id}`}>
+                              {(m.reactions || []).map((r, i) => <span key={i}>{r.emoji}</span>)}
+                            </div>
+                          )}
+                          <div className="text-[9px] text-muted-foreground mt-0.5 text-right flex items-center justify-end gap-1">
+                            <span>{timeShort(m.created_at)}</span>
+                            {statusTick(m)}
+                          </div>
                         </div>
+                        {!isOut && !isInternalMsg && (
+                          <div className="opacity-0 group-hover:opacity-100 transition">
+                            <MessageActions message={m} onReact={react} onDelete={deleteMessage} showDelete={false} />
+                          </div>
+                        )}
                       </div>
                     </div>);
                 })}

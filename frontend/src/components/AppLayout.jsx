@@ -41,6 +41,7 @@ const NAV = [
   { to: "/whatsapp-settings", label: "WhatsApp Setup", icon: MessageCircle, roles: ["super_admin","admin"], tenantOnly: true },
   { to: "/whatsapp-numbers", label: "WA Numbers", icon: Smartphone, roles: ["super_admin","admin","manager","agent"] },
   { to: "/wallet",        label: "Wallet",        icon: WalletIcon,      roles: ["super_admin","admin"] },
+  { to: "/billing",       label: "Billing",       icon: ReceiptText,     roles: ["super_admin","admin"] },
   { to: "/audit-logs",    label: "Audit Logs",    icon: ScrollText,      roles: ["super_admin","admin"] },
   { to: "/team",          label: "Team",          icon: UserCog,         roles: ["super_admin","admin"] },
   { to: "/settings",      label: "Settings",      icon: Settings,        roles: ["super_admin","admin","manager","agent"] },
