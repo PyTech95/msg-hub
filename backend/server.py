@@ -1457,12 +1457,93 @@ async def _send_one_campaign_recipient(campaign_id: str, channel: str, adapter, 
     return "sent"
 
 
+# Broadcast v2 — Redis + Celery distributed queue
+BROADCAST_ENGINE = (os.environ.get("BROADCAST_ENGINE") or "celery").lower()
+_celery_task = None
+
+
+def _get_celery_task():
+    """Lazy import so backend still runs if celery/redis is down."""
+    global _celery_task
+    if _celery_task is None:
+        try:
+            from celery_app import send_broadcast_message
+            _celery_task = send_broadcast_message
+        except Exception as e:
+            log.warning("Celery import failed — falling back to asyncio broadcast: %s", e)
+            _celery_task = False
+    return _celery_task if _celery_task is not False else None
+
+
+async def _enqueue_recipient_celery(campaign_id: str, channel: str, tpl: dict, c: dict,
+                                    body: str, company_id: Optional[str]) -> str:
+    """v2 path: create message row + wallet debit + enqueue Celery task. Returns 'queued'|'skipped'|'failed'."""
+    mid = new_id()
+    await db.messages.insert_one({
+        "id": mid, "channel": channel, "contact_id": c["id"], "direction": "outbound",
+        "body": body, "media_url": tpl.get("media_url"),
+        "status": "queued", "provider_message_id": None,
+        "campaign_id": campaign_id, "company_id": company_id,
+        "broadcast_engine": "celery",
+        "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
+    })
+    price_paise = _price_paise(channel) if company_id else 0
+    if company_id and price_paise > 0:
+        ok = await _debit_wallet(company_id, price_paise,
+                                 {"message_id": mid, "channel": channel, "campaign_id": campaign_id})
+        if not ok:
+            await db.messages.update_one({"id": mid}, {"$set": {"status": "failed", "error": "insufficient_wallet_balance"}})
+            await emit_event(mid, "failed", reason="insufficient_wallet_balance")
+            return "skipped"
+    task = _get_celery_task()
+    if not task:
+        # Refund + fallback to in-process
+        if company_id and price_paise > 0:
+            await db.wallets.update_one({"company_id": company_id},
+                                        {"$inc": {"balance_paise": price_paise},
+                                         "$set": {"updated_at": iso(now_utc())}})
+        return "failed"
+    task.delay(
+        message_id=mid, campaign_id=campaign_id, company_id=company_id,
+        channel=channel, to_phone=c["phone"], body=body,
+        template_name=tpl.get("template_name"),
+        template_language=tpl.get("template_language") or "en_US",
+        template_components=tpl.get("template_components"),
+        phone_number_id=tpl.get("phone_number_id"),
+    )
+    return "queued"
+
+
 async def run_campaign(campaign_id: str, channel: Channel, tpl: dict, audience: List[dict], variables_map: Dict[str, Any], company_id: Optional[str] = None):
-    """Run a campaign with pause/cancel support + rate-limited concurrent sending."""
+    """Run a campaign with pause/cancel support.
+    Uses Celery broadcast v2 when BROADCAST_ENGINE=celery + broker reachable.
+    Falls back to in-process asyncio semaphore otherwise (single-pod dev)."""
+    use_celery = (BROADCAST_ENGINE == "celery" and _get_celery_task() is not None
+                  and channel == "whatsapp")  # v2 currently WA-only
+    if use_celery:
+        await db.campaigns.update_one({"id": campaign_id},
+            {"$set": {"broadcast_engine": "celery"}, "$inc": {"stats.queued": len(audience)}})
+        stats = {"queued": 0, "skipped": 0, "failed": 0}
+        for c in audience:
+            camp = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0, "status": 1})
+            if not camp or camp.get("status") in ("cancelled", "paused"):
+                log.info(f"Campaign {campaign_id} halted during enqueue")
+                break
+            body = render_body(tpl["body"], c, variables_map)
+            result = await _enqueue_recipient_celery(campaign_id, channel, tpl, c, body, company_id)
+            stats[result] = stats.get(result, 0) + 1
+        # Campaign remains "running" until worker updates last recipient; a periodic reaper marks completed
+        await db.campaigns.update_one({"id": campaign_id},
+            {"$set": {"enqueue_completed_at": iso(now_utc()),
+                      "stats.enqueued": stats["queued"],
+                      "stats.skipped": stats["skipped"]}})
+        log.info(f"Campaign {campaign_id}: enqueued {stats['queued']} to Celery, skipped {stats['skipped']}")
+        return
+
+    # v1 (asyncio) path — kept for backward compat
     adapter = ADAPTERS[channel]
     stats = {"sent": 0, "skipped": 0, "failed": 0}
     for c in audience:
-        # Check campaign status — support pause/cancel
         camp = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0, "status": 1})
         if not camp or camp.get("status") in ("cancelled", "paused"):
             log.info(f"Campaign {campaign_id} {camp.get('status') if camp else 'gone'} — halting")
@@ -1492,6 +1573,35 @@ async def run_campaign(campaign_id: str, channel: Channel, tpl: dict, audience: 
                 )
     except Exception as e:
         log.warning(f"campaign-complete email failed: {e}")
+
+
+@api.get("/broadcast/status")
+async def broadcast_status(user: dict = Depends(require_roles("super_admin","admin","manager"))):
+    """Redis queue depth + Celery worker health (SA gets platform-wide stats)."""
+    out: Dict[str, Any] = {"engine": BROADCAST_ENGINE, "redis_up": False, "celery_workers": 0,
+                            "queue_depth": None, "active_tasks": None}
+    try:
+        import redis
+        r = redis.from_url(os.environ.get("REDIS_URL") or "redis://127.0.0.1:6379/0", socket_timeout=2)
+        r.ping()
+        out["redis_up"] = True
+        out["queue_depth"] = r.llen("celery")
+    except Exception as e:
+        out["redis_error"] = str(e)[:200]
+    try:
+        from celery_app import celery_app as capp
+        insp = capp.control.inspect(timeout=2)
+        stats = insp.stats() or {}
+        active = insp.active() or {}
+        out["celery_workers"] = len(stats)
+        out["worker_names"] = list(stats.keys())
+        out["active_tasks"] = sum(len(v or []) for v in active.values())
+    except Exception as e:
+        out["celery_error"] = str(e)[:200]
+    return out
+
+
+
 
 
 @api.post("/campaigns/{campaign_id}/pause")
