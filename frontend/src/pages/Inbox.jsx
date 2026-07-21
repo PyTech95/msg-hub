@@ -19,12 +19,19 @@ async function fetchMediaBlob(id) {
 function MediaBubble({ media }) {
   const [url, setUrl] = useState(null);
   const [failed, setFailed] = useState(false);
+  const urlRef = useRef(null);
   useEffect(() => {
     let alive = true;
     if (!media?.gridfs_id || media.type === "location") return;
-    fetchMediaBlob(media.gridfs_id).then(u => { if (alive) setUrl(u); }).catch(() => { if (alive) setFailed(true); });
-    return () => { alive = false; if (url) URL.revokeObjectURL(url); };
-  }, [media?.gridfs_id]);
+    fetchMediaBlob(media.gridfs_id).then(u => {
+      if (alive) { urlRef.current = u; setUrl(u); }
+      else URL.revokeObjectURL(u);
+    }).catch(() => { if (alive) setFailed(true); });
+    return () => {
+      alive = false;
+      if (urlRef.current) { URL.revokeObjectURL(urlRef.current); urlRef.current = null; }
+    };
+  }, [media?.gridfs_id, media?.type]);
   if (!media) return null;
   if (media.type === "location") {
     return (
@@ -367,13 +374,13 @@ export default function Inbox() {
                     </div>);
                   const m = it;
                   const isOut = m.direction === "outbound";
-                  const isNote = m.direction === "internal" || m.is_internal;
+                  const isInternalMsg = m.direction === "internal" || m.is_internal;
                   return (
-                    <div key={m.id} className={`flex ${isOut ? "justify-end" : isNote ? "justify-center" : "justify-start"}`} data-testid={`msg-${m.id}`}>
+                    <div key={m.id} className={`flex ${isOut ? "justify-end" : isInternalMsg ? "justify-center" : "justify-start"}`} data-testid={`msg-${m.id}`}>
                       <div className={`max-w-[75%] p-2 rounded-lg text-xs shadow-sm ${
-                        isNote ? "bg-yellow-100 dark:bg-yellow-900/40 border border-yellow-300 dark:border-yellow-700 max-w-[85%]"
+                        isInternalMsg ? "bg-yellow-100 dark:bg-yellow-900/40 border border-yellow-300 dark:border-yellow-700 max-w-[85%]"
                         : isOut ? "bg-green-100 dark:bg-green-900/40" : "bg-white dark:bg-slate-800"}`}>
-                        {isNote && (
+                        {isInternalMsg && (
                           <div className="text-[9px] uppercase tracking-wider text-yellow-700 dark:text-yellow-300 mb-1 flex items-center gap-1">
                             <StickyNote className="h-2.5 w-2.5" /> Internal note · {m.author}
                           </div>
