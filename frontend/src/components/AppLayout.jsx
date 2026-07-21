@@ -21,6 +21,7 @@ import { Toaster } from "@/components/ui/sonner";
 // roles allowed to see each nav item. super_admin always sees all.
 const NAV = [
   { to: "/dashboard",     label: "Dashboard",     icon: LayoutDashboard, roles: ["super_admin","admin","agent"] },
+  { to: "/inbox",         label: "Inbox",         icon: MessageCircle,   roles: ["super_admin","admin","manager","agent"] },
   { to: "/contacts",      label: "Contacts",      icon: Users,           roles: ["super_admin","admin","agent"] },
   { to: "/lists",         label: "Lists",         icon: ListChecks,      roles: ["super_admin","admin"] },
   { to: "/templates",     label: "Templates",     icon: FileText,        roles: ["super_admin","admin","agent"] },
@@ -63,10 +64,17 @@ export default function AppLayout() {
   useRealtime((evt) => {
     if (!evt) return;
     if (evt.type === "inbound_message") {
-      toast.info("New WhatsApp message", {
-        description: (evt.body || "").slice(0, 120),
-        action: { label: "Open", onClick: () => nav(`/contacts/${evt.contact_id}`) },
-      });
+      // Push to Inbox page listener (used for live message list refresh)
+      try { window.dispatchEvent(new CustomEvent("cpaas:new_message", { detail: evt })); } catch (_) {}
+      // Only toast when not already in Inbox / same contact
+      const path = window.location.pathname + window.location.search;
+      const suppress = path.startsWith("/inbox") && path.includes(evt.contact_id);
+      if (!suppress) {
+        toast.info("New WhatsApp message", {
+          description: (evt.body || "").slice(0, 120),
+          action: { label: "Open", onClick: () => nav(`/inbox?c=${evt.contact_id}`) },
+        });
+      }
     } else if (evt.type === "wallet_debit" && evt.low_balance) {
       toast.warning("Low wallet balance", {
         description: `Balance dropped to ₹${(evt.balance_paise/100).toFixed(2)} — recharge soon.`,

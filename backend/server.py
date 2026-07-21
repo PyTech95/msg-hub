@@ -1639,21 +1639,146 @@ async def message_events(message_id: str, user: dict = Depends(current_user)):
 
 # ───────────────────────── Conversations ─────────────────────────
 @api.get("/conversations")
-async def list_conversations(user: dict = Depends(current_user)):
-    convs = await db.conversations.find(cflt(user), {"_id": 0}).sort("last_message_at", -1).to_list(500)
-    # enrich with contact name
+async def list_conversations(
+    q: Optional[str] = None,
+    channel: Optional[str] = None,
+    unread_only: bool = False,
+    limit: int = 200,
+    user: dict = Depends(current_user),
+):
+    """WhatsApp-Web style conversation list — includes unread counts, last message preview,
+    and last-message direction/status for a rich left-panel UI."""
+    limit = max(1, min(500, int(limit)))
+    query: Dict[str, Any] = {}
+    if channel: query["channel"] = channel
+    convs = await db.conversations.find(cflt(user, query), {"_id": 0}).sort("last_message_at", -1).to_list(limit * 2)
+
+    if q:
+        q_low = q.lower()
+        contact_ids = set(c["contact_id"] for c in convs)
+        matched = await db.contacts.find(
+            cflt(user, {"id": {"$in": list(contact_ids)},
+                        "$or": [{"name": {"$regex": q, "$options": "i"}},
+                                {"phone": {"$regex": q, "$options": "i"}}]}),
+            {"_id": 0, "id": 1}).to_list(1000)
+        allowed = {c["id"] for c in matched}
+        convs = [c for c in convs
+                 if c["contact_id"] in allowed
+                 or q_low in ((c.get("last_message") or "").lower())]
+
+    out: List[Dict[str, Any]] = []
     for c in convs:
-        contact = await db.contacts.find_one({"id": c["contact_id"]}, {"_id": 0, "name": 1, "phone": 1})
-        if contact:
-            c["contact_name"] = contact["name"]
-            c["contact_phone"] = contact["phone"]
-    return convs
+        contact = await db.contacts.find_one({"id": c["contact_id"]},
+                                             {"_id": 0, "name": 1, "phone": 1, "tags": 1}) or {}
+        c["contact_name"] = contact.get("name")
+        c["contact_phone"] = contact.get("phone")
+        c["tags"] = contact.get("tags") or []
+        # Unread inbound count = inbound messages after last read timestamp
+        last_read = c.get("last_read_at")
+        unread_q = cflt(user, {"contact_id": c["contact_id"], "channel": c["channel"], "direction": "inbound"})
+        if last_read:
+            unread_q["created_at"] = {"$gt": last_read}
+        c["unread_count"] = await db.messages.count_documents(unread_q)
+        # Last message direction/status
+        last_msg = await db.messages.find_one(
+            cflt(user, {"contact_id": c["contact_id"], "channel": c["channel"]}),
+            {"_id": 0, "direction": 1, "status": 1, "body": 1, "media": 1, "created_at": 1},
+            sort=[("created_at", -1)])
+        if last_msg:
+            c["last_direction"] = last_msg.get("direction")
+            c["last_status"] = last_msg.get("status")
+            if last_msg.get("media"):
+                c["last_media_type"] = (last_msg["media"] or {}).get("type")
+        if unread_only and c["unread_count"] == 0:
+            continue
+        out.append(c)
+        if len(out) >= limit:
+            break
+    return out
+
+
+@api.post("/conversations/{contact_id}/read")
+async def mark_conversation_read(contact_id: str, channel: str = "whatsapp",
+                                 user: dict = Depends(current_user)):
+    """Mark all inbound messages up to now as read (clears the unread badge)."""
+    now = iso(now_utc())
+    res = await db.conversations.update_one(
+        cflt(user, {"contact_id": contact_id, "channel": channel}),
+        {"$set": {"last_read_at": now, "last_read_by": user["email"]}}, upsert=False,
+    )
+    return {"ok": True, "matched": res.matched_count, "last_read_at": now}
+
+
+class ConversationAssignIn(BaseModel):
+    agent_email: Optional[str] = None  # None = unassign
+
+
+@api.post("/conversations/{contact_id}/assign")
+async def assign_conversation(contact_id: str, body: ConversationAssignIn,
+                              channel: str = "whatsapp",
+                              user: dict = Depends(require_roles("super_admin","admin","manager"))):
+    """Assign a conversation to an agent (or unassign by passing null)."""
+    if body.agent_email:
+        agent = await db.users.find_one(cflt(user, {"email": body.agent_email}), {"_id": 0, "email": 1, "role": 1})
+        if not agent:
+            raise HTTPException(404, "Agent not found in this tenant")
+    upd: Dict[str, Any] = {"assigned_to": body.agent_email or None,
+                            "assigned_at": iso(now_utc()) if body.agent_email else None,
+                            "assigned_by": user["email"] if body.agent_email else None}
+    res = await db.conversations.update_one(
+        cflt(user, {"contact_id": contact_id, "channel": channel}), {"$set": upd}, upsert=False)
+    await audit("conversation_assigned", "conversation", contact_id, user,
+                {"agent": body.agent_email, "channel": channel})
+    return {"ok": True, "matched": res.matched_count, "assigned_to": body.agent_email}
+
+
+class InternalNoteIn(BaseModel):
+    contact_id: str
+    body: str
+    channel: str = "whatsapp"
+
+
+@api.post("/conversations/notes")
+async def add_internal_note(body: InternalNoteIn, user: dict = Depends(current_user)):
+    """Add a private internal note (not sent to WhatsApp). Visible to team only."""
+    if not body.body.strip():
+        raise HTTPException(400, "Empty note")
+    note = {
+        "id": new_id(), "channel": body.channel, "contact_id": body.contact_id,
+        "direction": "internal", "body": body.body.strip(), "status": "note",
+        "provider_message_id": None, "campaign_id": None,
+        "company_id": user.get("company_id"),
+        "author": user["email"], "author_role": user.get("role"),
+        "is_internal": True,
+        "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
+    }
+    await db.messages.insert_one(note)
+    # Bump conversation with a preview marker
+    await db.conversations.update_one(
+        cflt(user, {"contact_id": body.contact_id, "channel": body.channel}),
+        {"$set": {"last_message_at": iso(now_utc()),
+                  "last_message": f"📝 {user['email'].split('@')[0]}: {body.body[:60]}",
+                  "company_id": user.get("company_id")}}, upsert=True,
+    )
+    await audit("internal_note_added", "conversation", body.contact_id, user,
+                {"length": len(body.body)})
+    return {"id": note["id"], "created_at": note["created_at"]}
+
 
 @api.get("/contacts/{contact_id}/timeline")
-async def contact_timeline(contact_id: str, user: dict = Depends(current_user)):
-    msgs = await db.messages.find(cflt(user, {"contact_id": contact_id}), {"_id": 0}).sort("created_at", -1).limit(500).to_list(500)
-    calls = await db.call_logs.find(cflt(user, {"contact_id": contact_id}), {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
-    return {"messages": msgs, "calls": calls}
+async def contact_timeline(contact_id: str, before: Optional[str] = None, limit: int = 100,
+                            user: dict = Depends(current_user)):
+    """Paginated conversation timeline. `before` = ISO timestamp cursor (fetch older messages)."""
+    limit = max(1, min(200, int(limit)))
+    q = cflt(user, {"contact_id": contact_id})
+    if before:
+        q["created_at"] = {"$lt": before}
+    msgs = await db.messages.find(q, {"_id": 0}).sort("created_at", -1).limit(limit).to_list(limit)
+    calls = [] if before else await db.call_logs.find(cflt(user, {"contact_id": contact_id}), {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
+    has_more = len(msgs) == limit
+    next_cursor = msgs[-1]["created_at"] if msgs and has_more else None
+    return {"messages": list(reversed(msgs)), "calls": calls,
+            "has_more": has_more, "next_cursor": next_cursor}
 
 # ───────────────────────── Voice Calls ─────────────────────────
 @api.post("/calls")
