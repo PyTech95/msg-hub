@@ -412,8 +412,8 @@ export default function Inbox() {
                 </Link>
               </div>
 
-              {/* Messages */}
-              <div ref={scrollerRef} className="flex-1 overflow-y-auto p-4 space-y-1.5 bg-[url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2240%22 height=%2240%22><rect width=%2240%22 height=%2240%22 fill=%22%23f0f4f0%22/></svg>')]" data-testid="chat-messages">
+              {/* Messages — WhatsApp-Web style beige background for readable contrast */}
+              <div ref={scrollerRef} className="flex-1 overflow-y-auto p-4 space-y-1.5 bg-[#efeae2] dark:bg-slate-900" data-testid="chat-messages">
                 {hasMore && (
                   <div className="text-center">
                     <Button variant="ghost" size="sm" className="h-6 text-[10px]" disabled={loadingMore}
@@ -439,9 +439,10 @@ export default function Inbox() {
                             <MessageActions message={m} onReact={react} onDelete={deleteMessage} />
                           </div>
                         )}
-                        <div className={`p-2 rounded-lg text-xs shadow-sm relative ${
+                        <div className={`px-2.5 py-1.5 rounded-lg text-xs shadow-sm relative ${
                           isInternalMsg ? "bg-yellow-100 dark:bg-yellow-900/40 border border-yellow-300 dark:border-yellow-700 max-w-[85%]"
-                          : isOut ? "bg-green-100 dark:bg-green-900/40" : "bg-white dark:bg-slate-800"}`}>
+                          : isOut ? "bg-[#d9fdd3] dark:bg-green-900/40 border border-[#c5eabf] dark:border-green-800"
+                          : "bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700"}`}>
                           {isInternalMsg && (
                             <div className="text-[9px] uppercase tracking-wider text-yellow-700 dark:text-yellow-300 mb-1 flex items-center gap-1">
                               <StickyNote className="h-2.5 w-2.5" /> Internal note · {m.author}

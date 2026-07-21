@@ -2313,7 +2313,9 @@ async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict], com
 
 @api.post("/webhook/whatsapp")
 async def meta_whatsapp_webhook(request: _FRequest):
-    """Receives Meta Cloud API events: inbound messages + delivery statuses."""
+    """Receives Meta Cloud API events: inbound messages + delivery statuses.
+    Legacy platform-level webhook. Auto-resolves company_id from the receiving
+    phone_number_id so inbound messages land in the correct tenant."""
     raw = await request.body()
     app_secret = (os.environ.get("WHATSAPP_APP_SECRET") or "").strip()
     sig_ok = meta_wa.verify_meta_signature(app_secret, raw, request.headers.get("X-Hub-Signature-256") or "")
@@ -2335,11 +2337,23 @@ async def meta_whatsapp_webhook(request: _FRequest):
                 continue
             value = change.get("value", {}) or {}
             recv_phone_id = ((value.get("metadata") or {}).get("phone_number_id") or "").strip() or None
+            # Resolve which tenant owns this receiving number (so inbound
+            # messages/contacts get the right company_id and are visible in
+            # the tenant's Inbox — not stuck in SA-only scope).
+            resolved_company_id: Optional[str] = None
+            if recv_phone_id:
+                cfg = await db.company_whatsapp_configs.find_one(
+                    {"phone_number_id": recv_phone_id, "is_active": {"$ne": False}},
+                    {"_id": 0, "company_id": 1})
+                if cfg:
+                    resolved_company_id = cfg.get("company_id")
             for st in value.get("statuses", []) or []:
                 await _meta_handle_status(st)
                 n_status += 1
             for m in value.get("messages", []) or []:
-                await _meta_handle_inbound(m, value.get("contacts", []) or [], phone_number_id=recv_phone_id)
+                await _meta_handle_inbound(m, value.get("contacts", []) or [],
+                                          company_id=resolved_company_id,
+                                          phone_number_id=recv_phone_id)
                 n_inbound += 1
     log.info("Meta WA webhook processed: %s status update(s), %s inbound message(s)", n_status, n_inbound)
     return {"status": "received"}
