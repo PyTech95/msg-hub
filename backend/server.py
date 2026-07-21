@@ -4019,10 +4019,14 @@ async def subscribe(body: SubscribeIn, user: dict = Depends(require_roles("super
     price_paise = plan["annual_paise"] if body.billing_cycle == "annual" else plan["monthly_paise"]
     if price_paise <= 0:
         raise HTTPException(400, "Plan has no price configured")
+    # Preview coupon discount (does NOT increment used_count yet — we redeem only after wallet debit succeeds
+    # to avoid over-counting when wallet fails)
     discount_paise = 0
     if body.coupon_code:
-        discount_paise = await _redeem_coupon(body.coupon_code, user["company_id"], None,
-                                              price_paise, "subscription")
+        preview = await validate_coupon(  # reuses public validator, raises 400/404 with clear msg
+            CouponValidateIn(code=body.coupon_code, amount_paise=price_paise,
+                             context="subscription", plan_code=body.plan_code), user=user)
+        discount_paise = int(preview.get("discount_paise") or 0)
     final_paise = price_paise - discount_paise
 
     # Debit wallet
@@ -4031,6 +4035,23 @@ async def subscribe(body: SubscribeIn, user: dict = Depends(require_roles("super
                               "coupon": body.coupon_code, "discount_paise": discount_paise})
     if not ok:
         raise HTTPException(402, f"Insufficient wallet balance. Need ₹{final_paise / 100:.2f} — recharge first.")
+
+    # Debit succeeded → now atomically consume the coupon
+    if body.coupon_code:
+        try:
+            await _redeem_coupon(body.coupon_code, user["company_id"], None,
+                                 price_paise, "subscription")
+        except HTTPException:
+            # Rare race: coupon exhausted between validate and redeem — refund the wallet
+            await db.wallets.update_one({"company_id": user["company_id"]},
+                                        {"$inc": {"balance_paise": final_paise},
+                                         "$set": {"updated_at": iso(now_utc())}})
+            await db.wallet_transactions.insert_one({
+                "id": new_id(), "company_id": user["company_id"], "type": "credit",
+                "amount_paise": final_paise, "meta": {"reason": "subscription_coupon_race_refund"},
+                "created_at": iso(now_utc()),
+            })
+            raise
 
     # Cancel existing active sub (if any)
     await db.subscriptions.update_many(
