@@ -35,7 +35,8 @@ def _new_id() -> str:
     return str(uuid.uuid4())
 
 
-def build_features_router(*, db, current_user, require_roles, audit, emit_event, ADAPTERS, cflt):
+def build_features_router(*, db, current_user, require_roles, audit, emit_event, ADAPTERS, cflt,
+                          media_fs=None, meta_wa=None, meta_wa_credentials=None, email_service=None):
     """Wire the features router. Pass in references to the main app's dependencies."""
     router = APIRouter(prefix="/api")
 
@@ -44,8 +45,12 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
     # =====================================================================
     EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 
-    async def llm_split_bills(text: str) -> Dict[str, Any]:
-        """Use Claude (via emergentintegrations) to extract bills. Returns {bills, error}."""
+    async def llm_split_bills(page_texts: List[str]) -> Dict[str, Any]:
+        """Use Claude to extract bills + page ranges from a multi-page PDF.
+
+        page_texts: list of per-page extracted text (1-indexed conceptually).
+        Returns {bills, error}. Each bill has page_start/page_end (1-indexed inclusive).
+        """
         if not EMERGENT_LLM_KEY:
             return {"bills": [], "error": "EMERGENT_LLM_KEY not configured"}
         try:
@@ -53,16 +58,31 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
         except Exception as e:
             return {"bills": [], "error": f"emergentintegrations import failed: {e}"}
 
+        # Build a page-tagged text blob so the LLM can attribute each bill to specific pages.
+        tagged = []
+        budget = 18000
+        for i, t in enumerate(page_texts, start=1):
+            snippet = (t or "").strip()
+            header = f"\n===== PAGE {i} =====\n"
+            if sum(len(x) for x in tagged) + len(header) + len(snippet) > budget:
+                snippet = snippet[: max(0, budget - sum(len(x) for x in tagged) - len(header))]
+                tagged.append(header + snippet)
+                break
+            tagged.append(header + snippet)
+        text_blob = "".join(tagged)
+
         prompt = (
             "You are extracting individual property bills from a multi-bill PDF. "
+            "The text below is split by page markers like '===== PAGE N =====' where N is a 1-indexed page number. "
             "Identify each distinct bill block and output JSON with this exact schema:\n"
-            '{"bills":[{"name":"...","phone":"...","email":"...","property_id":"...","address":"...","amount":0,"due_date":"YYYY-MM-DD","raw":"..."}]}\n'
+            '{"bills":[{"name":"...","phone":"...","email":"...","property_id":"...","address":"...","amount":0,"due_date":"YYYY-MM-DD","raw":"...","page_start":1,"page_end":1}]}\n'
             "Rules:\n"
             "- One entry per bill\n"
+            "- page_start and page_end are 1-indexed inclusive page numbers where the bill appears (usually the same page)\n"
             "- If a field is missing, leave it as empty string or 0\n"
             "- raw = a 1-line summary of the bill\n"
             "- Strict JSON only, no markdown, no commentary\n\n"
-            f"PDF TEXT:\n{text[:18000]}"
+            f"PDF TEXT:\n{text_blob}"
         )
 
         try:
@@ -84,27 +104,76 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
             log.error(f"LLM bill split failed: {e}")
             return {"bills": [], "error": str(e)[:300]}
 
+    def _slice_pdf_pages(raw_pdf: bytes, page_start: int, page_end: int) -> Optional[bytes]:
+        """Return a new PDF containing pages [page_start..page_end] (1-indexed inclusive)."""
+        try:
+            from pypdf import PdfReader, PdfWriter
+            reader = PdfReader(io.BytesIO(raw_pdf))
+            total = len(reader.pages)
+            ps = max(1, int(page_start or 1))
+            pe = min(total, int(page_end or ps))
+            if pe < ps:
+                pe = ps
+            writer = PdfWriter()
+            for i in range(ps - 1, pe):
+                writer.add_page(reader.pages[i])
+            buf = io.BytesIO()
+            writer.write(buf)
+            return buf.getvalue()
+        except Exception as e:
+            log.warning(f"pdf slice failed p{page_start}-{page_end}: {e}")
+            return None
+
     @router.post("/bills/upload")
     async def upload_bill_pdf(file: UploadFile = File(...), user: dict = Depends(current_user)):
         raw = await file.read()
         try:
             with pdfplumber.open(io.BytesIO(raw)) as pdf:
-                text = "\n\n".join((p.extract_text() or "") for p in pdf.pages)
+                page_texts = [(p.extract_text() or "") for p in pdf.pages]
                 page_count = len(pdf.pages)
         except Exception as e:
             raise HTTPException(400, f"Could not read PDF: {e}")
 
-        if not text.strip():
+        if not any(t.strip() for t in page_texts):
             raise HTTPException(400, "PDF has no extractable text (scanned image?)")
 
         batch_id = _new_id()
-        result = await llm_split_bills(text)
+        result = await llm_split_bills(page_texts)
         bills = result["bills"]
         llm_error = result["error"]
         rows = []
-        for b in bills:
+        base_filename = (file.filename or "bills.pdf").rsplit(".", 1)[0]
+        for idx, b in enumerate(bills, start=1):
+            bill_id = _new_id()
+            ps = int(b.get("page_start") or 1)
+            pe = int(b.get("page_end") or ps)
+            # Sanitize page bounds
+            ps = max(1, min(ps, page_count))
+            pe = max(ps, min(pe, page_count))
+
+            pdf_gridfs_id: Optional[str] = None
+            pdf_size: int = 0
+            if media_fs is not None:
+                sliced = _slice_pdf_pages(raw, ps, pe)
+                if sliced:
+                    safe_name = (b.get("property_id") or b.get("name") or f"bill-{idx}").strip() or f"bill-{idx}"
+                    safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in safe_name)[:40]
+                    pdf_filename = f"{base_filename}__{safe_name}__{idx}.pdf"
+                    fs_id = await media_fs.upload_from_stream(
+                        pdf_filename, io.BytesIO(sliced),
+                        metadata={"company_id": user.get("company_id"),
+                                  "mime_type": "application/pdf",
+                                  "source": "bill_split",
+                                  "batch_id": batch_id,
+                                  "bill_id": bill_id,
+                                  "size": len(sliced),
+                                  "created_at": _iso(_now())},
+                    )
+                    pdf_gridfs_id = str(fs_id)
+                    pdf_size = len(sliced)
+
             rows.append({
-                "id": _new_id(),
+                "id": bill_id,
                 "batch_id": batch_id,
                 "name": (b.get("name") or "").strip(),
                 "phone": (b.get("phone") or "").strip(),
@@ -114,6 +183,10 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
                 "amount": float(b.get("amount") or 0),
                 "due_date": (b.get("due_date") or "").strip(),
                 "raw": (b.get("raw") or "").strip(),
+                "page_start": ps,
+                "page_end": pe,
+                "pdf_gridfs_id": pdf_gridfs_id,
+                "pdf_size": pdf_size,
                 "sent": {"sms": False, "whatsapp": False, "email": False},
                 "company_id": user.get("company_id"),
                 "created_at": _iso(_now()),
@@ -148,16 +221,52 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
 
     @router.delete("/bills/batches/{batch_id}")
     async def delete_bill_batch(batch_id: str, user: dict = Depends(require_roles("super_admin","admin"))):
+        # Clean up per-bill PDFs from GridFS first
+        if media_fs is not None:
+            from bson import ObjectId
+            to_delete = await db.bills.find(cflt(user, {"batch_id": batch_id}),
+                                            {"_id": 0, "pdf_gridfs_id": 1}).to_list(2000)
+            for b in to_delete:
+                gid = b.get("pdf_gridfs_id")
+                if not gid:
+                    continue
+                try:
+                    await media_fs.delete(ObjectId(gid))
+                except Exception as e:
+                    log.warning(f"gridfs delete failed for {gid}: {e}")
         await db.bills.delete_many(cflt(user, {"batch_id": batch_id}))
         await db.bill_batches.delete_one(cflt(user, {"id": batch_id}))
         await audit("bill_batch_deleted", "bill_batch", batch_id, user)
         return {"ok": True}
+
+    @router.get("/bills/{bill_id}/pdf")
+    async def get_bill_pdf(bill_id: str, user: dict = Depends(current_user)):
+        """Stream the per-bill sliced PDF from GridFS. Tenant-scoped."""
+        if media_fs is None:
+            raise HTTPException(503, "PDF storage not available")
+        bill = await db.bills.find_one(cflt(user, {"id": bill_id}), {"_id": 0})
+        if not bill:
+            raise HTTPException(404, "Bill not found")
+        gid = bill.get("pdf_gridfs_id")
+        if not gid:
+            raise HTTPException(404, "No PDF attached to this bill")
+        from bson import ObjectId
+        try:
+            stream = await media_fs.open_download_stream(ObjectId(gid))
+        except Exception:
+            raise HTTPException(404, "PDF not found in storage")
+        buf = await stream.read()
+        safe_name = (bill.get("property_id") or bill.get("name") or "bill").strip() or "bill"
+        safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in safe_name)[:40]
+        return FastResponse(content=buf, media_type="application/pdf",
+                            headers={"Content-Disposition": f'inline; filename="bill-{safe_name}.pdf"'})
 
     class BillSendIn(BaseModel):
         channel: str  # sms | whatsapp | email
         bill_ids: List[str]
         message_template: str  # supports {{name}} {{amount}} {{property_id}} {{address}} {{due_date}}
         subject: Optional[str] = None  # for email
+        attach_pdf: bool = True  # attach the per-bill sliced PDF (whatsapp/email only)
 
     def _render(tpl: str, b: dict) -> str:
         for k, v in {
@@ -173,39 +282,133 @@ def build_features_router(*, db, current_user, require_roles, audit, emit_event,
             tpl = tpl.replace("{{" + k + "}}", v)
         return tpl
 
+    async def _read_bill_pdf_bytes(bill: dict) -> Optional[bytes]:
+        """Fetch the sliced PDF bytes from GridFS for the given bill. Returns None if unavailable."""
+        gid = bill.get("pdf_gridfs_id")
+        if not gid or media_fs is None:
+            return None
+        from bson import ObjectId
+        try:
+            stream = await media_fs.open_download_stream(ObjectId(gid))
+            return await stream.read()
+        except Exception as e:
+            log.warning(f"read bill pdf failed {gid}: {e}")
+            return None
+
+    async def _send_whatsapp_bill_pdf(company_id: Optional[str], to_phone: str,
+                                     pdf_bytes: bytes, pdf_filename: str,
+                                     caption: str) -> Dict[str, Any]:
+        """Upload the PDF to Meta and send as a WhatsApp document message."""
+        if not meta_wa or not meta_wa_credentials:
+            return {"ok": False, "error": "WhatsApp media adapter not wired"}
+        creds = await meta_wa_credentials(company_id)
+        if not creds:
+            return {"ok": False, "error": "WhatsApp not configured for this tenant"}
+        try:
+            up = await meta_wa.upload_media(creds, pdf_bytes, pdf_filename, "application/pdf")
+            if not up.get("ok"):
+                return {"ok": False, "error": up.get("error") or "upload failed"}
+            resp = await meta_wa.send_media_message(
+                creds, to_phone, "document",
+                media_id=up["media_id"],
+                caption=caption or None,
+                filename=pdf_filename,
+            )
+            return {"ok": True, "provider_message_id": resp.get("provider_message_id")}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:300]}
+
     @router.post("/bills/send")
     async def send_bills(body: BillSendIn, user: dict = Depends(current_user)):
         if body.channel not in ("sms", "whatsapp", "email"):
             raise HTTPException(400, "channel must be sms | whatsapp | email")
         bills = await db.bills.find(cflt(user, {"id": {"$in": body.bill_ids}}), {"_id": 0}).to_list(len(body.bill_ids))
-        sent, skipped = 0, 0
+        sent, skipped, no_pdf = 0, 0, 0
+        attach_enabled = bool(body.attach_pdf) and body.channel in ("whatsapp", "email")
+
         for b in bills:
             recipient = b.get("email") if body.channel == "email" else b.get("phone")
             if not recipient:
                 skipped += 1; continue
             body_text = _render(body.message_template, b)
             mid = _new_id()
+            pdf_filename = f"bill-{(b.get('property_id') or b.get('name') or b['id'])[:32]}.pdf"
+
+            provider_msg_id = None
+            status = "queued"
+            send_error = None
+            attached = False
+
+            if attach_enabled:
+                pdf_bytes = await _read_bill_pdf_bytes(b)
+                if pdf_bytes:
+                    if body.channel == "whatsapp":
+                        r = await _send_whatsapp_bill_pdf(user.get("company_id"),
+                                                         b.get("phone"), pdf_bytes,
+                                                         pdf_filename, body_text)
+                        if r.get("ok"):
+                            provider_msg_id = r.get("provider_message_id")
+                            status = "sent"; attached = True
+                        else:
+                            send_error = r.get("error")
+                    elif body.channel == "email":
+                        if email_service is not None:
+                            r = await email_service.send(
+                                to=recipient,
+                                subject=(body.subject or "Your bill"),
+                                html=f"<pre style='font-family:inherit;white-space:pre-wrap'>{body_text}</pre>",
+                                text=body_text,
+                                attachments=[{
+                                    "filename": pdf_filename,
+                                    "content_b64": base64.b64encode(pdf_bytes).decode(),
+                                    "content_type": "application/pdf",
+                                }],
+                            )
+                            if r.get("ok"):
+                                provider_msg_id = r.get("id")
+                                status = "sent"; attached = True
+                            else:
+                                send_error = r.get("error")
+                else:
+                    no_pdf += 1
+
+            # Fallback to text-only adapter path when we didn't already send with attachment
+            if not attached:
+                adapter = ADAPTERS.get(body.channel)
+                if adapter:
+                    try:
+                        resp = await adapter.send(recipient, body_text, None, company_id=user.get("company_id"))
+                        provider_msg_id = resp.get("provider_message_id")
+                        status = "sent"
+                    except Exception as e:
+                        log.error(f"bill send failed: {e}")
+                        send_error = str(e)[:300]
+
             await db.messages.insert_one({
                 "id": mid, "channel": body.channel, "contact_id": b["id"],
                 "direction": "outbound", "body": body_text,
-                "status": "queued", "provider_message_id": None,
+                "status": status, "provider_message_id": provider_msg_id,
                 "campaign_id": None, "company_id": user.get("company_id"),
-                "meta": {"bill_id": b["id"], "subject": body.subject},
+                "meta": {"bill_id": b["id"], "subject": body.subject,
+                         "pdf_attached": attached, "error": send_error},
                 "created_at": _iso(_now()), "updated_at": _iso(_now()),
             })
-            # dispatch via existing mock adapter (email uses a new mock adapter we register at startup)
-            adapter = ADAPTERS.get(body.channel)
-            if adapter:
-                try:
-                    resp = await adapter.send(recipient, body_text, None, company_id=user.get("company_id"))
-                    await db.messages.update_one({"id": mid}, {"$set": {"provider_message_id": resp.get("provider_message_id")}})
+            # Simulate lifecycle only for mock/text sends where we relied on the adapter
+            if not attached and status == "sent":
+                adapter = ADAPTERS.get(body.channel)
+                if adapter:
                     asyncio.create_task(_deliver(mid, body.channel, adapter))
-                except Exception as e:
-                    log.error(f"bill send failed: {e}")
-            await db.bills.update_one({"id": b["id"]}, {"$set": {f"sent.{body.channel}": True, f"sent_at.{body.channel}": _iso(_now())}})
+
+            await db.bills.update_one({"id": b["id"]},
+                {"$set": {f"sent.{body.channel}": True,
+                          f"sent_at.{body.channel}": _iso(_now()),
+                          f"sent_with_pdf.{body.channel}": attached}})
             sent += 1
-        await audit("bills_sent", "bills", "", user, {"channel": body.channel, "sent": sent, "skipped": skipped})
-        return {"sent": sent, "skipped": skipped}
+        await audit("bills_sent", "bills", "", user, {"channel": body.channel, "sent": sent,
+                                                     "skipped": skipped, "no_pdf": no_pdf,
+                                                     "attach_pdf": attach_enabled})
+        return {"sent": sent, "skipped": skipped, "no_pdf": no_pdf,
+                "attach_pdf": attach_enabled}
 
     async def _deliver(mid: str, channel: str, adapter):
         try:

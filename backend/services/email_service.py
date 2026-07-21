@@ -33,19 +33,29 @@ class EmailService:
         return "none"
 
     async def send(self, to: str, subject: str, html: str,
-                   text: Optional[str] = None, reply_to: Optional[str] = None) -> dict:
-        """Send an email. Returns {ok, provider, id?, error?}. Never raises."""
+                   text: Optional[str] = None, reply_to: Optional[str] = None,
+                   attachments: Optional[list] = None) -> dict:
+        """Send an email. Returns {ok, provider, id?, error?}. Never raises.
+
+        attachments: List[{"filename": str, "content_b64": str, "content_type": str?}]
+        """
         if not to or not subject: return {"ok": False, "error": "to/subject required"}
         if not self.configured:
-            log.info(f"[email:mock] to={to} subject={subject!r} (no key set)")
+            log.info(f"[email:mock] to={to} subject={subject!r} attachments={len(attachments or [])} (no key set)")
             return {"ok": False, "error": "email service not configured", "provider": "none"}
         try:
             if self.resend_key:
-                async with httpx.AsyncClient(timeout=15.0) as c:
+                async with httpx.AsyncClient(timeout=30.0) as c:
                     payload = {"from": self.email_from, "to": [to],
                                "subject": subject, "html": html}
                     if text: payload["text"] = text
                     if reply_to: payload["reply_to"] = reply_to
+                    if attachments:
+                        # Resend expects: [{filename, content (base64)}]
+                        payload["attachments"] = [
+                            {"filename": a["filename"], "content": a["content_b64"]}
+                            for a in attachments if a.get("content_b64")
+                        ]
                     r = await c.post("https://api.resend.com/emails",
                                      headers={"Authorization": f"Bearer {self.resend_key}",
                                               "Content-Type": "application/json"},
@@ -56,13 +66,20 @@ class EmailService:
                             "error": (data.get("message") or data.get("error") or r.text)}
                 return {"ok": True, "provider": "resend", "id": data.get("id")}
             # SendGrid fallback
-            async with httpx.AsyncClient(timeout=15.0) as c:
+            async with httpx.AsyncClient(timeout=30.0) as c:
                 payload = {
                     "personalizations": [{"to": [{"email": to}], "subject": subject}],
                     "from": {"email": self.email_from},
                     "content": [{"type": "text/html", "value": html}],
                 }
                 if reply_to: payload["reply_to"] = {"email": reply_to}
+                if attachments:
+                    payload["attachments"] = [
+                        {"filename": a["filename"], "content": a["content_b64"],
+                         "type": a.get("content_type") or "application/pdf",
+                         "disposition": "attachment"}
+                        for a in attachments if a.get("content_b64")
+                    ]
                 r = await c.post("https://api.sendgrid.com/v3/mail/send",
                                  headers={"Authorization": f"Bearer {self.sendgrid_key}",
                                           "Content-Type": "application/json"},

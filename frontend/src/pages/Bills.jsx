@@ -9,7 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { ChannelBadge } from "@/components/Badges";
-import { Upload, FileText, Send, Mail, MessageCircle, MessageSquare, Trash2, Loader2, Sparkles, AlarmClock, CheckCircle2 } from "lucide-react";
+import { Upload, FileText, Send, Mail, MessageCircle, MessageSquare, Trash2, Loader2, Sparkles, AlarmClock, CheckCircle2, Paperclip, Eye } from "lucide-react";
 import { toast } from "sonner";
 
 const DEFAULT_TPL = "Dear {{name}}, your property bill #{{property_id}} for INR {{amount}} is due {{due_date}}. Please pay at the earliest.";
@@ -28,6 +28,7 @@ export default function Bills() {
   const [tpl, setTpl] = useState(DEFAULT_TPL);
   const [subj, setSubj] = useState(DEFAULT_SUBJECT);
   const [sending, setSending] = useState(false);
+  const [attachPdf, setAttachPdf] = useState(true);
 
   const loadAll = async () => {
     const [b, bs] = await Promise.all([
@@ -78,13 +79,27 @@ export default function Bills() {
         bill_ids: Array.from(selected),
         message_template: tpl,
         subject: sendChannel === "email" ? subj : undefined,
+        attach_pdf: sendChannel === "sms" ? false : attachPdf,
       });
-      toast.success(`Sent ${data.sent} via ${sendChannel.toUpperCase()}${data.skipped ? `, skipped ${data.skipped}` : ""}`);
+      const attachedNote = data.attach_pdf ? " with PDF" : "";
+      const noPdfNote = data.no_pdf ? `, ${data.no_pdf} without PDF` : "";
+      toast.success(`Sent ${data.sent}${attachedNote} via ${sendChannel.toUpperCase()}${data.skipped ? `, skipped ${data.skipped}` : ""}${noPdfNote}`);
       setSendOpen(false);
       setSelected(new Set());
       loadAll();
     } catch (err) { toast.error(err.response?.data?.detail || "Send failed"); }
     finally { setSending(false); }
+  };
+
+  const viewBillPdf = async (billId) => {
+    try {
+      const resp = await api.get(`/bills/${billId}/pdf`, { responseType: "blob" });
+      const url = URL.createObjectURL(new Blob([resp.data], { type: "application/pdf" }));
+      window.open(url, "_blank", "noopener,noreferrer");
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "PDF not available for this bill");
+    }
   };
 
   const enableReminders = async () => {
@@ -210,12 +225,22 @@ export default function Bills() {
                     }
                   </td>
                   <td className="px-3 py-2 text-right">
-                    {!b.paid && (
-                      <Button size="sm" variant="ghost" className="rounded-sm h-7 px-2 gap-1 text-emerald-700 hover:text-emerald-800"
-                        onClick={() => markPaid(b.id)} data-testid={`bill-mark-paid-${b.id}`}>
-                        <CheckCircle2 className="h-3 w-3" /> Paid
-                      </Button>
-                    )}
+                    <div className="flex items-center justify-end gap-1">
+                      {b.pdf_gridfs_id && (
+                        <Button size="sm" variant="ghost" className="rounded-sm h-7 px-2 gap-1"
+                          onClick={() => viewBillPdf(b.id)}
+                          data-testid={`bill-view-pdf-${b.id}`}
+                          title="View this bill's individual PDF">
+                          <Eye className="h-3 w-3" /> PDF
+                        </Button>
+                      )}
+                      {!b.paid && (
+                        <Button size="sm" variant="ghost" className="rounded-sm h-7 px-2 gap-1 text-emerald-700 hover:text-emerald-800"
+                          onClick={() => markPaid(b.id)} data-testid={`bill-mark-paid-${b.id}`}>
+                          <CheckCircle2 className="h-3 w-3" /> Paid
+                        </Button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -244,6 +269,28 @@ export default function Bills() {
               <Label>Message template</Label>
               <Textarea rows={5} value={tpl} onChange={e => setTpl(e.target.value)} className="rounded-sm font-mono text-xs" data-testid="bills-send-template" />
             </div>
+            {(sendChannel === "whatsapp" || sendChannel === "email") && (
+              <label className="flex items-start gap-2 rounded-sm border border-dashed border-border p-3 cursor-pointer hover:bg-accent/40"
+                     data-testid="bills-attach-pdf-toggle">
+                <Checkbox checked={attachPdf} onCheckedChange={(v) => setAttachPdf(!!v)} className="mt-0.5" />
+                <div className="flex-1">
+                  <div className="text-sm font-medium flex items-center gap-2">
+                    <Paperclip className="h-3.5 w-3.5" /> Attach each recipient&apos;s individual bill PDF
+                  </div>
+                  <div className="text-[11px] text-muted-foreground mt-0.5">
+                    {sendChannel === "whatsapp"
+                      ? "Sends the sliced 1-page PDF as a WhatsApp document."
+                      : "Sends the sliced 1-page PDF as an email attachment."}
+                    {" "}Bills without a stored PDF will fall back to text-only.
+                  </div>
+                </div>
+              </label>
+            )}
+            {sendChannel === "sms" && (
+              <div className="rounded-sm border border-dashed border-border p-3 text-[11px] text-muted-foreground">
+                SMS does not support attachments — only the message text will be delivered.
+              </div>
+            )}
           </div>
           <DialogFooter>
             <Button variant="outline" className="rounded-sm" onClick={() => setSendOpen(false)}>Cancel</Button>

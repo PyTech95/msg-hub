@@ -4515,4 +4515,6 @@ from features import build_features_router
 app.include_router(build_features_router(
     db=db, current_user=current_user, require_roles=require_roles,
     audit=audit, emit_event=emit_event, ADAPTERS=ADAPTERS, cflt=cflt,
+    media_fs=media_fs, meta_wa=meta_wa,
+    meta_wa_credentials=meta_wa_credentials, email_service=email_service,
 ))
