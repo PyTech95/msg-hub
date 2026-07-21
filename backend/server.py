@@ -416,7 +416,9 @@ async def meta_wa_credentials(company_id: Optional[str] = None,
     """Resolve live credentials for a specific WhatsApp phone number.
     Resolution order:
     1) Per-tenant number in `company_whatsapp_configs`:
-       - If phone_number_id given: exact match
+       - If phone_number_id given: exact match. If matched row is mock or inactive,
+         raise a 400 to avoid silently falling through to env creds (would surprise the caller
+         with a completely different sender number).
        - Else: primary number (is_primary=True), fallback to first active
     2) Global Provider Vault (`provider_accounts` where provider_key='meta_whatsapp')
     3) Environment variables (WHATSAPP_ACCESS_TOKEN + WHATSAPP_PHONE_NUMBER_ID)
@@ -424,17 +426,28 @@ async def meta_wa_credentials(company_id: Optional[str] = None,
     """
     # 1) Per-tenant
     if company_id:
-        q: Dict[str, Any] = {"company_id": company_id, "is_active": True}
         if phone_number_id:
-            q["phone_number_id"] = phone_number_id
-        cfg = None
-        if phone_number_id:
-            cfg = await db.company_whatsapp_configs.find_one(q, {"_id": 0})
-        else:
-            # Primary first, then any active
             cfg = await db.company_whatsapp_configs.find_one(
-                {**q, "is_primary": True}, {"_id": 0}
-            ) or await db.company_whatsapp_configs.find_one(q, {"_id": 0})
+                {"company_id": company_id, "phone_number_id": phone_number_id}, {"_id": 0})
+            if cfg:
+                if not cfg.get("is_active", True):
+                    raise HTTPException(400, f"Selected number {phone_number_id} is disabled for this tenant.")
+                if cfg.get("mock", True):
+                    raise HTTPException(400, f"Selected number {phone_number_id} is in Mock mode. Turn Mock off in WA Numbers to send live messages from this number.")
+                if cfg.get("access_token") and cfg.get("phone_number_id"):
+                    return {
+                        "access_token": cfg["access_token"],
+                        "phone_number_id": cfg["phone_number_id"],
+                        "graph_version": cfg.get("graph_version") or os.environ.get("GRAPH_API_VERSION") or "v22.0",
+                        "waba_id": cfg.get("waba_id") or "",
+                    }
+                raise HTTPException(400, f"Selected number {phone_number_id} is missing an access_token. Update it in WA Numbers.")
+            raise HTTPException(400, f"Phone number {phone_number_id} is not configured for this tenant.")
+        # No specific pnid requested → try primary first, then any active
+        cfg = await db.company_whatsapp_configs.find_one(
+            {"company_id": company_id, "is_active": True, "is_primary": True}, {"_id": 0}
+        ) or await db.company_whatsapp_configs.find_one(
+            {"company_id": company_id, "is_active": True}, {"_id": 0})
         if (cfg and not cfg.get("mock", True)
                 and cfg.get("access_token") and cfg.get("phone_number_id")):
             return {
@@ -1563,6 +1576,19 @@ async def send_message(body: SendMessageIn, background: BackgroundTasks, user: d
             resp = await adapter.send(contact["phone"], body.body, body.media_url,
                                        company_id=user.get("company_id"),
                                        phone_number_id=body.phone_number_id)
+    except HTTPException as he:
+        # Refund on validation failure (mock/inactive number, etc.) before re-raising as-is
+        if user.get("company_id") and price_paise > 0:
+            await db.wallets.update_one({"company_id": user["company_id"]},
+                                        {"$inc": {"balance_paise": price_paise},
+                                         "$set": {"updated_at": iso(now_utc())}})
+            await db.wallet_transactions.insert_one({
+                "id": new_id(), "company_id": user["company_id"], "type": "credit",
+                "amount_paise": price_paise, "meta": {"reason": "send_failed_refund", "message_id": mid},
+                "created_at": iso(now_utc()),
+            })
+        await emit_event(mid, "failed", reason=str(he.detail))
+        raise he
     except Exception as e:
         # Refund the wallet — send failed at provider level
         if user.get("company_id") and price_paise > 0:
@@ -2121,6 +2147,19 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
             resp = await ADAPTERS["whatsapp"].send(phone, body.message, body.media_url,
                                                     company_id=user.get("company_id"),
                                                     phone_number_id=body.phone_number_id)
+    except HTTPException as he:
+        # Refund on validation failure (mock/inactive number, etc.) before re-raising as-is
+        if user.get("company_id") and price_paise > 0:
+            await db.wallets.update_one({"company_id": user["company_id"]},
+                                        {"$inc": {"balance_paise": price_paise},
+                                         "$set": {"updated_at": iso(now_utc())}})
+            await db.wallet_transactions.insert_one({
+                "id": new_id(), "company_id": user["company_id"], "type": "credit",
+                "amount_paise": price_paise, "meta": {"reason": "send_failed_refund", "message_id": mid},
+                "created_at": iso(now_utc()),
+            })
+        await emit_event(mid, "failed", reason=str(he.detail), source="meta_whatsapp")
+        raise he
     except Exception as e:
         # Refund the wallet on provider failure
         if user.get("company_id") and price_paise > 0:
@@ -2473,9 +2512,12 @@ async def test_phone_number(phone_number_id: str,
     """Health-check a specific number's credentials against Meta Graph API."""
     if not user.get("company_id"):
         raise HTTPException(400, "SA cannot test tenant-scoped numbers here.")
-    creds = await meta_wa_credentials(user["company_id"], phone_number_id)
+    try:
+        creds = await meta_wa_credentials(user["company_id"], phone_number_id)
+    except HTTPException as e:
+        return {"ok": False, "message": e.detail, "phone_number_id": phone_number_id}
     if not creds or creds.get("phone_number_id") != phone_number_id:
-        return {"ok": False, "message": "Number not configured or is set to Mock mode"}
+        return {"ok": False, "message": "Number not configured"}
     result = await meta_wa.health_check(creds)
     return {"ok": result["ok"], "message": result["message"], "phone_number_id": phone_number_id}
 
@@ -2486,7 +2528,10 @@ async def sync_phone_number(phone_number_id: str,
     """Fetch display name, quality rating, and messaging limit from Meta and cache locally."""
     if not user.get("company_id"):
         raise HTTPException(400, "SA cannot sync tenant-scoped numbers here.")
-    creds = await meta_wa_credentials(user["company_id"], phone_number_id)
+    try:
+        creds = await meta_wa_credentials(user["company_id"], phone_number_id)
+    except HTTPException:
+        raise HTTPException(400, "Cannot sync — number is in Mock mode or is disabled. Enable it first.")
     if not creds:
         raise HTTPException(400, "Number not configured")
     graph_v = creds.get("graph_version", "v22.0")

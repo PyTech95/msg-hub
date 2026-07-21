@@ -226,19 +226,22 @@ export default function WhatsAppNumbers() {
                 <Input value={form.verified_name} onChange={e => setForm({ ...form, verified_name: e.target.value })} placeholder="MyCompany Sales" className="rounded-sm" />
               </div>
             </div>
-            <div className="flex items-center gap-6">
-              <label className="flex items-center gap-2 text-xs cursor-pointer">
-                <Switch checked={form.is_primary} onCheckedChange={(v) => setForm({ ...form, is_primary: v })} data-testid="add-is-primary" />
-                Set as primary sender
-              </label>
-              <label className="flex items-center gap-2 text-xs cursor-pointer">
-                <Switch checked={form.mock} onCheckedChange={(v) => setForm({ ...form, mock: v })} data-testid="add-mock" />
-                Mock mode (skip Meta)
-              </label>
-            </div>
-            <div className="text-[10px] text-muted-foreground">
-              Tip: The first number added is automatically the primary sender. You can promote another number later.
-            </div>
+              <div className="flex items-center gap-6">
+                <label className="flex items-center gap-2 text-xs cursor-pointer">
+                  <Switch checked={form.is_primary} onCheckedChange={(v) => setForm({ ...form, is_primary: v })} data-testid="add-is-primary" />
+                  Set as primary sender
+                </label>
+                <label className="flex items-center gap-2 text-xs cursor-pointer">
+                  <Switch checked={form.mock} onCheckedChange={(v) => setForm({ ...form, mock: v })} data-testid="add-mock" />
+                  Mock mode
+                </label>
+              </div>
+              <div className="text-[10px] text-muted-foreground -mt-1">
+                <strong>Mock mode</strong>: skip live Meta calls (useful for testing / demos). Turn OFF to send real messages.
+              </div>
+              <div className="text-[10px] text-muted-foreground">
+                Tip: The first number added is automatically the primary sender. You can promote another number later.
+              </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowAdd(false)}>Cancel</Button>
