@@ -303,6 +303,8 @@ class SendMessageIn(BaseModel):
     template_name: Optional[str] = None
     template_language: Optional[str] = "en_US"
     template_components: Optional[List[Dict[str, Any]]] = None
+    # Multi-number: which WhatsApp phone_number_id to send from. None → tenant's primary number.
+    phone_number_id: Optional[str] = None
 
 class CallIn(BaseModel):
     contact_id: str
@@ -409,17 +411,30 @@ except Exception as _e:
 # ── Meta WhatsApp Cloud API adapter (per-tenant → vault → env; mock fallback) ──
 from adapters import meta_whatsapp as meta_wa
 
-async def meta_wa_credentials(company_id: Optional[str] = None) -> Optional[Dict[str, str]]:
-    """Resolve live credentials:
-    1) Per-tenant config in `company_whatsapp_configs`
+async def meta_wa_credentials(company_id: Optional[str] = None,
+                              phone_number_id: Optional[str] = None) -> Optional[Dict[str, str]]:
+    """Resolve live credentials for a specific WhatsApp phone number.
+    Resolution order:
+    1) Per-tenant number in `company_whatsapp_configs`:
+       - If phone_number_id given: exact match
+       - Else: primary number (is_primary=True), fallback to first active
     2) Global Provider Vault (`provider_accounts` where provider_key='meta_whatsapp')
     3) Environment variables (WHATSAPP_ACCESS_TOKEN + WHATSAPP_PHONE_NUMBER_ID)
     Returns None → adapter runs in mock (demo) or hard-fails (production).
     """
     # 1) Per-tenant
     if company_id:
-        cfg = await db.company_whatsapp_configs.find_one(
-            {"company_id": company_id, "is_active": True}, {"_id": 0})
+        q: Dict[str, Any] = {"company_id": company_id, "is_active": True}
+        if phone_number_id:
+            q["phone_number_id"] = phone_number_id
+        cfg = None
+        if phone_number_id:
+            cfg = await db.company_whatsapp_configs.find_one(q, {"_id": 0})
+        else:
+            # Primary first, then any active
+            cfg = await db.company_whatsapp_configs.find_one(
+                {**q, "is_primary": True}, {"_id": 0}
+            ) or await db.company_whatsapp_configs.find_one(q, {"_id": 0})
         if (cfg and not cfg.get("mock", True)
                 and cfg.get("access_token") and cfg.get("phone_number_id")):
             return {
@@ -541,7 +556,23 @@ async def on_startup():
     await db.password_reset_tokens.create_index("token", unique=True)
     await db.system_settings.create_index("key", unique=True)
     await db.login_attempts.create_index("identifier")
-    await db.company_whatsapp_configs.create_index("company_id", unique=True)
+    # Multi-number per tenant: drop legacy unique-on-company_id if it exists, then
+    # ensure compound unique index. New rows carry `phone_number_id` + `is_primary`.
+    try:
+        idx_info = await db.company_whatsapp_configs.index_information()
+        for name, spec in idx_info.items():
+            keys = spec.get("key", [])
+            if spec.get("unique") and len(keys) == 1 and keys[0][0] == "company_id":
+                await db.company_whatsapp_configs.drop_index(name)
+                log.info("Dropped legacy single-column unique index %s on company_whatsapp_configs", name)
+    except Exception as e:
+        log.warning("index migration on company_whatsapp_configs skipped: %s", e)
+    await db.company_whatsapp_configs.create_index([("company_id", 1), ("phone_number_id", 1)], unique=True, sparse=True)
+    await db.company_whatsapp_configs.create_index([("company_id", 1), ("is_primary", 1)])
+    # Backfill: existing single-number rows get is_primary=True
+    await db.company_whatsapp_configs.update_many(
+        {"is_primary": {"$exists": False}}, {"$set": {"is_primary": True}}
+    )
     await db.wallets.create_index("company_id", unique=True)
     await db.wallet_transactions.create_index([("company_id", 1), ("created_at", -1)])
     await db.wallet_recharge_orders.create_index("razorpay_order_id", unique=True)
@@ -1526,9 +1557,12 @@ async def send_message(body: SendMessageIn, background: BackgroundTasks, user: d
                 language_code=(body.template_language or "en_US").strip(),
                 components=body.template_components or None,
                 company_id=user.get("company_id"),
+                phone_number_id=body.phone_number_id,
             )
         else:
-            resp = await adapter.send(contact["phone"], body.body, body.media_url, company_id=user.get("company_id"))
+            resp = await adapter.send(contact["phone"], body.body, body.media_url,
+                                       company_id=user.get("company_id"),
+                                       phone_number_id=body.phone_number_id)
     except Exception as e:
         # Refund the wallet — send failed at provider level
         if user.get("company_id") and price_paise > 0:
@@ -1543,7 +1577,10 @@ async def send_message(body: SendMessageIn, background: BackgroundTasks, user: d
         await emit_event(mid, "failed", reason=str(e))
         # Return 400 (not 502) so Cloudflare doesn't swallow the JSON body with its own 5xx page.
         raise HTTPException(400, f"Send failed: {e}")
-    await db.messages.update_one({"id": mid}, {"$set": {"provider_message_id": resp["provider_message_id"]}})
+    await db.messages.update_one({"id": mid}, {"$set": {
+        "provider_message_id": resp["provider_message_id"],
+        "phone_number_id": resp.get("phone_number_id_used") or body.phone_number_id,
+    }})
     await db.conversations.update_one(
         {"contact_id": body.contact_id, "channel": body.channel},
         {"$set": {"last_message_at": iso(now_utc()), "last_message": body.body, "company_id": user.get("company_id")}}, upsert=True,
@@ -1890,7 +1927,8 @@ async def _meta_handle_status(st: Dict[str, Any]):
             extra["errors"] = st["errors"]
         await emit_event(msg["id"], internal, **extra)
 
-async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict], company_id: Optional[str] = None):
+async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict], company_id: Optional[str] = None,
+                                phone_number_id: Optional[str] = None):
     pid = m.get("id")
     if pid and await db.messages.find_one({"provider_message_id": str(pid)}):
         return  # already processed (Meta retries webhooks)
@@ -1960,6 +1998,7 @@ async def _meta_handle_inbound(m: Dict[str, Any], contacts_info: List[dict], com
         "body": body_txt, "status": "received",
         "provider_message_id": str(pid) if pid else f"meta_in_{secrets.token_hex(6)}",
         "campaign_id": None, "company_id": resolved_company_id,
+        "phone_number_id": phone_number_id,  # which of the tenant's numbers received this
         "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
     }
     if media_meta:
@@ -2009,11 +2048,12 @@ async def meta_whatsapp_webhook(request: _FRequest):
             if change.get("field") != "messages":
                 continue
             value = change.get("value", {}) or {}
+            recv_phone_id = ((value.get("metadata") or {}).get("phone_number_id") or "").strip() or None
             for st in value.get("statuses", []) or []:
                 await _meta_handle_status(st)
                 n_status += 1
             for m in value.get("messages", []) or []:
-                await _meta_handle_inbound(m, value.get("contacts", []) or [])
+                await _meta_handle_inbound(m, value.get("contacts", []) or [], phone_number_id=recv_phone_id)
                 n_inbound += 1
     log.info("Meta WA webhook processed: %s status update(s), %s inbound message(s)", n_status, n_inbound)
     return {"status": "received"}
@@ -2025,6 +2065,7 @@ class WhatsAppSendIn(BaseModel):
     template_name: Optional[str] = None
     template_language: Optional[str] = "en_US"
     template_components: Optional[List[Dict[str, Any]]] = None
+    phone_number_id: Optional[str] = None  # Multi-number: pick which sender number to use
 
 @api.post("/whatsapp/send-message")
 async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTasks, user: dict = Depends(current_user)):
@@ -2074,9 +2115,12 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
                 language_code=(body.template_language or "en_US").strip(),
                 components=body.template_components or None,
                 company_id=user.get("company_id"),
+                phone_number_id=body.phone_number_id,
             )
         else:
-            resp = await ADAPTERS["whatsapp"].send(phone, body.message, body.media_url, company_id=user.get("company_id"))
+            resp = await ADAPTERS["whatsapp"].send(phone, body.message, body.media_url,
+                                                    company_id=user.get("company_id"),
+                                                    phone_number_id=body.phone_number_id)
     except Exception as e:
         # Refund the wallet on provider failure
         if user.get("company_id") and price_paise > 0:
@@ -2091,7 +2135,10 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
         await emit_event(mid, "failed", reason=str(e), source="meta_whatsapp")
         # Return 400 (not 502) so Cloudflare passes the JSON error body through to the UI.
         raise HTTPException(400, f"WhatsApp send failed: {e}")
-    await db.messages.update_one({"id": mid}, {"$set": {"provider_message_id": resp["provider_message_id"]}})
+    await db.messages.update_one({"id": mid}, {"$set": {
+        "provider_message_id": resp["provider_message_id"],
+        "phone_number_id": resp.get("phone_number_id_used") or body.phone_number_id,
+    }})
     await db.conversations.update_one(
         {"contact_id": cid, "channel": "whatsapp"},
         {"$set": {"last_message_at": iso(now_utc()), "last_message": body.message, "company_id": user.get("company_id")}}, upsert=True,
@@ -2126,6 +2173,7 @@ async def whatsapp_setup(_: dict = Depends(platform_only("super_admin", "admin")
 def _mask_wa(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Return a safe view of a company WA config (masks token / app_secret)."""
     out: Dict[str, Any] = {
+        "id": cfg.get("id"),
         "company_id": cfg.get("company_id"),
         "phone_number_id": cfg.get("phone_number_id") or "",
         "waba_id": cfg.get("waba_id") or "",
@@ -2133,6 +2181,13 @@ def _mask_wa(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "verify_token": cfg.get("verify_token") or "",
         "is_active": cfg.get("is_active", True),
         "mock": cfg.get("mock", True),
+        "is_primary": cfg.get("is_primary", False),
+        "display_phone_number": cfg.get("display_phone_number") or "",
+        "verified_name": cfg.get("verified_name") or "",
+        "quality_rating": cfg.get("quality_rating") or "",
+        "messaging_limit": cfg.get("messaging_limit") or "",
+        "last_synced_at": cfg.get("last_synced_at"),
+        "onboarded_via": cfg.get("onboarded_via") or "manual",
         "access_token_set": bool(cfg.get("access_token")),
         "app_secret_set": bool(cfg.get("app_secret")),
         "updated_at": cfg.get("updated_at"),
@@ -2160,7 +2215,12 @@ async def get_wa_config(user: dict = Depends(current_user)):
     """Company Admin/Agent: view own tenant WhatsApp config (masked).
     Super Admin (no company_id): returns platform env/vault info + a summary of tenants."""
     if user.get("company_id"):
-        cfg = await db.company_whatsapp_configs.find_one({"company_id": user["company_id"]}, {"_id": 0})
+        # Legacy single-config endpoint returns the tenant's primary number
+        cfg = await db.company_whatsapp_configs.find_one(
+            {"company_id": user["company_id"], "is_primary": True}, {"_id": 0}
+        ) or await db.company_whatsapp_configs.find_one(
+            {"company_id": user["company_id"]}, {"_id": 0}
+        )
         if not cfg:
             return {
                 "configured": False, "company_id": user["company_id"],
@@ -2194,7 +2254,12 @@ async def put_wa_config(body: WhatsAppConfigIn, user: dict = Depends(require_rol
     A per-tenant `verify_token` is auto-generated on first create."""
     if not user.get("company_id"):
         raise HTTPException(400, "Super Admin does not have a per-tenant WhatsApp config. Use the global Provider Vault instead.")
-    existing = await db.company_whatsapp_configs.find_one({"company_id": user["company_id"]}, {"_id": 0})
+    # Target the tenant's primary number (or auto-create the first row)
+    existing = await db.company_whatsapp_configs.find_one(
+        {"company_id": user["company_id"], "is_primary": True}, {"_id": 0}
+    ) or await db.company_whatsapp_configs.find_one(
+        {"company_id": user["company_id"]}, {"_id": 0}
+    )
     now = iso(now_utc())
     upd: Dict[str, Any] = {"updated_at": now, "updated_by": user.get("email")}
     for k in ("access_token", "phone_number_id", "waba_id", "app_secret", "graph_version"):
@@ -2215,17 +2280,28 @@ async def put_wa_config(body: WhatsAppConfigIn, user: dict = Depends(require_rol
             "verify_token": f"tzs_{secrets.token_urlsafe(24)}",
             "is_active": upd.get("is_active", True),
             "mock": upd.get("mock", False),
+            "is_primary": True,
+            "onboarded_via": "manual",
             "created_at": now, "created_by": user.get("email"),
         })
         await db.company_whatsapp_configs.insert_one(upd)
         await audit("wa_config_created", "wa_config", user["company_id"], user,
                     {"phone_number_id": upd.get("phone_number_id", ""), "mock": upd.get("mock")})
     else:
-        await db.company_whatsapp_configs.update_one(
-            {"company_id": user["company_id"]}, {"$set": upd})
+        # Update using the existing row's phone_number_id (or id) to avoid ambiguity
+        target_filter = {"company_id": user["company_id"]}
+        if existing.get("phone_number_id"):
+            target_filter["phone_number_id"] = existing["phone_number_id"]
+        elif existing.get("id"):
+            target_filter = {"id": existing["id"]}
+        await db.company_whatsapp_configs.update_one(target_filter, {"$set": upd})
         await audit("wa_config_updated", "wa_config", user["company_id"], user,
                     {"fields": sorted([k for k in upd.keys() if k not in ("updated_at","updated_by")])})
-    cfg = await db.company_whatsapp_configs.find_one({"company_id": user["company_id"]}, {"_id": 0})
+    cfg = await db.company_whatsapp_configs.find_one(
+        {"company_id": user["company_id"], "is_primary": True}, {"_id": 0}
+    ) or await db.company_whatsapp_configs.find_one(
+        {"company_id": user["company_id"]}, {"_id": 0}
+    )
     base_url = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
     webhook_path = f"/api/webhook/whatsapp/{user['company_id']}"
     return {
@@ -2238,8 +2314,12 @@ async def put_wa_config(body: WhatsAppConfigIn, user: dict = Depends(require_rol
 
 @api.delete("/whatsapp/config")
 async def delete_wa_config(user: dict = Depends(require_roles("super_admin","admin"))):
+    """Legacy: delete the tenant's primary WhatsApp number. Use DELETE /whatsapp/phone-numbers/{id} for specific numbers."""
     if not user.get("company_id"):
         raise HTTPException(400, "Super Admin does not have a per-tenant WhatsApp config.")
+    n_total = await db.company_whatsapp_configs.count_documents({"company_id": user["company_id"]})
+    if n_total > 1:
+        raise HTTPException(400, "Tenant has multiple WhatsApp numbers. Use DELETE /api/whatsapp/phone-numbers/{phone_number_id} to remove a specific one.")
     res = await db.company_whatsapp_configs.delete_one({"company_id": user["company_id"]})
     await audit("wa_config_deleted", "wa_config", user["company_id"], user)
     return {"ok": True, "deleted": res.deleted_count}
@@ -2256,6 +2336,182 @@ async def test_wa_config(user: dict = Depends(require_roles("super_admin","admin
                 "message": "No live credentials configured for this tenant. Add access_token + phone_number_id and set mock=false."}
     result = await meta_wa.health_check(creds)
     return {"ok": result["ok"], "mode": "live", "message": result["message"], "phone_number_id": creds.get("phone_number_id")}
+
+
+# ─────────── Multi-number per tenant (list / add / update / delete / primary / sync) ───────────
+class WhatsAppPhoneNumberIn(BaseModel):
+    access_token: str
+    phone_number_id: str
+    waba_id: Optional[str] = None
+    app_secret: Optional[str] = None
+    graph_version: Optional[str] = None
+    display_phone_number: Optional[str] = None
+    verified_name: Optional[str] = None
+    mock: Optional[bool] = False
+    is_active: Optional[bool] = True
+    is_primary: Optional[bool] = False
+
+
+class WhatsAppPhoneNumberPatch(BaseModel):
+    access_token: Optional[str] = None
+    waba_id: Optional[str] = None
+    app_secret: Optional[str] = None
+    graph_version: Optional[str] = None
+    display_phone_number: Optional[str] = None
+    verified_name: Optional[str] = None
+    mock: Optional[bool] = None
+    is_active: Optional[bool] = None
+    is_primary: Optional[bool] = None
+
+
+@api.get("/whatsapp/phone-numbers")
+async def list_phone_numbers(user: dict = Depends(require_roles("super_admin","admin","manager","agent"))):
+    """List all WhatsApp phone numbers for the current tenant (masked)."""
+    if not user.get("company_id"):
+        # SA: show all tenants grouped
+        rows = await db.company_whatsapp_configs.find({}, {"_id": 0}).sort([("company_id", 1), ("is_primary", -1)]).to_list(1000)
+        return [_mask_wa(r) for r in rows]
+    rows = await db.company_whatsapp_configs.find(
+        {"company_id": user["company_id"]}, {"_id": 0}
+    ).sort([("is_primary", -1), ("created_at", 1)]).to_list(50)
+    return [_mask_wa(r) for r in rows]
+
+
+@api.post("/whatsapp/phone-numbers")
+async def add_phone_number(body: WhatsAppPhoneNumberIn,
+                           user: dict = Depends(require_roles("super_admin","admin"))):
+    """Add a NEW WhatsApp phone number for the tenant. First number becomes primary automatically."""
+    if not user.get("company_id"):
+        raise HTTPException(400, "Super Admin cannot add tenant-scoped numbers. Use a Company Admin account.")
+    # Prevent duplicate per tenant
+    existing = await db.company_whatsapp_configs.find_one(
+        {"company_id": user["company_id"], "phone_number_id": body.phone_number_id}, {"_id": 0})
+    if existing:
+        raise HTTPException(409, f"Phone number {body.phone_number_id} already added")
+    n_existing = await db.company_whatsapp_configs.count_documents({"company_id": user["company_id"]})
+    is_primary = True if n_existing == 0 else bool(body.is_primary)
+    if is_primary and n_existing > 0:
+        await db.company_whatsapp_configs.update_many(
+            {"company_id": user["company_id"], "is_primary": True}, {"$set": {"is_primary": False}})
+    doc = {
+        "id": new_id(), "company_id": user["company_id"],
+        "phone_number_id": body.phone_number_id,
+        "access_token": body.access_token,
+        "waba_id": body.waba_id or "",
+        "app_secret": body.app_secret or "",
+        "graph_version": body.graph_version or os.environ.get("GRAPH_API_VERSION") or "v22.0",
+        "display_phone_number": body.display_phone_number or "",
+        "verified_name": body.verified_name or "",
+        "mock": bool(body.mock) if body.mock is not None else False,
+        "is_active": True if body.is_active is None else bool(body.is_active),
+        "is_primary": is_primary,
+        "verify_token": f"tzs_{secrets.token_urlsafe(24)}",
+        "onboarded_via": "manual",
+        "created_at": iso(now_utc()), "created_by": user["email"],
+        "updated_at": iso(now_utc()), "updated_by": user["email"],
+    }
+    await db.company_whatsapp_configs.insert_one(doc)
+    await audit("wa_phone_number_added", "wa_phone", body.phone_number_id, user,
+                {"is_primary": is_primary, "display": doc["display_phone_number"]})
+    return _mask_wa(doc)
+
+
+@api.patch("/whatsapp/phone-numbers/{phone_number_id}")
+async def update_phone_number(phone_number_id: str, body: WhatsAppPhoneNumberPatch,
+                              user: dict = Depends(require_roles("super_admin","admin"))):
+    """Update a WhatsApp phone number. Set is_primary=True to make it the tenant's default sender."""
+    if not user.get("company_id"):
+        raise HTTPException(400, "Super Admin cannot edit tenant-scoped numbers.")
+    row = await db.company_whatsapp_configs.find_one(
+        {"company_id": user["company_id"], "phone_number_id": phone_number_id}, {"_id": 0})
+    if not row:
+        raise HTTPException(404, "Phone number not found for this tenant")
+    upd: Dict[str, Any] = {}
+    for f in ("access_token", "waba_id", "app_secret", "graph_version",
+              "display_phone_number", "verified_name", "mock", "is_active"):
+        v = getattr(body, f, None)
+        if v is not None:
+            upd[f] = v
+    if body.is_primary is True and not row.get("is_primary"):
+        # Demote existing primaries
+        await db.company_whatsapp_configs.update_many(
+            {"company_id": user["company_id"], "is_primary": True}, {"$set": {"is_primary": False}})
+        upd["is_primary"] = True
+    elif body.is_primary is False and row.get("is_primary"):
+        raise HTTPException(400, "Cannot un-set primary directly. Promote a different number to primary instead.")
+    upd["updated_at"] = iso(now_utc()); upd["updated_by"] = user["email"]
+    await db.company_whatsapp_configs.update_one(
+        {"company_id": user["company_id"], "phone_number_id": phone_number_id}, {"$set": upd})
+    row = await db.company_whatsapp_configs.find_one(
+        {"company_id": user["company_id"], "phone_number_id": phone_number_id}, {"_id": 0})
+    await audit("wa_phone_number_updated", "wa_phone", phone_number_id, user,
+                {"fields": sorted([k for k in upd.keys() if k not in ("updated_at","updated_by")])})
+    return _mask_wa(row)
+
+
+@api.delete("/whatsapp/phone-numbers/{phone_number_id}")
+async def delete_phone_number(phone_number_id: str,
+                              user: dict = Depends(require_roles("super_admin","admin"))):
+    """Remove a WhatsApp phone number from the tenant. Cannot remove the primary if others exist."""
+    if not user.get("company_id"):
+        raise HTTPException(400, "Super Admin cannot delete tenant-scoped numbers.")
+    row = await db.company_whatsapp_configs.find_one(
+        {"company_id": user["company_id"], "phone_number_id": phone_number_id}, {"_id": 0})
+    if not row:
+        raise HTTPException(404, "Phone number not found")
+    n_total = await db.company_whatsapp_configs.count_documents({"company_id": user["company_id"]})
+    if row.get("is_primary") and n_total > 1:
+        raise HTTPException(400, "Cannot delete the primary number while others exist. Promote another number first.")
+    await db.company_whatsapp_configs.delete_one({"company_id": user["company_id"], "phone_number_id": phone_number_id})
+    await audit("wa_phone_number_deleted", "wa_phone", phone_number_id, user)
+    return {"ok": True}
+
+
+@api.post("/whatsapp/phone-numbers/{phone_number_id}/test")
+async def test_phone_number(phone_number_id: str,
+                            user: dict = Depends(require_roles("super_admin","admin","manager"))):
+    """Health-check a specific number's credentials against Meta Graph API."""
+    if not user.get("company_id"):
+        raise HTTPException(400, "SA cannot test tenant-scoped numbers here.")
+    creds = await meta_wa_credentials(user["company_id"], phone_number_id)
+    if not creds or creds.get("phone_number_id") != phone_number_id:
+        return {"ok": False, "message": "Number not configured or is set to Mock mode"}
+    result = await meta_wa.health_check(creds)
+    return {"ok": result["ok"], "message": result["message"], "phone_number_id": phone_number_id}
+
+
+@api.post("/whatsapp/phone-numbers/{phone_number_id}/sync")
+async def sync_phone_number(phone_number_id: str,
+                            user: dict = Depends(require_roles("super_admin","admin","manager"))):
+    """Fetch display name, quality rating, and messaging limit from Meta and cache locally."""
+    if not user.get("company_id"):
+        raise HTTPException(400, "SA cannot sync tenant-scoped numbers here.")
+    creds = await meta_wa_credentials(user["company_id"], phone_number_id)
+    if not creds:
+        raise HTTPException(400, "Number not configured")
+    graph_v = creds.get("graph_version", "v22.0")
+    url = f"https://graph.facebook.com/{graph_v}/{phone_number_id}"
+    params = {"fields": "verified_name,display_phone_number,quality_rating,messaging_limit_tier,name_status,code_verification_status"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            r = await c.get(url, params=params, headers={"Authorization": f"Bearer {creds['access_token']}"})
+        data = r.json() if r.content else {}
+        if r.status_code >= 400:
+            raise HTTPException(400, (data.get("error") or {}).get("message") or r.text)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Meta sync failed: {e}")
+    upd = {
+        "verified_name": data.get("verified_name") or "",
+        "display_phone_number": data.get("display_phone_number") or "",
+        "quality_rating": data.get("quality_rating") or "",
+        "messaging_limit": data.get("messaging_limit_tier") or "",
+        "last_synced_at": iso(now_utc()),
+    }
+    await db.company_whatsapp_configs.update_one(
+        {"company_id": user["company_id"], "phone_number_id": phone_number_id}, {"$set": upd})
+    return {"ok": True, **upd}
 
 
 # ─────────── Meta Embedded Signup (one-click WhatsApp onboarding) ───────────
@@ -2332,13 +2588,18 @@ async def embedded_signup_exchange(body: EmbeddedSignupIn,
         "onboarded_via": "embedded_signup",
         "updated_at": iso(now_utc()), "updated_by": user["email"],
     }
-    existing = await db.company_whatsapp_configs.find_one({"company_id": user["company_id"]}, {"_id": 0, "verify_token": 1})
+    # Persist per-tenant credentials: upsert against (company_id, phone_number_id) to support multi-number
+    existing = await db.company_whatsapp_configs.find_one(
+        {"company_id": user["company_id"], "phone_number_id": body.phone_number_id}, {"_id": 0})
     if existing and existing.get("verify_token"):
         cfg_doc["verify_token"] = existing["verify_token"]
     else:
         cfg_doc["created_at"] = iso(now_utc()); cfg_doc["created_by"] = user["email"]
+    # First number for this tenant becomes primary automatically
+    n_existing = await db.company_whatsapp_configs.count_documents({"company_id": user["company_id"]})
+    cfg_doc["is_primary"] = (n_existing == 0) or bool(existing and existing.get("is_primary"))
     await db.company_whatsapp_configs.update_one(
-        {"company_id": user["company_id"]},
+        {"company_id": user["company_id"], "phone_number_id": body.phone_number_id},
         {"$set": cfg_doc, "$setOnInsert": {"id": new_id()}}, upsert=True,
     )
     # 3) Subscribe the app to WABA webhooks (best-effort; ignore failure so onboarding still completes)
@@ -2407,8 +2668,10 @@ async def list_wa_templates(status: Optional[str] = None, limit: int = 100,
     """
     is_tenant_user = bool(user.get("company_id"))
     if is_tenant_user:
-        # Strict per-tenant scoping: do NOT inherit env/global creds
+        # Strict per-tenant scoping: primary number's WABA credentials
         cfg = await db.company_whatsapp_configs.find_one(
+            {"company_id": user["company_id"], "is_active": True, "is_primary": True}, {"_id": 0}
+        ) or await db.company_whatsapp_configs.find_one(
             {"company_id": user["company_id"], "is_active": True}, {"_id": 0})
         if not cfg or cfg.get("mock", True) or not cfg.get("access_token") or not cfg.get("phone_number_id"):
             return {"ok": False, "templates": [],
@@ -2481,6 +2744,8 @@ async def _resolve_wa_creds_for_template_write(user: dict) -> Dict[str, str]:
     """Get access_token + waba_id for template CREATE/DELETE (strict tenant isolation for CA)."""
     if user.get("company_id"):
         cfg = await db.company_whatsapp_configs.find_one(
+            {"company_id": user["company_id"], "is_active": True, "is_primary": True}, {"_id": 0}
+        ) or await db.company_whatsapp_configs.find_one(
             {"company_id": user["company_id"], "is_active": True}, {"_id": 0})
         if not cfg or not cfg.get("access_token") or not cfg.get("phone_number_id"):
             raise HTTPException(400, "Tenant WhatsApp is not configured. Add access_token + phone_number_id in Step 2.")
@@ -2964,6 +3229,7 @@ async def whatsapp_send_media(
     to: str = Form(...),
     caption: str = Form(""),
     file: UploadFile = File(...),
+    phone_number_id: Optional[str] = Form(None),  # Multi-number: which sender number
     user: dict = Depends(current_user),
 ):
     """Upload media to Meta → send as WhatsApp message → store in GridFS → wallet debit."""
@@ -2992,7 +3258,7 @@ async def whatsapp_send_media(
             "company_id": user.get("company_id"), "created_at": iso(now_utc()),
         })
 
-    creds = await meta_wa_credentials(user.get("company_id"))
+    creds = await meta_wa_credentials(user.get("company_id"), phone_number_id)
     if not creds:
         raise HTTPException(400, "WhatsApp is not configured for this tenant. Ask your admin to set up Meta credentials.")
 
@@ -3017,6 +3283,7 @@ async def whatsapp_send_media(
         "id": mid, "channel": "whatsapp", "contact_id": cid, "direction": "outbound",
         "body": caption, "status": "queued", "provider_message_id": None, "campaign_id": None,
         "company_id": user.get("company_id"),
+        "phone_number_id": creds.get("phone_number_id"),
         "media": {"type": kind, "mime_type": mime, "filename": filename,
                   "size": len(content), "gridfs_id": str(gridfs_id),
                   "caption": caption, "download_status": "done"},
@@ -3136,11 +3403,13 @@ async def meta_whatsapp_webhook_tenant(company_id: str, request: _FRequest):
             if change.get("field") != "messages":
                 continue
             value = change.get("value", {}) or {}
+            recv_phone_id = ((value.get("metadata") or {}).get("phone_number_id") or "").strip() or None
             for st in value.get("statuses", []) or []:
                 await _meta_handle_status(st)
                 n_status += 1
             for m in value.get("messages", []) or []:
-                await _meta_handle_inbound(m, value.get("contacts", []) or [], company_id=company_id)
+                await _meta_handle_inbound(m, value.get("contacts", []) or [], company_id=company_id,
+                                            phone_number_id=recv_phone_id)
                 n_inbound += 1
     log.info("Meta WA tenant %s webhook: %s status update(s), %s inbound message(s)", company_id, n_status, n_inbound)
     return {"status": "received"}

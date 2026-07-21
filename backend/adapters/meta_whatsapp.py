@@ -233,7 +233,8 @@ def build_adapter(BaseAdapter, creds_provider: Callable[..., Awaitable[Optional[
 
         async def send(self, to: str, body: str, media_url: Optional[str] = None, **kwargs) -> Dict[str, Any]:
             company_id = kwargs.get("company_id")
-            creds = await creds_provider(company_id)
+            phone_number_id = kwargs.get("phone_number_id")
+            creds = await creds_provider(company_id, phone_number_id) if phone_number_id else await creds_provider(company_id)
             if not creds:
                 return _mock_or_fail()
             to_clean = _clean_number(to)
@@ -243,17 +244,19 @@ def build_adapter(BaseAdapter, creds_provider: Callable[..., Awaitable[Optional[
             else:
                 payload = {"messaging_product": "whatsapp", "to": to_clean, "type": "text",
                            "text": {"body": body, "preview_url": True}}
-            log.info("Meta WA send → %s (type=%s, company=%s)", to_clean, "image" if media_url else "text", company_id or "-")
+            log.info("Meta WA send → %s (type=%s, company=%s, phone=%s)", to_clean, "image" if media_url else "text", company_id or "-", phone_number_id or "primary")
             data = await graph_post_message(creds, payload)
             pid = ((data.get("messages") or [{}])[0]).get("id") or f"meta_{secrets.token_hex(8)}"
             log.info("Meta WA accepted id=%s", pid)
-            return {"provider_message_id": str(pid), "accepted": True, "mode": "live", "raw": data}
+            return {"provider_message_id": str(pid), "accepted": True, "mode": "live", "raw": data,
+                    "phone_number_id_used": creds.get("phone_number_id")}
 
         async def send_template(self, to: str, template_name: str,
                                 language_code: str = "en_US",
                                 components: Optional[list] = None,
-                                company_id: Optional[str] = None) -> Dict[str, Any]:
-            creds = await creds_provider(company_id)
+                                company_id: Optional[str] = None,
+                                phone_number_id: Optional[str] = None) -> Dict[str, Any]:
+            creds = await creds_provider(company_id, phone_number_id) if phone_number_id else await creds_provider(company_id)
             if not creds:
                 return _mock_or_fail()
             template: Dict[str, Any] = {"name": template_name, "language": {"code": language_code}}
@@ -263,7 +266,8 @@ def build_adapter(BaseAdapter, creds_provider: Callable[..., Awaitable[Optional[
                        "type": "template", "template": template}
             data = await graph_post_message(creds, payload)
             pid = ((data.get("messages") or [{}])[0]).get("id") or f"meta_{secrets.token_hex(8)}"
-            return {"provider_message_id": str(pid), "accepted": True, "mode": "live", "raw": data}
+            return {"provider_message_id": str(pid), "accepted": True, "mode": "live", "raw": data,
+                    "phone_number_id_used": creds.get("phone_number_id")}
 
     return MetaWhatsAppAdapter()
 

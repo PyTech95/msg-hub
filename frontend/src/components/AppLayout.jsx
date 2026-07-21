@@ -5,7 +5,7 @@ import { useRealtime } from "@/hooks/useRealtime";
 import {
   LayoutDashboard, Users, FileText, Megaphone, MessageSquare, Phone,
   BarChart3, Plug, Webhook, UserCog, Settings, Inbox, Sun, Moon, LogOut,
-  ListChecks, ReceiptText, ScrollText, Sparkles, BotMessageSquare, AlarmClock, Building2, MessageCircle,
+  ListChecks, ReceiptText, ScrollText, Sparkles, BotMessageSquare, AlarmClock, Building2, MessageCircle, Smartphone,
   Wallet as WalletIcon
 } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
@@ -38,6 +38,7 @@ const NAV = [
   { to: "/providers",     label: "Providers",     icon: Plug,            roles: ["super_admin","admin"], platformOnly: true },
   { to: "/webhooks",      label: "Webhooks",      icon: Webhook,         roles: ["super_admin","admin"], platformOnly: true },
   { to: "/whatsapp-settings", label: "WhatsApp Setup", icon: MessageCircle, roles: ["super_admin","admin"], tenantOnly: true },
+  { to: "/whatsapp-numbers", label: "WA Numbers", icon: Smartphone, roles: ["super_admin","admin","manager","agent"] },
   { to: "/wallet",        label: "Wallet",        icon: WalletIcon,      roles: ["super_admin","admin"] },
   { to: "/audit-logs",    label: "Audit Logs",    icon: ScrollText,      roles: ["super_admin","admin"] },
   { to: "/team",          label: "Team",          icon: UserCog,         roles: ["super_admin","admin"] },

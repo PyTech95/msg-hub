@@ -1,0 +1,44 @@
+{
+  "summary": "Iteration 17 — P0 Multi-number per tenant. Backend 19/19 pytest passing; Frontend UI verified end-to-end. Covered: migration state (existing NSTU row backfilled is_primary=True, compound unique index on (company_id, phone_number_id) present, legacy single-column unique dropped), CRUD (GET/POST/PATCH/DELETE /api/whatsapp/phone-numbers with masked tokens, SA cannot POST/PATCH/DELETE tenant-scoped rows, duplicate pnid → 409, first number auto-primary, PATCH promote demotes others, cannot un-set primary → 400, cannot delete primary while >1 numbers, can delete last remaining), per-number /test and /sync endpoints, legacy /whatsapp/config back-compat (PUT still writes primary row, GET returns primary, DELETE now 400s when >1 numbers), send-message route accepts phone_number_id and persists it, templates endpoint scoped to primary WABA (NSTU mock primary → error message as expected), inbound webhook extracts value.metadata.phone_number_id and persists on message doc. Frontend: /whatsapp-numbers loads for both SA (all tenants, no actions) and tenant admin (Add Number button visible, dialog opens with all data-testid inputs, first number added is auto-primary shown with ★, second number added as non-primary, both visible in table). ContactProfile: with 2 numbers, wa-sender-picker appears above mode toggle showing ★ primary + secondary; select_option changes value correctly and payload will include phone_number_id.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/messages/send + /api/whatsapp/send-message (any send route)", "issue": "Silent env-cred fallback overrides caller-specified phone_number_id when the specified per-tenant row is mock=True. meta_wa_credentials(company_id, phone_number_id) returns None for mock rows and the code falls through to Provider Vault → env creds — the outbound Meta call then uses the env number (e.g. 1139736612564634) and resp.phone_number_id_used stored on the message doc is that env number, not the caller's request. Confirmed via test: sent with phone_number_id='SND_xxx' (mock row) → message doc persisted phone_number_id='1139736612564634'. Impact: for tenants that mix mock + live numbers, a user selecting a mock sender in ContactProfile picker will actually dispatch from the platform env number. Recommendation: when a per-tenant row exists for the requested phone_number_id but is mock/inactive, do NOT fall through to env — either (a) route through mock adapter path preserving pnid, or (b) return 400 'Selected number is in Mock mode / disabled'."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "/whatsapp-numbers table (tenant admin)", "issues": ["Status column shows 'LIVE' badge for a number saved with mock left ON in the dialog (dialog default mock=True). The row correctly persisted mock=True but the UI badge reads LIVE. Suspected: WhatsAppNumbers.jsx status computed from is_active only, not from mock. Should show MOCK badge when row.mock===true (matches SA view which correctly shows MOCK on NSTU row)."]},
+      {"screen": "/whatsapp-numbers dialog", "issues": ["The 'Mock' toggle default state should be explicit — added numbers via dialog inherit backend default (mock=False in Pydantic model) while the Switch UI may not reflect this if user didn't toggle. Add clear helper text: 'Turn ON to use mock/sandbox mode (no live Meta calls)'."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration17_wa_multi_number.py",
+    "/app/test_reports/pytest/iteration17.xml"
+  ],
+  "action_items": [
+    "P1 (routing correctness): Fix silent env-credential fallback in meta_wa_credentials or in send endpoints — when caller specifies a phone_number_id that exists on the tenant but is mock/inactive, return 400 or route through mock adapter with pnid preserved. Do NOT let a request to send from tenant number X quietly transmit from the platform env number.",
+    "P2 (UI): In WhatsAppNumbers.jsx, compute Status badge as MOCK when row.mock===true, DISABLED when !row.is_active, else LIVE — matches SA view rendering.",
+    "P3 (docs): Update /whatsapp-numbers Add dialog copy for the Mock toggle to clarify meaning."
+  ],
+  "critical_code_review_comments": [
+    "server.py now 3718 lines — extract WA phone-number CRUD + legacy config + templates + webhook + send routes into routers/whatsapp.py. Previously flagged in iter 15/16 and still open.",
+    "meta_wa_credentials() has three fall-through paths (per-tenant → Provider Vault → env) and no telemetry/logging when the effective creds are NOT what the caller asked for. Add a log.warning when phone_number_id was requested but resolved creds have a different phone_number_id.",
+    "message doc persistence uses `resp.get('phone_number_id_used') or body.phone_number_id` — this hides the fallback. Consider storing both fields: requested_phone_number_id + effective_phone_number_id so audit trails show intent vs actual.",
+    "add_phone_number defaults body.mock to False in the Pydantic model but the frontend dialog defaults to mock=True (via Switch checked={form.mock} initialising true). Verify default UX matches expectation — a user hitting 'Add Number' with valid live creds should NOT land on mock=True by mistake.",
+    "list_phone_numbers SA branch dumps ALL tenants' rows (limit 1000) with no pagination or tenant grouping metadata. For platforms with 1000+ tenants this becomes O(n) heavy — add server-side pagination + optional company_id filter query param.",
+    "PATCH /whatsapp/phone-numbers/{pnid}: If body.is_primary=True is passed for a row that IS already primary (row.is_primary True already), the current code short-circuits the demotion branch (correct) but does not set upd['is_primary']=True — no functional bug but slightly confusing branch structure. Consider `upd['is_primary'] = True` in both cases so audit is consistent."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration17_wa_multi_number.py (new — 19 tests, all pass in 8.7s)"
+  ],
+  "success_rate": {"backend": "100% (19/19)", "frontend": "100% (WA Numbers page + dialog + ContactProfile picker verified)"},
+  "test_credentials": "SA admin@cpaas.io / Admin@12345. Ephemeral tenant TEST_IT17_admin_<ts>@example.com / TestIt17@2026 auto-cleaned; UI-tenant test_it17ui_1784637790@example.com deleted after run.",
+  "seed_data_creation": "Ephemeral tenant created via POST /api/companies (SA-only) for each test run, plus one contact and 2-3 WhatsApp mock numbers. All test data cleaned up via DELETE /api/companies/{id} which cascades TENANT_COLLECTIONS.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "P0 multi-number feature is functionally complete and tested. Key API surface: GET/POST/PATCH/DELETE /api/whatsapp/phone-numbers, POST /{pnid}/test, POST /{pnid}/sync. Legacy /api/whatsapp/config PUT/GET/DELETE still work for single-number tenants. Migration is idempotent — new tenants start with 0 numbers and PUT /whatsapp/config creates the first row as is_primary=True. Test file test_iteration17_wa_multi_number.py is reusable regression suite (19 tests, ~9s). Known open issue: silent env-cred fallback when specified pnid is mock — captured as P1 action item; does not block feature ship but should be tightened before multi-number tenants go live with mixed mock+live setups. Frontend flow verified with 2 mock numbers added via dialog; sender-picker only renders when phoneNumbers.length > 1 (correct); primary indicated with ★ prefix in dropdown label.",
+  "rca of the issue": "No blocking bugs. The env-fallback routing issue is a design ambiguity: current spec says 'Falls through to Provider Vault → env creds when nothing per-tenant' — code implements this literally by ignoring mock rows, which means specifying a mock phone_number_id also triggers fallback. RCA: meta_wa_credentials line 439 excludes rows where cfg.mock is True from the return path; the caller has no signal that fallback occurred. Reproduction: (1) tenant admin adds a mock number with pnid X, (2) POST /api/messages/send with phone_number_id=X → 200, message.phone_number_id = env WHATSAPP_PHONE_NUMBER_ID (not X). Mitigation: add explicit check — if the request specified phone_number_id AND a matching row exists but is mock/inactive, return 400 with 'Selected number is in mock mode. Turn Mock off in Step 2 or pick another sender.' instead of falling through."
+}

@@ -87,6 +87,10 @@ export default function ContactProfile() {
   const [tplList, setTplList] = useState(null);       // null=not-loaded, []=loaded-empty, [...]=loaded
   const [tplLoading, setTplLoading] = useState(false);
 
+  // Multi-number: which sender phone_number_id to use (null = primary)
+  const [phoneNumbers, setPhoneNumbers] = useState([]);
+  const [senderPhoneId, setSenderPhoneId] = useState("");
+
   // WhatsApp Media Inbox (outbound)
   const fileInputRef = useRef(null);
   const [pendingFile, setPendingFile] = useState(null);
@@ -143,6 +147,21 @@ export default function ContactProfile() {
   };
   useEffect(() => { load(); }, [id]);
 
+  // Load tenant's WhatsApp numbers once (only if channel becomes 'whatsapp')
+  useEffect(() => {
+    if (channel !== "whatsapp") return;
+    api.get("/whatsapp/phone-numbers")
+      .then(r => {
+        const list = (r.data || []).filter(n => n.is_active !== false);
+        setPhoneNumbers(list);
+        if (list.length > 0 && !senderPhoneId) {
+          const primary = list.find(n => n.is_primary) || list[0];
+          setSenderPhoneId(primary.phone_number_id);
+        }
+      })
+      .catch(() => setPhoneNumbers([]));
+  }, [channel, senderPhoneId]);
+
   // Auto-load approved templates when user switches WhatsApp tab to Template mode
   useEffect(() => {
     if (channel !== "whatsapp" || waMode !== "template" || tplList !== null) return;
@@ -190,6 +209,7 @@ export default function ContactProfile() {
         fd.append("to", contact.phone);
         fd.append("caption", body || "");
         fd.append("file", pendingFile);
+        if (senderPhoneId) fd.append("phone_number_id", senderPhoneId);
         await api.post("/whatsapp/send-media", fd, { headers: { "Content-Type": "multipart/form-data" } });
         toast.success(`${pendingFile.type.split("/")[0] || "Media"} sent via WhatsApp`);
         setBody("");
@@ -202,6 +222,7 @@ export default function ContactProfile() {
           const comps = buildTemplateComponents();
           if (comps.length > 0) payload.template_components = comps;
         }
+        if (channel === "whatsapp" && senderPhoneId) payload.phone_number_id = senderPhoneId;
         await api.post("/messages/send", payload);
         toast.success(isTemplate
           ? `Template "${tplName}" queued — this always delivers when the template is approved by Meta.`
@@ -294,6 +315,23 @@ export default function ContactProfile() {
                     Switch to Template
                   </Button>
                 </div>
+              </div>
+            )}
+
+            {channel === "whatsapp" && phoneNumbers.length > 1 && (
+              <div className="flex items-center gap-2 flex-wrap p-2 border border-dashed rounded-sm bg-muted/20" data-testid="wa-sender-picker">
+                <span className="text-[10px] uppercase tracking-wider text-muted-foreground">Send from:</span>
+                <select value={senderPhoneId} onChange={e => setSenderPhoneId(e.target.value)}
+                  className="h-7 rounded-sm border bg-background px-2 text-xs font-mono min-w-[220px]"
+                  data-testid="wa-sender-select">
+                  {phoneNumbers.map(n => (
+                    <option key={n.phone_number_id} value={n.phone_number_id}>
+                      {n.is_primary ? "★ " : ""}{n.display_phone_number || n.phone_number_id}
+                      {n.verified_name ? ` — ${n.verified_name}` : ""}
+                      {n.mock ? " (mock)" : ""}
+                    </option>
+                  ))}
+                </select>
               </div>
             )}
 
