@@ -73,9 +73,21 @@ export default function Contacts() {
 
   const importCSV = async (file) => {
     const fd = new FormData(); fd.append("file", file);
-    const { data } = await api.post("/contacts/import", fd, { headers: { "Content-Type": "multipart/form-data" } });
-    toast.success(`Imported ${data.inserted}, skipped ${data.skipped}`);
-    load();
+    try {
+      const { data } = await api.post("/contacts/import", fd, { headers: { "Content-Type": "multipart/form-data" } });
+      const parts = [`Imported ${data.inserted}`];
+      if (data.duplicates) parts.push(`${data.duplicates} duplicates`);
+      if (data.error_count) parts.push(`${data.error_count} errors`);
+      parts.push(`(${data.format?.toUpperCase() || "CSV"})`);
+      toast.success(parts.join(" · "));
+      if (data.error_count && data.errors?.length) {
+        // Show a compact error summary in console for power users
+        console.warn("Import errors:", data.errors);
+      }
+      load();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Import failed");
+    }
   };
 
   const exportCSV = async () => {
@@ -95,12 +107,12 @@ export default function Contacts() {
           <h1 className="text-3xl font-black tracking-tighter">Contacts</h1>
         </div>
         <div className="flex items-center gap-2">
-          <input ref={fileRef} type="file" accept=".csv" className="hidden" onChange={e => e.target.files?.[0] && importCSV(e.target.files[0])} />
+          <input ref={fileRef} type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={e => e.target.files?.[0] && importCSV(e.target.files[0])} />
           <Button variant="outline" className="rounded-sm gap-2" onClick={exportCSV} data-testid="export-contacts-button">
             <Download className="h-4 w-4" /> Export
           </Button>
           <Button variant="outline" className="rounded-sm gap-2" onClick={() => fileRef.current?.click()} data-testid="import-contacts-button">
-            <Upload className="h-4 w-4" /> Import CSV
+            <Upload className="h-4 w-4" /> Import CSV / Excel
           </Button>
           <Button className="rounded-sm gap-2" onClick={openCreate} data-testid="add-contact-button"><Plus className="h-4 w-4" /> New Contact</Button>
           <Dialog open={open} onOpenChange={setOpen}>

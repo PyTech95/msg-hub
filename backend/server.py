@@ -13,6 +13,8 @@ import io
 import csv
 import uuid
 import json
+import hmac
+import hashlib
 import random
 import asyncio
 import logging
@@ -79,6 +81,118 @@ else:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+# ─────────────────────── Prometheus metrics ───────────────────────
+# Lightweight in-process counters + histograms. Scrape `/api/metrics`.
+from prometheus_client import Counter, Histogram, Gauge, CONTENT_TYPE_LATEST, generate_latest
+import time as _time
+
+REQ_TOTAL = Counter("cpaas_http_requests_total", "HTTP requests", ["method", "path", "status"])
+REQ_LATENCY = Histogram("cpaas_http_request_seconds", "HTTP request latency (s)",
+                        ["method", "path"], buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10))
+MSG_TOTAL = Counter("cpaas_messages_total", "Outbound messages sent",
+                    ["channel", "status"])
+BROADCAST_QUEUE_DEPTH = Gauge("cpaas_broadcast_queue_depth", "Pending broadcast task count")
+CELERY_WORKERS = Gauge("cpaas_celery_workers_alive", "Number of alive Celery workers")
+ACTIVE_TENANTS = Gauge("cpaas_active_tenants", "Active tenant companies")
+WA_CONFIGS_LIVE = Gauge("cpaas_wa_configs_live", "Tenant WA configs live (mock=False)")
+
+
+@app.middleware("http")
+async def _prometheus_middleware(request: Request, call_next):
+    start = _time.perf_counter()
+    # Normalize path: replace /api/foo/<uuid>/bar → /api/foo/{id}/bar to avoid
+    # metric-cardinality explosion. Only bucket by the route pattern.
+    route_path = request.scope.get("route").path if request.scope.get("route") else request.url.path
+    method = request.method
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        elapsed = _time.perf_counter() - start
+        try:
+            REQ_TOTAL.labels(method, route_path, str(status_code)).inc()
+            REQ_LATENCY.labels(method, route_path).observe(elapsed)
+        except Exception:
+            pass
+
+
+@app.get("/api/metrics", include_in_schema=False)
+async def metrics():
+    """Prometheus scrape endpoint. Emits process + platform gauges."""
+    # Refresh gauges before rendering — cheap Mongo aggregates.
+    try:
+        ACTIVE_TENANTS.set(await db.companies.count_documents({"is_active": True}))
+        WA_CONFIGS_LIVE.set(await db.company_whatsapp_configs.count_documents({"is_active": True, "mock": False}))
+        # Broadcast queue depth via Redis LLEN on the celery default queue
+        try:
+            import redis  # noqa: WPS433 (local import — optional)
+            r = redis.Redis.from_url(os.environ.get("CELERY_BROKER_URL", "redis://127.0.0.1:6379/0"))
+            BROADCAST_QUEUE_DEPTH.set(r.llen("celery"))
+        except Exception:
+            BROADCAST_QUEUE_DEPTH.set(-1)
+        # Celery worker health
+        try:
+            from celery_app import celery_app as _capp
+            insp = _capp.control.inspect(timeout=1)
+            pong = insp.ping() or {}
+            CELERY_WORKERS.set(len(pong))
+        except Exception:
+            CELERY_WORKERS.set(-1)
+    except Exception as e:
+        log.warning("metrics gauge refresh failed: %s", e)
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+# ─────────────────────── Security headers middleware ───────────────────────
+# Adds baseline hardening headers on every response. CSP is intentionally
+# permissive on connect-src / img-src because the SPA calls the same origin
+# API and loads GridFS media inline. Tighten via env when going fully public.
+_CSP_DEFAULT = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://connect.facebook.net https://checkout.razorpay.com; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' data: https://fonts.gstatic.com; "
+    "img-src 'self' data: blob: https:; "
+    "media-src 'self' blob: https:; "
+    "connect-src 'self' ws: wss: https:; "
+    "frame-src https://www.facebook.com https://web.facebook.com https://api.razorpay.com https://checkout.razorpay.com; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
+)
+_CSP = (os.environ.get("CSP_POLICY") or _CSP_DEFAULT).strip()
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    # Baseline OWASP-recommended headers
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy",
+                                "camera=(), microphone=(), geolocation=(), payment=(self)")
+    # HSTS only over https (browsers ignore it on http)
+    if request.url.scheme == "https":
+        response.headers.setdefault("Strict-Transport-Security",
+                                    "max-age=31536000; includeSubDomains")
+    # Skip CSP on the docs & openapi endpoints so Swagger UI keeps working.
+    path = request.url.path
+    if not (path.startswith("/docs") or path.startswith("/redoc") or path == "/openapi.json"):
+        response.headers.setdefault("Content-Security-Policy", _CSP)
+    return response
+
+
+# Harden auth cookies: on HTTPS we set Secure=True. Development on plain HTTP
+# keeps Secure=False so cookies work locally. Controlled by COOKIE_SECURE env.
+COOKIE_SECURE = (os.environ.get("COOKIE_SECURE") or "auto").lower()
+def _cookie_secure(request: Request) -> bool:
+    if COOKIE_SECURE == "true": return True
+    if COOKIE_SECURE == "false": return False
+    return request.url.scheme == "https"
 
 # ───────────────────────── Helpers ─────────────────────────
 def now_utc() -> datetime:
@@ -486,6 +600,30 @@ async def meta_wa_credentials(company_id: Optional[str] = None,
                 "graph_version": cfg.get("graph_version") or os.environ.get("GRAPH_API_VERSION") or "v22.0",
                 "waba_id": cfg.get("waba_id") or "",
             }
+        # CRITICAL SaaS ISOLATION: a tenant with no LIVE WA config MUST NOT
+        # silently fall through to the global provider vault or the platform's
+        # env credentials — that would leak the platform's phone number to
+        # tenant sends. Hard-fail with a targeted onboarding CTA instead.
+        if cfg is None:
+            raise HTTPException(
+                400,
+                "Please connect your WhatsApp Business account first. "
+                "Go to WhatsApp Numbers and add your access_token, "
+                "phone_number_id and waba_id.",
+            )
+        if cfg.get("mock", True):
+            raise HTTPException(
+                400,
+                "Your WhatsApp number is in Mock mode. Turn Mock off in "
+                "WhatsApp Numbers to send live messages from your own number.",
+            )
+        if not cfg.get("access_token") or not cfg.get("phone_number_id"):
+            raise HTTPException(
+                400,
+                "Your WhatsApp configuration is incomplete. Please update "
+                "access_token and phone_number_id in WhatsApp Numbers.",
+            )
+    # SA (no tenant): fall through to global vault → env creds
     # 2) Global vault
     p = await db.provider_accounts.find_one({"provider_key": "meta_whatsapp", "is_active": True}, {"_id": 0})
     creds = (p or {}).get("credentials") or {}
@@ -626,6 +764,7 @@ async def on_startup():
     await _seed_default_plans()
     await db.wallet_transactions.create_index([("company_id", 1), ("created_at", -1)])
     await db.wallet_recharge_orders.create_index("razorpay_order_id", unique=True)
+    await db.razorpay_webhook_events.create_index("id", unique=True)
     await db.wallet_alerts.create_index([("company_id", 1), ("date", 1), ("type", 1)])
     # Performance indexes for tenant-scoped Inbox/campaign queries at scale
     await db.messages.create_index([("company_id", 1), ("channel", 1), ("created_at", -1)])
@@ -912,8 +1051,9 @@ async def login(body: LoginIn, response: Response, request: Request):
     user_ctx = {"id": user["id"], "email": user["email"], "role": user["role"], "token_version": user.get("token_version", 1)}
     token = make_token(user_ctx)
     refresh = make_refresh_token(user_ctx)
-    response.set_cookie("access_token", token, httponly=True, samesite="lax", max_age=ACCESS_TTL_MIN*60, path="/")
-    response.set_cookie("refresh_token", refresh, httponly=True, samesite="lax", max_age=REFRESH_TTL_DAYS*24*3600, path="/")
+    _sec = _cookie_secure(request)
+    response.set_cookie("access_token", token, httponly=True, secure=_sec, samesite="lax", max_age=ACCESS_TTL_MIN*60, path="/")
+    response.set_cookie("refresh_token", refresh, httponly=True, secure=_sec, samesite="lax", max_age=REFRESH_TTL_DAYS*24*3600, path="/")
     await audit("login", "user", user["id"], user, {"ip": ip})
     return {"token": token, "refresh_token": refresh, "user": await with_company(clean(user))}
 
@@ -974,8 +1114,9 @@ async def refresh_access_token(body: RefreshIn, request: Request, response: Resp
     user_ctx = {"id": user["id"], "email": user["email"], "role": user["role"], "token_version": user.get("token_version", 1)}
     new_access = make_token(user_ctx)
     new_refresh = make_refresh_token(user_ctx)
-    response.set_cookie("access_token", new_access, httponly=True, samesite="lax", max_age=ACCESS_TTL_MIN*60, path="/")
-    response.set_cookie("refresh_token", new_refresh, httponly=True, samesite="lax", max_age=REFRESH_TTL_DAYS*24*3600, path="/")
+    _sec = _cookie_secure(request)
+    response.set_cookie("access_token", new_access, httponly=True, secure=_sec, samesite="lax", max_age=ACCESS_TTL_MIN*60, path="/")
+    response.set_cookie("refresh_token", new_refresh, httponly=True, secure=_sec, samesite="lax", max_age=REFRESH_TTL_DAYS*24*3600, path="/")
     return {"token": new_access, "refresh_token": new_refresh}
 
 @api.get("/auth/me")
@@ -987,7 +1128,7 @@ class ChangePasswordIn(BaseModel):
     new_password: str
 
 @api.post("/auth/change-password")
-async def change_password(body: ChangePasswordIn, response: Response, user: dict = Depends(current_user)):
+async def change_password(body: ChangePasswordIn, response: Response, request: Request, user: dict = Depends(current_user)):
     full = await db.users.find_one({"id": user["id"]})
     if not full or not verify_pw(body.old_password, full["password_hash"]):
         raise HTTPException(400, "Current password is incorrect")
@@ -999,7 +1140,7 @@ async def change_password(body: ChangePasswordIn, response: Response, user: dict
         "token_version": new_tv,
     }})
     new_token = make_token({"id": user["id"], "email": user["email"], "role": user["role"], "token_version": new_tv})
-    response.set_cookie("access_token", new_token, httponly=True, samesite="lax", max_age=ACCESS_TTL_MIN*60, path="/")
+    response.set_cookie("access_token", new_token, httponly=True, secure=_cookie_secure(request), samesite="lax", max_age=ACCESS_TTL_MIN*60, path="/")
     await audit("password_changed", "user", user["id"], user)
     return {"ok": True, "token": new_token}
 
@@ -1275,28 +1416,96 @@ async def bulk_delete_contacts(ids: List[str], user: dict = Depends(require_role
 
 @api.post("/contacts/import")
 async def import_contacts_csv(file: UploadFile = File(...), user: dict = Depends(current_user)):
-    raw = (await file.read()).decode("utf-8", errors="ignore")
-    reader = csv.DictReader(io.StringIO(raw))
-    inserted = 0
-    skipped = 0
+    """Import contacts from CSV or Excel (xlsx/xls). Detects format by filename
+    extension. Handles duplicates (existing phone in tenant scope is skipped, not
+    overwritten) and returns a detailed error report per-row for the client to
+    surface."""
+    raw = await file.read()
+    filename = (file.filename or "").lower()
+    is_excel = filename.endswith(".xlsx") or filename.endswith(".xls")
+
+    rows: List[Dict[str, str]] = []
+    format_err: Optional[str] = None
+    if is_excel:
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+            ws = wb.active
+            headers: List[str] = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i == 0:
+                    headers = [(str(c).strip().lower() if c is not None else "") for c in row]
+                    continue
+                d = {}
+                for h, v in zip(headers, row):
+                    if not h:
+                        continue
+                    d[h] = "" if v is None else str(v).strip()
+                if any(d.values()):
+                    rows.append(d)
+        except Exception as e:
+            format_err = f"Could not read Excel file: {e}"
+    else:
+        try:
+            text = raw.decode("utf-8", errors="ignore")
+            for r in csv.DictReader(io.StringIO(text)):
+                rows.append({(k or "").strip().lower(): (str(v).strip() if v is not None else "") for k, v in r.items()})
+        except Exception as e:
+            format_err = f"Could not read CSV file: {e}"
+
+    if format_err:
+        raise HTTPException(400, format_err)
+    if not rows:
+        raise HTTPException(400, "No data rows found. Expected a header row followed by data rows.")
+
+    # Preload existing phones for tenant so we can skip duplicates in one pass
+    existing_phones = set()
+    async for c in db.contacts.find(cflt(user), {"_id": 0, "phone": 1}):
+        if c.get("phone"):
+            existing_phones.add(c["phone"])
+
     docs = []
-    for row in reader:
-        phone = (row.get("phone") or row.get("mobile") or "").strip()
+    errors: List[Dict[str, Any]] = []
+    duplicates = 0
+    for idx, row in enumerate(rows, start=2):  # start=2 so error rows line up with spreadsheet row #s
+        phone = (row.get("phone") or row.get("mobile") or row.get("phone_number") or "").strip()
         name = (row.get("name") or row.get("full_name") or "").strip()
-        if not phone or not name:
-            skipped += 1
+        if not phone:
+            errors.append({"row": idx, "reason": "missing phone"})
             continue
+        if not name:
+            errors.append({"row": idx, "reason": "missing name"})
+            continue
+        # Normalize +91 for Indian numbers if missing
+        if not phone.startswith("+") and phone.isdigit() and len(phone) >= 10:
+            phone = "+" + phone
+        if phone in existing_phones:
+            duplicates += 1
+            continue
+        existing_phones.add(phone)  # prevent same-batch dupes too
         docs.append({
             "id": new_id(), "name": name, "phone": phone,
             "email": (row.get("email") or "").strip() or None,
             "tags": [t.strip() for t in (row.get("tags") or "").split(",") if t.strip()],
-            "list_ids": [], "dnd": False, "opted_out": False, "notes": "",
-            "custom_fields": {}, "company_id": user.get("company_id"), "created_at": iso(now_utc()),
+            "list_ids": [], "dnd": False, "opted_out": False,
+            "notes": (row.get("notes") or "").strip(),
+            "custom_fields": {}, "company_id": user.get("company_id"),
+            "created_at": iso(now_utc()),
         })
     if docs:
         await db.contacts.insert_many(docs)
-        inserted = len(docs)
-    return {"inserted": inserted, "skipped": skipped}
+    await audit("contacts_imported", "contacts", "", user,
+                {"format": "xlsx" if is_excel else "csv",
+                 "rows_read": len(rows), "inserted": len(docs),
+                 "duplicates": duplicates, "errors": len(errors)})
+    return {
+        "format": "xlsx" if is_excel else "csv",
+        "rows_read": len(rows),
+        "inserted": len(docs),
+        "duplicates": duplicates,
+        "errors": errors[:100],   # cap error report size
+        "error_count": len(errors),
+    }
 
 # ───────────────────────── Lists ─────────────────────────
 @api.get("/lists")
@@ -2410,7 +2619,118 @@ class WhatsAppSendIn(BaseModel):
 
 @api.post("/whatsapp/send-message")
 async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTasks, user: dict = Depends(current_user)):
+    return await _wa_send_text(body.to, body.message or "", user,
+                               phone_number_id=body.phone_number_id,
+                               template_name=body.template_name,
+                               template_language=body.template_language,
+                               template_components=body.template_components)
+
+
+class WhatsAppForwardIn(BaseModel):
+    message_id: str
+    to_contact_ids: List[str]
+    phone_number_id: Optional[str] = None
+
+
+@api.post("/whatsapp/forward")
+async def whatsapp_forward(body: WhatsAppForwardIn, user: dict = Depends(current_user)):
+    """Forward an existing message (text or media) to N contacts. Each fan-out send
+    is tenant-scoped and reuses the same WA send pipeline (including credit
+    debit + provider dispatch + audit)."""
+    if not body.to_contact_ids:
+        raise HTTPException(400, "to_contact_ids is required")
+    src = await db.messages.find_one(cflt(user, {"id": body.message_id}), {"_id": 0})
+    if not src:
+        raise HTTPException(404, "Source message not found")
+    text = (src.get("body") or "").strip()
+    src_media = src.get("media") or {}
+    results = []
+    for cid in body.to_contact_ids[:50]:  # cap for safety
+        contact = await db.contacts.find_one(cflt(user, {"id": cid}), {"_id": 0, "phone": 1, "id": 1, "opted_out": 1})
+        if not contact or not contact.get("phone"):
+            results.append({"contact_id": cid, "ok": False, "error": "contact not found or has no phone"}); continue
+        if contact.get("opted_out"):
+            results.append({"contact_id": cid, "ok": False, "error": "opted_out"}); continue
+        try:
+            # Prefer forwarding media if source had it; else forward text
+            if src_media.get("gridfs_id") and src_media.get("type") in ("image","video","document","audio","voice"):
+                r = await _wa_forward_media(contact["phone"], src_media, text, user,
+                                             phone_number_id=body.phone_number_id)
+            else:
+                if not text:
+                    results.append({"contact_id": cid, "ok": False, "error": "empty message"}); continue
+                r = await _wa_send_text(contact["phone"], text, user,
+                                        phone_number_id=body.phone_number_id)
+            results.append({"contact_id": cid, "ok": True, "message_id": r.get("id")})
+        except HTTPException as e:
+            results.append({"contact_id": cid, "ok": False, "error": e.detail})
+        except Exception as e:
+            log.exception("forward failed for contact %s: %s", cid, e)
+            results.append({"contact_id": cid, "ok": False, "error": str(e)[:200]})
+    await audit("messages_forwarded", "message", body.message_id, user,
+                {"targets": len(body.to_contact_ids), "success": sum(1 for r in results if r["ok"])})
+    return {"forwarded": sum(1 for r in results if r["ok"]),
+            "total": len(results), "results": results}
+
+
+class WhatsAppContactCardIn(BaseModel):
+    to: str
+    name: str
+    phone: str
+    email: Optional[str] = None
+    phone_number_id: Optional[str] = None
+
+
+@api.post("/whatsapp/send-contact-card")
+async def whatsapp_send_contact_card(body: WhatsAppContactCardIn, user: dict = Depends(current_user)):
+    """Send a WhatsApp contact card (vCard). Uses Meta's `contacts` message type."""
     phone = body.to.strip()
+    if not phone.startswith("+"): phone = "+" + phone
+    creds = await meta_wa_credentials(user.get("company_id"), body.phone_number_id)
+    contact_phone = body.phone.strip()
+    if not contact_phone.startswith("+"):
+        contact_phone = "+" + contact_phone
+    contact_obj = {
+        "name": {"formatted_name": body.name, "first_name": body.name.split()[0] if body.name else "Contact"},
+        "phones": [{"phone": contact_phone, "wa_id": contact_phone.lstrip("+")}],
+    }
+    if body.email:
+        contact_obj["emails"] = [{"email": body.email, "type": "WORK"}]
+    payload = {"messaging_product": "whatsapp", "to": phone.lstrip("+"),
+               "type": "contacts", "contacts": [contact_obj]}
+    resp = await meta_wa.graph_post_message(creds, payload)
+    # Persist as outbound with a compact preview body
+    cid = None
+    contact = await db.contacts.find_one(cflt(user, {"phone": phone}), {"_id": 0, "id": 1})
+    if contact: cid = contact["id"]
+    else:
+        cid = new_id()
+        await db.contacts.insert_one({"id": cid, "name": phone, "phone": phone, "email": None,
+            "tags": ["wa-direct"], "list_ids": [], "dnd": False, "opted_out": False,
+            "notes": "", "custom_fields": {}, "company_id": user.get("company_id"),
+            "created_at": iso(now_utc())})
+    mid = new_id()
+    await db.messages.insert_one({
+        "id": mid, "channel": "whatsapp", "contact_id": cid, "direction": "outbound",
+        "body": f"[Contact Card] {body.name} · {contact_phone}",
+        "status": "sent", "provider_message_id": resp.get("provider_message_id"),
+        "company_id": user.get("company_id"),
+        "phone_number_id": creds.get("phone_number_id"),
+        "meta": {"contact_card": contact_obj},
+        "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
+    })
+    await audit("wa_contact_card_sent", "message", mid, user, {"to": phone})
+    return {"ok": True, "message_id": mid, "provider_message_id": resp.get("provider_message_id")}
+
+
+async def _wa_send_text(to: str, message: str, user: dict, *,
+                        phone_number_id: Optional[str] = None,
+                        template_name: Optional[str] = None,
+                        template_language: Optional[str] = "en_US",
+                        template_components: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Shared WA text/template send. Extracted from /whatsapp/send-message so
+    /whatsapp/forward can reuse the exact same debit + dispatch + audit path."""
+    phone = to.strip()
     if not phone.startswith("+"):
         phone = f"+{phone}"
     contact = await db.contacts.find_one(cflt(user, {"phone": {"$in": [phone, phone.lstrip('+')]}}), {"_id": 0})
@@ -2425,19 +2745,19 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
             "list_ids": [], "dnd": False, "opted_out": False, "notes": "", "custom_fields": {},
             "company_id": user.get("company_id"), "created_at": iso(now_utc()),
         })
-    is_template = (body.template_name or "").strip() != ""
+    is_template = (template_name or "").strip() != ""
     mid = new_id()
     msg_doc: Dict[str, Any] = {
         "id": mid, "channel": "whatsapp", "contact_id": cid, "direction": "outbound",
-        "body": body.message, "media_url": body.media_url, "status": "queued",
+        "body": message, "status": "queued",
         "provider_message_id": None, "campaign_id": None, "company_id": user.get("company_id"),
         "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
     }
     if is_template:
         msg_doc["meta"] = {
-            "template_name": body.template_name.strip(),
-            "template_language": (body.template_language or "en_US").strip(),
-            "template_components": body.template_components or [],
+            "template_name": template_name.strip(),
+            "template_language": (template_language or "en_US").strip(),
+            "template_components": template_components or [],
         }
     await db.messages.insert_one(msg_doc)
     # Wallet check + debit
@@ -2452,16 +2772,16 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
     try:
         if is_template:
             resp = await ADAPTERS["whatsapp"].send_template(
-                phone, body.template_name.strip(),
-                language_code=(body.template_language or "en_US").strip(),
-                components=body.template_components or None,
+                phone, template_name.strip(),
+                language_code=(template_language or "en_US").strip(),
+                components=template_components or None,
                 company_id=user.get("company_id"),
-                phone_number_id=body.phone_number_id,
+                phone_number_id=phone_number_id,
             )
         else:
-            resp = await ADAPTERS["whatsapp"].send(phone, body.message, body.media_url,
+            resp = await ADAPTERS["whatsapp"].send(phone, message, None,
                                                     company_id=user.get("company_id"),
-                                                    phone_number_id=body.phone_number_id)
+                                                    phone_number_id=phone_number_id)
     except HTTPException as he:
         # Refund on validation failure (mock/inactive number, etc.) before re-raising as-is
         if user.get("company_id") and price_paise > 0:
@@ -2491,11 +2811,11 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
         raise HTTPException(400, f"WhatsApp send failed: {e}")
     await db.messages.update_one({"id": mid}, {"$set": {
         "provider_message_id": resp["provider_message_id"],
-        "phone_number_id": resp.get("phone_number_id_used") or body.phone_number_id,
+        "phone_number_id": resp.get("phone_number_id_used") or phone_number_id,
     }})
     await db.conversations.update_one(
         {"contact_id": cid, "channel": "whatsapp"},
-        {"$set": {"last_message_at": iso(now_utc()), "last_message": body.message, "company_id": user.get("company_id")}}, upsert=True,
+        {"$set": {"last_message_at": iso(now_utc()), "last_message": message, "company_id": user.get("company_id")}}, upsert=True,
     )
     if resp.get("mode") == "live":
         await emit_event(mid, "sent", source="meta_whatsapp")
@@ -2504,9 +2824,60 @@ async def whatsapp_send_message(body: WhatsAppSendIn, background: BackgroundTask
             "amount": PRICING["whatsapp"], "currency": "INR", "company_id": user.get("company_id"), "created_at": iso(now_utc()),
         })
     else:
-        background.add_task(deliver_message, mid, "whatsapp")
-    return {"message_id": mid, "provider_message_id": resp["provider_message_id"],
+        # background delivery lifecycle simulation for mock/queued path
+        asyncio.create_task(deliver_message(mid, "whatsapp"))
+    return {"id": mid, "message_id": mid, "provider_message_id": resp["provider_message_id"],
             "mode": resp.get("mode"), "status": "sent" if resp.get("mode") == "live" else "queued"}
+
+
+async def _wa_forward_media(to: str, src_media: dict, caption: str, user: dict, *,
+                            phone_number_id: Optional[str] = None) -> Dict[str, Any]:
+    """Forward a previously-received/sent WA media message. Reads bytes from
+    GridFS and re-uploads to Meta from the tenant's own number so the outbound
+    is a fresh, valid Meta media send (media_ids can't be shared between
+    numbers)."""
+    from bson import ObjectId
+    gid = src_media.get("gridfs_id")
+    if not gid or media_fs is None:
+        raise HTTPException(400, "Source media not available for forward")
+    try:
+        stream = await media_fs.open_download_stream(ObjectId(gid))
+        media_bytes = await stream.read()
+    except Exception:
+        raise HTTPException(404, "Source media file not found in storage")
+    mime = src_media.get("mime_type") or "application/octet-stream"
+    filename = src_media.get("filename") or f"forwarded_{gid[-8:]}"
+    mtype = src_media.get("type") or "document"
+    phone = to.strip()
+    if not phone.startswith("+"): phone = "+" + phone
+    creds = await meta_wa_credentials(user.get("company_id"), phone_number_id)
+    up = await meta_wa.upload_media(creds, media_bytes, filename, mime)
+    if not up.get("ok"):
+        raise HTTPException(400, up.get("error") or "media upload failed")
+    resp = await meta_wa.send_media_message(
+        creds, phone, mtype, media_id=up["media_id"],
+        caption=(caption or None) if mtype in ("image", "video", "document") else None,
+        filename=filename if mtype == "document" else None,
+    )
+    # Persist as new outbound msg
+    contact = await db.contacts.find_one(cflt(user, {"phone": phone}), {"_id": 0, "id": 1})
+    cid = contact["id"] if contact else new_id()
+    if not contact:
+        await db.contacts.insert_one({"id": cid, "name": phone, "phone": phone, "email": None,
+            "tags": ["wa-direct"], "list_ids": [], "dnd": False, "opted_out": False,
+            "notes": "", "custom_fields": {}, "company_id": user.get("company_id"),
+            "created_at": iso(now_utc())})
+    mid = new_id()
+    await db.messages.insert_one({
+        "id": mid, "channel": "whatsapp", "contact_id": cid, "direction": "outbound",
+        "body": caption or "", "status": "sent",
+        "provider_message_id": resp.get("provider_message_id"),
+        "company_id": user.get("company_id"),
+        "phone_number_id": creds.get("phone_number_id"),
+        "media": {**src_media, "forwarded_from": src_media.get("gridfs_id")},
+        "created_at": iso(now_utc()), "updated_at": iso(now_utc()),
+    })
+    return {"id": mid, "provider_message_id": resp.get("provider_message_id")}
 
 @api.get("/whatsapp/setup")
 async def whatsapp_setup(_: dict = Depends(platform_only("super_admin", "admin"))):
@@ -3567,6 +3938,169 @@ async def verify_recharge(body: RechargeVerifyIn, user: dict = Depends(current_u
             log.warning(f"receipt email failed: {e}")
     asyncio.create_task(_send_receipt())
     return {"ok": True, "balance_paise": res["balance_paise"]}
+
+
+# ─────────────────────── Razorpay Webhook ───────────────────────
+async def _credit_wallet_for_paid_order(order: Dict[str, Any], payment_id: str,
+                                        source: str) -> int:
+    """Idempotently credit the wallet + emit a wallet_transaction. Returns new balance."""
+    await _get_or_create_wallet(order["company_id"])
+    res = await db.wallets.find_one_and_update(
+        {"company_id": order["company_id"]},
+        {"$inc": {"balance_paise": order["amount_paise"]},
+         "$set": {"updated_at": iso(now_utc())}},
+        return_document=True,
+    )
+    await db.wallet_transactions.insert_one({
+        "id": new_id(), "company_id": order["company_id"], "type": "credit",
+        "amount_paise": order["amount_paise"],
+        "balance_paise_after": res["balance_paise"],
+        "meta": {"source": source, "order_id": order["razorpay_order_id"],
+                 "payment_id": payment_id},
+        "created_at": iso(now_utc()),
+    })
+    return res["balance_paise"]
+
+
+@api.post("/webhooks/razorpay")
+@limiter.limit("60/minute")
+async def razorpay_webhook(request: Request):
+    """Razorpay webhook receiver. Validates X-Razorpay-Signature with the shared secret,
+    then handles payment.captured / payment.failed / refund events idempotently.
+
+    Configure in Razorpay dashboard:
+      URL:     https://<your-domain>/api/webhooks/razorpay
+      Events:  payment.captured, payment.failed, refund.processed
+      Secret:  set as RAZORPAY_WEBHOOK_SECRET in backend env
+    """
+    raw = await request.body()
+    secret = (os.environ.get("RAZORPAY_WEBHOOK_SECRET") or "").strip()
+    sig_header = request.headers.get("X-Razorpay-Signature") or ""
+    # Signature check (Razorpay uses HMAC-SHA256 over the raw request body).
+    sig_valid = False
+    if secret and sig_header:
+        expected = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+        sig_valid = hmac.compare_digest(expected, sig_header)
+        if not sig_valid:
+            log.warning("Razorpay webhook sig mismatch: got=%s expected=%s raw_len=%s secret_len=%s",
+                        sig_header[:16], expected[:16], len(raw), len(secret))
+    # Always log the event for debugging, whether signature is valid or not.
+    try:
+        payload = await request.json() if raw else {}
+    except Exception:
+        payload = {}
+    event_id = (payload.get("id") or "") or f"evt_{new_id()}"
+    await db.webhook_events.insert_one({
+        "id": new_id(), "channel": "razorpay", "provider": "razorpay",
+        "event_type": payload.get("event") or "unknown",
+        "signature_valid": sig_valid, "payload": payload,
+        "processed": False, "created_at": iso(now_utc()),
+    })
+    if not sig_valid:
+        log.warning("Razorpay webhook: invalid signature, rejecting")
+        raise HTTPException(401, "Invalid signature")
+    # Idempotency guard: Razorpay may retry the same event on transient 5xx.
+    existing = await db.razorpay_webhook_events.find_one({"id": event_id}, {"_id": 0, "processed": 1})
+    if existing and existing.get("processed"):
+        return {"ok": True, "duplicate": True}
+    await db.razorpay_webhook_events.update_one(
+        {"id": event_id},
+        {"$set": {"id": event_id, "event": payload.get("event"),
+                  "received_at": iso(now_utc()), "processed": False}},
+        upsert=True,
+    )
+
+    event = payload.get("event") or ""
+    entity = ((payload.get("payload") or {}).get("payment") or {}).get("entity") or {}
+    refund_entity = ((payload.get("payload") or {}).get("refund") or {}).get("entity") or {}
+
+    if event == "payment.captured":
+        payment_id = entity.get("id") or ""
+        order_id = entity.get("order_id") or ""
+        if not order_id:
+            await db.razorpay_webhook_events.update_one({"id": event_id},
+                {"$set": {"processed": True, "note": "no order_id"}})
+            return {"ok": True, "note": "no order_id"}
+        # Atomic CAS — only credit if still in 'created' state.
+        order = await db.wallet_recharge_orders.find_one_and_update(
+            {"razorpay_order_id": order_id, "status": "created"},
+            {"$set": {"status": "paid", "paid_at": iso(now_utc()),
+                      "razorpay_payment_id": payment_id,
+                      "webhook_credited_at": iso(now_utc())}},
+            return_document=True,
+        )
+        if order:
+            balance = await _credit_wallet_for_paid_order(order, payment_id, source="razorpay_webhook")
+            await audit("wallet_recharged_via_webhook", "wallet", order["company_id"], None,
+                        {"order_id": order_id, "payment_id": payment_id,
+                         "amount_paise": order["amount_paise"], "balance_paise": balance})
+            log.info("Razorpay webhook credited wallet: order=%s amount=%s co=%s",
+                     order_id, order["amount_paise"], order["company_id"])
+        else:
+            # Order already paid (verify endpoint got there first) — safe no-op.
+            log.info("Razorpay webhook payment.captured for already-paid order %s", order_id)
+        await db.razorpay_webhook_events.update_one({"id": event_id},
+            {"$set": {"processed": True, "processed_at": iso(now_utc())}})
+        return {"ok": True, "event": event}
+
+    if event == "payment.failed":
+        payment_id = entity.get("id") or ""
+        order_id = entity.get("order_id") or ""
+        reason = entity.get("error_description") or entity.get("error_reason") or "unknown"
+        if order_id:
+            r = await db.wallet_recharge_orders.find_one_and_update(
+                {"razorpay_order_id": order_id, "status": "created"},
+                {"$set": {"status": "failed", "failed_at": iso(now_utc()),
+                          "failure_reason": reason,
+                          "razorpay_payment_id": payment_id}},
+                return_document=True,
+            )
+            if r:
+                await audit("wallet_recharge_failed", "wallet", r["company_id"], None,
+                            {"order_id": order_id, "payment_id": payment_id, "reason": reason})
+        await db.razorpay_webhook_events.update_one({"id": event_id},
+            {"$set": {"processed": True, "processed_at": iso(now_utc()), "reason": reason}})
+        return {"ok": True, "event": event}
+
+    if event in ("refund.created", "refund.processed"):
+        payment_id = refund_entity.get("payment_id") or ""
+        refund_id = refund_entity.get("id") or ""
+        amount_paise = int(refund_entity.get("amount") or 0)
+        # Find the associated order via payment_id
+        order = await db.wallet_recharge_orders.find_one(
+            {"razorpay_payment_id": payment_id}, {"_id": 0})
+        if order and amount_paise > 0:
+            # Debit the wallet (may go negative — that's an accounting concern, not a hard error).
+            res = await db.wallets.find_one_and_update(
+                {"company_id": order["company_id"]},
+                {"$inc": {"balance_paise": -amount_paise},
+                 "$set": {"updated_at": iso(now_utc())}},
+                return_document=True,
+            )
+            new_balance = (res or {}).get("balance_paise", 0)
+            await db.wallet_transactions.insert_one({
+                "id": new_id(), "company_id": order["company_id"], "type": "debit",
+                "amount_paise": amount_paise,
+                "balance_paise_after": new_balance,
+                "meta": {"source": "razorpay_refund", "order_id": order["razorpay_order_id"],
+                         "payment_id": payment_id, "refund_id": refund_id},
+                "created_at": iso(now_utc()),
+            })
+            await db.wallet_recharge_orders.update_one(
+                {"razorpay_order_id": order["razorpay_order_id"]},
+                {"$set": {"status": "refunded", "refunded_at": iso(now_utc()),
+                          "refund_id": refund_id, "refund_amount_paise": amount_paise}})
+            await audit("wallet_refunded", "wallet", order["company_id"], None,
+                        {"order_id": order["razorpay_order_id"], "refund_id": refund_id,
+                         "amount_paise": amount_paise, "balance_paise": new_balance})
+        await db.razorpay_webhook_events.update_one({"id": event_id},
+            {"$set": {"processed": True, "processed_at": iso(now_utc())}})
+        return {"ok": True, "event": event}
+
+    # Unhandled event — mark processed so we don't reprocess.
+    await db.razorpay_webhook_events.update_one({"id": event_id},
+        {"$set": {"processed": True, "processed_at": iso(now_utc()), "note": "unhandled"}})
+    return {"ok": True, "event": event, "note": "unhandled"}
 
 
 # ─────────── WhatsApp Media Inbox (upload → send / receive → GridFS) ───────────
