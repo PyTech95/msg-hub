@@ -433,6 +433,10 @@ except Exception as _e:
 
 # ── Meta WhatsApp Cloud API adapter (per-tenant → vault → env; mock fallback) ──
 from adapters import meta_whatsapp as meta_wa
+from services import crypto_service as crypto
+
+# Fields on `company_whatsapp_configs` that are encrypted at rest.
+WA_CFG_ENCRYPTED_FIELDS = ["access_token", "app_secret"]
 
 async def meta_wa_credentials(company_id: Optional[str] = None,
                               phone_number_id: Optional[str] = None) -> Optional[Dict[str, str]]:
@@ -446,12 +450,14 @@ async def meta_wa_credentials(company_id: Optional[str] = None,
     2) Global Provider Vault (`provider_accounts` where provider_key='meta_whatsapp')
     3) Environment variables (WHATSAPP_ACCESS_TOKEN + WHATSAPP_PHONE_NUMBER_ID)
     Returns None → adapter runs in mock (demo) or hard-fails (production).
+    Encrypted `access_token` values are decrypted transparently.
     """
     # 1) Per-tenant
     if company_id:
         if phone_number_id:
             cfg = await db.company_whatsapp_configs.find_one(
                 {"company_id": company_id, "phone_number_id": phone_number_id}, {"_id": 0})
+            crypto.decrypt_dict(cfg, WA_CFG_ENCRYPTED_FIELDS)
             if cfg:
                 if not cfg.get("is_active", True):
                     raise HTTPException(400, f"Selected number {phone_number_id} is disabled for this tenant.")
@@ -471,6 +477,7 @@ async def meta_wa_credentials(company_id: Optional[str] = None,
             {"company_id": company_id, "is_active": True, "is_primary": True}, {"_id": 0}
         ) or await db.company_whatsapp_configs.find_one(
             {"company_id": company_id, "is_active": True}, {"_id": 0})
+        crypto.decrypt_dict(cfg, WA_CFG_ENCRYPTED_FIELDS)
         if (cfg and not cfg.get("mock", True)
                 and cfg.get("access_token") and cfg.get("phone_number_id")):
             return {
@@ -620,6 +627,13 @@ async def on_startup():
     await db.wallet_transactions.create_index([("company_id", 1), ("created_at", -1)])
     await db.wallet_recharge_orders.create_index("razorpay_order_id", unique=True)
     await db.wallet_alerts.create_index([("company_id", 1), ("date", 1), ("type", 1)])
+    # Performance indexes for tenant-scoped Inbox/campaign queries at scale
+    await db.messages.create_index([("company_id", 1), ("channel", 1), ("created_at", -1)])
+    await db.messages.create_index([("campaign_id", 1), ("status", 1)])
+    await db.messages.create_index("provider_message_id", sparse=True)
+    await db.campaign_recipients.create_index("campaign_id")
+    await db.campaign_recipients.create_index([("campaign_id", 1), ("contact_id", 1)], unique=True, sparse=True)
+    await db.conversations.create_index([("company_id", 1), ("last_message_at", -1)])
     await seed()
     asyncio.create_task(campaign_scheduler_loop())
     log.info("CPaaS backend ready.")
@@ -2533,9 +2547,9 @@ def _mask_wa(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "updated_at": cfg.get("updated_at"),
         "updated_by": cfg.get("updated_by"),
     }
-    tok = cfg.get("access_token") or ""
+    tok = crypto.decrypt(cfg.get("access_token") or "") or ""
     out["access_token_preview"] = ("•" * max(0, len(tok) - 4) + tok[-4:]) if tok else ""
-    sec = cfg.get("app_secret") or ""
+    sec = crypto.decrypt(cfg.get("app_secret") or "") or ""
     out["app_secret_preview"] = ("•" * max(0, len(sec) - 4) + sec[-4:]) if sec else ""
     return out
 
@@ -2614,6 +2628,8 @@ async def put_wa_config(body: WhatsAppConfigIn, user: dict = Depends(require_rol
         upd[k] = v
     if body.is_active is not None: upd["is_active"] = bool(body.is_active)
     if body.mock is not None: upd["mock"] = bool(body.mock)
+    # Encrypt sensitive fields at rest
+    crypto.encrypt_dict(upd, WA_CFG_ENCRYPTED_FIELDS)
     if not existing:
         upd.update({
             "id": new_id(), "company_id": user["company_id"],
@@ -2750,6 +2766,7 @@ async def add_phone_number(body: WhatsAppPhoneNumberIn,
         "created_at": iso(now_utc()), "created_by": user["email"],
         "updated_at": iso(now_utc()), "updated_by": user["email"],
     }
+    crypto.encrypt_dict(doc, WA_CFG_ENCRYPTED_FIELDS)
     await db.company_whatsapp_configs.insert_one(doc)
     await audit("wa_phone_number_added", "wa_phone", body.phone_number_id, user,
                 {"is_primary": is_primary, "display": doc["display_phone_number"]})
@@ -2780,6 +2797,7 @@ async def update_phone_number(phone_number_id: str, body: WhatsAppPhoneNumberPat
     elif body.is_primary is False and row.get("is_primary"):
         raise HTTPException(400, "Cannot un-set primary directly. Promote a different number to primary instead.")
     upd["updated_at"] = iso(now_utc()); upd["updated_by"] = user["email"]
+    crypto.encrypt_dict(upd, WA_CFG_ENCRYPTED_FIELDS)
     await db.company_whatsapp_configs.update_one(
         {"company_id": user["company_id"], "phone_number_id": phone_number_id}, {"$set": upd})
     row = await db.company_whatsapp_configs.find_one(
@@ -2944,6 +2962,8 @@ async def embedded_signup_exchange(body: EmbeddedSignupIn,
     # First number for this tenant becomes primary automatically
     n_existing = await db.company_whatsapp_configs.count_documents({"company_id": user["company_id"]})
     cfg_doc["is_primary"] = (n_existing == 0) or bool(existing and existing.get("is_primary"))
+    # Encrypt sensitive fields at rest (access_token, app_secret)
+    crypto.encrypt_dict(cfg_doc, WA_CFG_ENCRYPTED_FIELDS)
     await db.company_whatsapp_configs.update_one(
         {"company_id": user["company_id"], "phone_number_id": body.phone_number_id},
         {"$set": cfg_doc, "$setOnInsert": {"id": new_id()}}, upsert=True,
@@ -3019,6 +3039,7 @@ async def list_wa_templates(status: Optional[str] = None, limit: int = 100,
             {"company_id": user["company_id"], "is_active": True, "is_primary": True}, {"_id": 0}
         ) or await db.company_whatsapp_configs.find_one(
             {"company_id": user["company_id"], "is_active": True}, {"_id": 0})
+        crypto.decrypt_dict(cfg, WA_CFG_ENCRYPTED_FIELDS)
         if not cfg or cfg.get("mock", True) or not cfg.get("access_token") or not cfg.get("phone_number_id"):
             return {"ok": False, "templates": [],
                     "error": "No live WhatsApp credentials configured for this tenant. Save your access_token + phone_number_id in Step 2 (and set Mock mode off)."}
@@ -3093,6 +3114,7 @@ async def _resolve_wa_creds_for_template_write(user: dict) -> Dict[str, str]:
             {"company_id": user["company_id"], "is_active": True, "is_primary": True}, {"_id": 0}
         ) or await db.company_whatsapp_configs.find_one(
             {"company_id": user["company_id"], "is_active": True}, {"_id": 0})
+        crypto.decrypt_dict(cfg, WA_CFG_ENCRYPTED_FIELDS)
         if not cfg or not cfg.get("access_token") or not cfg.get("phone_number_id"):
             raise HTTPException(400, "Tenant WhatsApp is not configured. Add access_token + phone_number_id in Step 2.")
         if not (cfg.get("waba_id") or "").strip():
@@ -3727,6 +3749,7 @@ async def meta_whatsapp_webhook_tenant(company_id: str, request: _FRequest):
     cfg = await db.company_whatsapp_configs.find_one({"company_id": company_id}, {"_id": 0})
     if not cfg:
         raise HTTPException(404, "Tenant WhatsApp config not found")
+    crypto.decrypt_dict(cfg, WA_CFG_ENCRYPTED_FIELDS)
     raw = await request.body()
     app_secret = (cfg.get("app_secret") or "").strip()
     sig_ok = meta_wa.verify_meta_signature(app_secret, raw, request.headers.get("X-Hub-Signature-256") or "")

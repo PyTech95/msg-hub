@@ -78,6 +78,11 @@ async def _resolve_creds(company_id: Optional[str], phone_number_id: Optional[st
             ) or await db.company_whatsapp_configs.find_one(
                 {"company_id": company_id, "is_active": True}, {"_id": 0})
         if cfg and not cfg.get("mock", True) and cfg.get("access_token") and cfg.get("phone_number_id"):
+            try:
+                from services import crypto_service as _crypto
+                _crypto.decrypt_dict(cfg, ["access_token", "app_secret"])
+            except Exception:
+                pass  # legacy plaintext or crypto disabled — use as-is
             return {"access_token": cfg["access_token"], "phone_number_id": cfg["phone_number_id"],
                     "graph_version": cfg.get("graph_version") or "v22.0",
                     "waba_id": cfg.get("waba_id") or ""}

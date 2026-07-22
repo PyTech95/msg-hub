@@ -171,7 +171,18 @@ export default function Inbox() {
 
   const loadChat = useCallback(async (cid, cursor = null) => {
     if (!cid) return;
-    if (cursor) setLoadingMore(true); else setChatLoading(true);
+    if (cursor) {
+      setLoadingMore(true);
+    } else {
+      // CRITICAL: Immediately clear stale messages when switching contacts so a
+      // failed timeline fetch (e.g. 502 / network error) doesn't leave the
+      // previous contact's messages rendered under the new contact's header.
+      setMsgs([]);
+      setContact(null);
+      setHasMore(false);
+      setNextCursor(null);
+      setChatLoading(true);
+    }
     try {
       const { data } = await api.get(`/contacts/${cid}/timeline`, { params: { before: cursor || undefined, limit: 100 } });
       if (cursor) {
@@ -449,7 +460,13 @@ export default function Inbox() {
                             </div>
                           )}
                           {m.media && <div className="mb-1"><MediaBubble media={m.media} /></div>}
-                          {m.body && <div className="whitespace-pre-wrap">{m.body}</div>}
+                          {m.body ? (
+                            <div className="whitespace-pre-wrap">{m.body}</div>
+                          ) : (!m.media && (
+                            <div className="italic text-muted-foreground/70 text-[11px]">
+                              {m.template_name ? `[Template · ${m.template_name}]` : "[No content]"}
+                            </div>
+                          ))}
                           {(m.reactions || []).length > 0 && (
                             <div className="absolute -bottom-2 right-1 bg-white dark:bg-slate-900 border rounded-full px-1.5 py-0.5 text-[10px] shadow-sm flex gap-0.5" data-testid={`reactions-${m.id}`}>
                               {(m.reactions || []).map((r, i) => <span key={i}>{r.emoji}</span>)}
