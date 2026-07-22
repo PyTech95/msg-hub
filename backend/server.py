@@ -28,6 +28,9 @@ import qrcode
 import qrcode.image.svg
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, BackgroundTasks, UploadFile, File, Form, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 
@@ -49,13 +52,33 @@ media_fs = AsyncIOMotorGridFSBucket(db, bucket_name="wa_media")
 app = FastAPI(title="tezsandesh.digital API", version="1.0.0")
 api = APIRouter(prefix="/api")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Per-IP rate limiter (in-memory for single-pod dev; use `storage_uri=redis://…`
+# for multi-pod prod). Applied only on abuse-sensitive endpoints (auth, webhook).
+limiter = Limiter(key_func=get_remote_address, default_limits=[])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS: `allow_origins="*"` is incompatible with `allow_credentials=True` per the
+# CORS spec (browsers reject credentialed requests when the ACAO header is `*`).
+# When CORS_ORIGINS is unset we allow credentialed same-origin dev by echoing the
+# Origin via a regex; production MUST set CORS_ORIGINS to explicit URLs.
+_cors_origins_env = (os.environ.get("CORS_ORIGINS") or "").strip()
+if _cors_origins_env and _cors_origins_env != "*":
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[o.strip() for o in _cors_origins_env.split(",") if o.strip()],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=".*",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # ───────────────────────── Helpers ─────────────────────────
 def now_utc() -> datetime:
@@ -820,6 +843,7 @@ async def seed():
 
 # ───────────────────────── Auth routes ─────────────────────────
 @api.post("/auth/login")
+@limiter.limit("20/minute")
 async def login(body: LoginIn, response: Response, request: Request):
     email = body.email.lower()
     ip = request.client.host if request.client else "unknown"
@@ -908,6 +932,7 @@ class RefreshIn(BaseModel):
 
 
 @api.post("/auth/refresh")
+@limiter.limit("30/minute")
 async def refresh_access_token(body: RefreshIn, request: Request, response: Response):
     """Exchange a valid refresh token for a fresh access + refresh token pair.
     Revocation is automatic via `token_version` bump (password change / disable).
@@ -1026,7 +1051,8 @@ class ResetPasswordIn(BaseModel):
     new_password: str
 
 @api.post("/auth/forgot-password")
-async def forgot_password(body: ForgotPasswordIn):
+@limiter.limit("5/minute")
+async def forgot_password(body: ForgotPasswordIn, request: Request):
     user = await db.users.find_one({"email": body.email.lower()})
     if user:
         recent = await db.password_reset_tokens.find_one(
@@ -1055,7 +1081,8 @@ async def forgot_password(body: ForgotPasswordIn):
     return {"ok": True, "message": "If the email exists, a reset link has been generated. Check server logs (demo mode)."}
 
 @api.post("/auth/reset-password")
-async def reset_password(body: ResetPasswordIn):
+@limiter.limit("10/minute")
+async def reset_password(body: ResetPasswordIn, request: Request):
     if len(body.new_password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters")
     rec = await db.password_reset_tokens.find_one({"token": body.token, "used": False})

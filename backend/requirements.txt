@@ -76,6 +76,7 @@ pathspec==1.1.1
 pdfminer.six==20260107
 pdfplumber==0.11.10
 pypdf==6.14.2
+slowapi==0.1.10
 pillow==12.2.0
 platformdirs==4.9.6
 pluggy==1.6.0
