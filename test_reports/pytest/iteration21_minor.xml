@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="3" time="1.828" timestamp="2026-07-22T16:47:23.124294+00:00" hostname="agent-env-8c4e4cb2-3d92-450e-b9c5-607896e3a5af"><testcase classname="backend.tests.test_iteration21_minor_fixes.TestSendContactCardErrorHandling" name="test_meta_4xx_returns_400_not_500_and_refunds_wallet" time="0.754" /><testcase classname="backend.tests.test_iteration21_minor_fixes.TestRefundIdempotency" name="test_refund_dedup_by_refund_id" time="0.408" /><testcase classname="backend.tests.test_iteration21_minor_fixes.TestLogoutBumpsTokenVersion" name="test_stale_access_token_invalidated_after_logout" time="0.491"><failure message="AttributeError: 'NoneType' object has no attribute 'startswith'">backend/tests/test_iteration21_minor_fixes.py:178: in test_stale_access_token_invalidated_after_logout
+    stale.cookies.set("access_token", old_access_cookie, domain=None)
+/root/.venv/lib/python3.11/site-packages/requests/cookies.py:246: in set
+    c = create_cookie(name, value, **kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/root/.venv/lib/python3.11/site-packages/requests/cookies.py:525: in create_cookie
+    result["domain_initial_dot"] = result["domain"].startswith(".")
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'startswith'</failure></testcase></testsuite></testsuites>

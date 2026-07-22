@@ -1,0 +1,28 @@
+{
+  "summary": "Iteration 21 targeted re-verification of the 3 minor fixes flagged in iteration 20 — ALL 3 fixes verified and full 20-test regression suite still green (23/23 total). FIX 1: POST /api/whatsapp/send-contact-card now correctly returns HTTP 400 (was 500) with 'WhatsApp send failed:' detail when Meta rejects the call, AND the wallet is refunded (post-call balance == pre-call balance). FIX 2: Razorpay refund_id dedup verified — same refund_id sent as refund.processed then refund.created (different event ids) debits wallet exactly ONCE; second call returns 200 with duplicate_refund=true and NO further debit; a third replay also returns duplicate_refund=true (no double/triple-debit). FIX 3: POST /api/auth/logout now increments users.token_version by exactly +1 in Mongo; a stale access_token cookie captured BEFORE logout is rejected with 401 when replayed against /api/auth/me AFTER logout (proves token-version-bump invalidates leaked tokens before natural expiry). Regression: all 20 iteration-20 tests still pass (WA tenant isolation, Razorpay HMAC + payment.captured idempotency + payment.failed + refund.processed, security headers, prometheus metrics, xlsx import, forward/contact-card structural, httpOnly cookie E2E, Fernet encryption at rest, brute-force rate limit).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_iteration21_minor_fixes.py",
+    "/app/backend/tests/test_iteration20_wa_isolation_webhooks.py",
+    "/app/test_reports/pytest/iteration21_full.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py:2711-2725 send-contact-card — clean try/except HTTPException + generic Exception with wallet refund in $inc; parity with _wa_send_text achieved. LGTM.",
+    "server.py:4089-4102 razorpay_webhook refund path — dedup guard `db.wallet_transactions.find_one({meta.refund_id: refund_id})` executes BEFORE the debit. Returns {duplicate_refund: true}. Correct. Suggest also adding a Mongo index on wallet_transactions.meta.refund_id (partial, unique on non-null) for O(1) lookup at scale.",
+    "server.py:1077-1084 logout — $inc token_version by 1 before clearing cookies. current_user dependency in JWT decoder already compares token tv to users.token_version, so old tokens are rejected instantly. LGTM.",
+    "Iteration 20's test_logout_clears_cookies + module-scoped demo_session fixture had a latent ordering issue exposed by Fix 3 (logout now invalidates other holders of the same user's tokens). Patched TestEncryptionAtRest to re-login. Consider function-scoped fixtures for future test suites to isolate token-invalidation side effects."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration21_minor_fixes.py (new)",
+    "/app/backend/tests/test_iteration20_wa_isolation_webhooks.py (re-login in TestEncryptionAtRest to avoid stale-token from logout side-effect)"
+  ],
+  "success_rate": {"backend": "100% (23/23)", "frontend": "not tested (backend-only request)"},
+  "test_credentials": "SA=admin@cpaas.io/Admin@12345; Demo=demo@demo.corp/DemoPass@123 (co=15bec8dc-48ac-488f-aff6-e4913010f0c0); Acme=acme@acme.ltd/AcmePass@123; RAZORPAY_WEBHOOK_SECRET=whsec_test_razor_1234.",
+  "seed_data_creation": "Ephemeral: 1 paid wallet_recharge_order for refund dedup test, 3 razorpay_webhook_events, 1 wallet_transaction with meta.refund_id=rfnd_dedup_*. No leftover pollution beyond what iter20 already creates.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "test_iteration21_minor_fixes.py is a small, targeted 3-test file focused solely on the 3 minor fixes. Combined with test_iteration20_wa_isolation_webhooks.py it forms the current full backend regression (23 tests, ~11s). Both are idempotent. Note that FIX 3 (logout bumps token_version) means any test flow that logs the same demo user out will invalidate other sessions of that user — either re-login inside each test or use function-scoped fixtures.",
+  "rca of the issue": "N/A — all 3 minor fixes verified working. No new bugs found."
+}

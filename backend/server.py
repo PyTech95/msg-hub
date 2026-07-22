@@ -1075,7 +1075,10 @@ async def register(body: RegisterIn, user: dict = Depends(require_roles("super_a
     return clean(doc)
 
 @api.post("/auth/logout")
-async def logout(response: Response, _: dict = Depends(current_user)):
+async def logout(response: Response, user: dict = Depends(current_user)):
+    # Bump token_version so any leaked access_token is immediately invalid
+    # (logout-everywhere semantics). Cookies are then cleared client-side too.
+    await db.users.update_one({"id": user["id"]}, {"$inc": {"token_version": 1}})
     response.delete_cookie("access_token", path="/")
     response.delete_cookie("refresh_token", path="/")
     return {"ok": True}
@@ -2698,7 +2701,28 @@ async def whatsapp_send_contact_card(body: WhatsAppContactCardIn, user: dict = D
         contact_obj["emails"] = [{"email": body.email, "type": "WORK"}]
     payload = {"messaging_product": "whatsapp", "to": phone.lstrip("+"),
                "type": "contacts", "contacts": [contact_obj]}
-    resp = await meta_wa.graph_post_message(creds, payload)
+    # Wallet debit BEFORE the Meta call so parity with other send endpoints holds.
+    price_paise = _price_paise("whatsapp")
+    if user.get("company_id") and price_paise > 0:
+        ok = await _debit_wallet(user["company_id"], price_paise,
+                                 {"channel": "whatsapp", "kind": "contact_card", "to": phone})
+        if not ok:
+            raise HTTPException(402, "Insufficient wallet balance. Please recharge your wallet to send messages.")
+    try:
+        resp = await meta_wa.graph_post_message(creds, payload)
+    except HTTPException as he:
+        # Refund on validation failure
+        if user.get("company_id") and price_paise > 0:
+            await db.wallets.update_one({"company_id": user["company_id"]},
+                                        {"$inc": {"balance_paise": price_paise},
+                                         "$set": {"updated_at": iso(now_utc())}})
+        raise he
+    except Exception as e:
+        if user.get("company_id") and price_paise > 0:
+            await db.wallets.update_one({"company_id": user["company_id"]},
+                                        {"$inc": {"balance_paise": price_paise},
+                                         "$set": {"updated_at": iso(now_utc())}})
+        raise HTTPException(400, f"WhatsApp send failed: {e}")
     # Persist as outbound with a compact preview body
     cid = None
     contact = await db.contacts.find_one(cflt(user, {"phone": phone}), {"_id": 0, "id": 1})
@@ -4066,6 +4090,16 @@ async def razorpay_webhook(request: Request):
         payment_id = refund_entity.get("payment_id") or ""
         refund_id = refund_entity.get("id") or ""
         amount_paise = int(refund_entity.get("amount") or 0)
+        # Dedup on refund_id: Razorpay sends BOTH refund.created and refund.processed
+        # for the same refund_id. Only credit the wallet once.
+        if refund_id:
+            already = await db.wallet_transactions.find_one(
+                {"meta.refund_id": refund_id}, {"_id": 1})
+            if already:
+                await db.razorpay_webhook_events.update_one({"id": event_id},
+                    {"$set": {"processed": True, "processed_at": iso(now_utc()),
+                              "note": "refund already applied"}})
+                return {"ok": True, "event": event, "duplicate_refund": True}
         # Find the associated order via payment_id
         order = await db.wallet_recharge_orders.find_one(
             {"razorpay_payment_id": payment_id}, {"_id": 0})

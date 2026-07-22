@@ -431,7 +431,10 @@ class TestCookieAuth:
 # ─────────────────────────────────────────────────────────────
 class TestEncryptionAtRest:
     def test_wa_config_encrypted_and_preview(self, demo_session):
-        s, _ = demo_session
+        # NOTE: iteration 21 introduced token_version bump on logout, so the
+        # module-scoped demo_session may be invalidated by TestCookieAuth.test_logout_clears_cookies.
+        # Re-login to guarantee a valid token here.
+        s, _ = _login(DEMO_CREDS)
         plaintext_token = f"EAAG_test_iter20_{uuid.uuid4().hex[:8]}"
         pnid = f"TEST20_{uuid.uuid4().hex[:8]}"
         r = s.post(f"{BASE_URL}/api/whatsapp/phone-numbers",
