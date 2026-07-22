@@ -118,8 +118,13 @@ export default function WhatsAppSettings() {
           code, waba_id: evtWaba.waba_id || "", phone_number_id: evtWaba.phone_number_id || "",
           business_id: evtWaba.business_id, display_phone_number: evtWaba.display_phone_number,
           verified_name: evtWaba.verified_name,
-        }).then(() => {
-          toast.success("WhatsApp connected via Meta! Refreshing…");
+        }).then((r) => {
+          const d = r.data || {};
+          const parts = ["WhatsApp connected!"];
+          if (d.display_phone_number) parts.push(`Number: ${d.display_phone_number}`);
+          if (d.verified_name) parts.push(`Verified: ${d.verified_name}`);
+          if (d.webhook_subscribed) parts.push("Webhooks: ON");
+          toast.success(parts.join(" · "));
           setTimeout(load, 500);
         }).catch(err => toast.error(err.response?.data?.detail || "Exchange failed"));
       },

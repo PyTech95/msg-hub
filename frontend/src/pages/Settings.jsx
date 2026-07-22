@@ -37,8 +37,7 @@ export default function Settings() {
     if (pwd.new_password !== pwd.confirm) return toast.error("Passwords do not match");
     setSaving(true);
     try {
-      const { data } = await api.post("/auth/change-password", { old_password: pwd.old_password, new_password: pwd.new_password });
-      if (data.token) localStorage.setItem("cpaas_token", data.token);
+      const _resp = await api.post("/auth/change-password", { old_password: pwd.old_password, new_password: pwd.new_password });
       toast.success("Password updated");
       setPwd({ old_password: "", new_password: "", confirm: "" });
     } catch (err) {

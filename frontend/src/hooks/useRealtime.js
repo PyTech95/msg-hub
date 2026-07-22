@@ -26,10 +26,10 @@ export function useRealtime(onEvent) {
 
   const connect = useCallback(() => {
     if (stopRef.current) return;
-    const token = localStorage.getItem("cpaas_token");
-    if (!token) return;
+    // SECURITY: auth is via the httpOnly `access_token` cookie sent by the browser
+    // during the WebSocket handshake — no token in the URL query.
     const backend = process.env.REACT_APP_BACKEND_URL || window.location.origin;
-    const wsUrl = backend.replace(/^http/, "ws") + `/api/ws?token=${encodeURIComponent(token)}`;
+    const wsUrl = backend.replace(/^http/, "ws") + `/api/ws`;
     let ws;
     try {
       ws = new WebSocket(wsUrl);

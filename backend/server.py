@@ -2923,12 +2923,21 @@ async def embedded_signup_exchange(body: EmbeddedSignupIn,
     graph_v = (os.environ.get("FB_GRAPH_VERSION") or "v22.0").strip() or "v22.0"
     if not app_id or not app_secret:
         raise HTTPException(503, "Meta Embedded Signup is not configured on this platform.")
-    # 1) Exchange code for user access token
+    if not body.waba_id or not body.phone_number_id:
+        raise HTTPException(400, "Missing waba_id or phone_number_id from Meta signup dialog. "
+                                 "Retry the connect flow — the signup dialog must complete phone selection.")
+    # 1) Exchange code for a business-scoped access token.
+    # For popup FB.login with response_type=code, Meta accepts the exchange with
+    # ONLY client_id + client_secret + code. `redirect_uri` is required only when
+    # the browser used a full redirect; passing an empty/wrong one breaks exchange.
+    exchange_params = {"client_id": app_id, "client_secret": app_secret, "code": body.code}
+    public_base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+    if public_base:
+        # Some FB app configurations still require the redirect_uri to match a whitelisted URL.
+        exchange_params["redirect_uri"] = public_base + "/whatsapp-settings"
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.get(f"https://graph.facebook.com/{graph_v}/oauth/access_token",
-                             params={"client_id": app_id, "client_secret": app_secret,
-                                     "code": body.code,
-                                     "redirect_uri": (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/") + "/whatsapp-settings"})
+                             params=exchange_params)
     if r.status_code >= 400:
         detail = (r.json() or {}).get("error", {}).get("message") or r.text
         raise HTTPException(400, f"Token exchange failed: {detail}")
@@ -2936,23 +2945,56 @@ async def embedded_signup_exchange(body: EmbeddedSignupIn,
     access_token = tok_data.get("access_token") or ""
     if not access_token:
         raise HTTPException(400, "No access_token returned from Meta")
-    # 2) Persist per-tenant credentials
+    token_expires_in = int(tok_data.get("expires_in") or 0)  # 0 = never expires (system user)
+
+    # 2) Enrich: fetch phone_number metadata + business_id from waba if not provided
+    display_phone_number = body.display_phone_number or ""
+    verified_name = body.verified_name or ""
+    quality_rating = ""
+    messaging_limit = ""
+    business_id = body.business_id or ""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            pn_r = await client.get(
+                f"https://graph.facebook.com/{graph_v}/{body.phone_number_id}",
+                params={"fields": "display_phone_number,verified_name,quality_rating,messaging_limit_tier,code_verification_status"},
+                headers={"Authorization": f"Bearer {access_token}"})
+            if pn_r.status_code < 400:
+                pn = pn_r.json() or {}
+                display_phone_number = display_phone_number or pn.get("display_phone_number") or ""
+                verified_name = verified_name or pn.get("verified_name") or ""
+                quality_rating = pn.get("quality_rating") or ""
+                messaging_limit = pn.get("messaging_limit_tier") or ""
+            if not business_id:
+                waba_r = await client.get(
+                    f"https://graph.facebook.com/{graph_v}/{body.waba_id}",
+                    params={"fields": "owner_business_info"},
+                    headers={"Authorization": f"Bearer {access_token}"})
+                if waba_r.status_code < 400:
+                    business_id = ((waba_r.json() or {}).get("owner_business_info") or {}).get("id") or ""
+        except Exception as e:
+            log.warning("Embedded signup enrichment (best-effort) failed: %s", e)
+
+    # 3) Persist per-tenant credentials
     verify_token = f"tzs_{secrets.token_urlsafe(24)}"
     cfg_doc = {
         "company_id": user["company_id"],
         "access_token": access_token,
         "phone_number_id": body.phone_number_id,
         "waba_id": body.waba_id,
-        "business_id": body.business_id,
-        "display_phone_number": body.display_phone_number,
-        "verified_name": body.verified_name,
+        "business_id": business_id,
+        "display_phone_number": display_phone_number,
+        "verified_name": verified_name,
+        "quality_rating": quality_rating,
+        "messaging_limit": messaging_limit,
         "graph_version": graph_v,
         "is_active": True, "mock": False,
         "verify_token": verify_token,
         "onboarded_via": "embedded_signup",
+        "token_expires_in": token_expires_in,
+        "last_synced_at": iso(now_utc()),
         "updated_at": iso(now_utc()), "updated_by": user["email"],
     }
-    # Persist per-tenant credentials: upsert against (company_id, phone_number_id) to support multi-number
     existing = await db.company_whatsapp_configs.find_one(
         {"company_id": user["company_id"], "phone_number_id": body.phone_number_id}, {"_id": 0})
     if existing and existing.get("verify_token"):
@@ -2968,17 +3010,30 @@ async def embedded_signup_exchange(body: EmbeddedSignupIn,
         {"company_id": user["company_id"], "phone_number_id": body.phone_number_id},
         {"$set": cfg_doc, "$setOnInsert": {"id": new_id()}}, upsert=True,
     )
-    # 3) Subscribe the app to WABA webhooks (best-effort; ignore failure so onboarding still completes)
+    # 4) Subscribe the app to WABA webhooks so inbound messages start flowing.
+    # Meta requires the access_token as a query parameter (Bearer header alone is
+    # unreliable for this specific endpoint per the docs).
+    subscribed = False
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            await client.post(f"https://graph.facebook.com/{graph_v}/{body.waba_id}/subscribed_apps",
-                              headers={"Authorization": f"Bearer {access_token}"})
+            sub_r = await client.post(
+                f"https://graph.facebook.com/{graph_v}/{body.waba_id}/subscribed_apps",
+                params={"access_token": access_token})
+            subscribed = sub_r.status_code < 400
+            if not subscribed:
+                log.warning("subscribed_apps returned %s: %s", sub_r.status_code, sub_r.text[:300])
     except Exception as e:
         log.warning("subscribed_apps registration failed (best-effort): %s", e)
     await audit("wa_embedded_signup", "wa_config", user["company_id"], user,
-                {"waba_id": body.waba_id, "phone_number_id": body.phone_number_id})
+                {"waba_id": body.waba_id, "phone_number_id": body.phone_number_id,
+                 "display_phone_number": display_phone_number, "subscribed": subscribed})
     return {"ok": True, "waba_id": body.waba_id, "phone_number_id": body.phone_number_id,
-            "verify_token": cfg_doc["verify_token"]}
+            "verify_token": cfg_doc["verify_token"],
+            "display_phone_number": display_phone_number,
+            "verified_name": verified_name,
+            "quality_rating": quality_rating,
+            "webhook_subscribed": subscribed,
+            "token_expires_in": token_expires_in}
 
 
 def _template_body_preview(components: List[Dict[str, Any]]) -> str:
@@ -4532,16 +4587,21 @@ async def root():
 
 
 @app.websocket("/api/ws")
-async def realtime_ws(ws: WebSocket, token: str = Query(...)):
-    """Realtime tenant-scoped feed. Frontend connects with ?token=<JWT>.
+async def realtime_ws(ws: WebSocket, token: Optional[str] = Query(None)):
+    """Realtime tenant-scoped feed. Auth resolution order:
+      1) `?token=<JWT>` query param (legacy; still supported for tools)
+      2) `access_token` httpOnly cookie (preferred, matches API auth)
     Broadcasts:
       - {type:"message_event", ...} on every emit_event()
       - {type:"inbound_message", ...} on new inbound WhatsApp message
       - {type:"wallet_debit"/"wallet_credit", balance_paise, ...}
     """
-    # Manual JWT decode (WebSocket can't use Depends(current_user))
+    tok = token or ws.cookies.get("access_token") or ""
+    if not tok:
+        await ws.close(code=4401)
+        return
     try:
-        payload = jwt.decode(token, os.environ["JWT_SECRET"], algorithms=["HS256"])
+        payload = jwt.decode(tok, os.environ["JWT_SECRET"], algorithms=["HS256"])
     except Exception:
         await ws.close(code=4401)
         return
