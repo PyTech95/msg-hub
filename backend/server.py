@@ -1267,6 +1267,172 @@ async def reset_password(body: ResetPasswordIn, request: Request):
     await audit("password_reset_completed", "user", user["id"])
     return {"ok": True}
 
+
+# ───────────────────────── Facebook OAuth Callback ─────────────────────────
+# GET /api/auth/facebook/callback
+# Handles the OAuth 2.0 authorization-code flow for "Login with Facebook".
+# Facebook redirects the browser here with ?code=<auth_code>&state=<csrf>.
+# We exchange the code server-side (client_secret never touches the browser),
+# fetch the user's public profile, and redirect back to the SPA with a
+# short-lived signed marker in the URL so the frontend can decide next steps
+# (link to existing account, create new session, etc).
+#
+# Env vars (required):
+#   FACEBOOK_APP_ID       — public FB App ID (also aliases FB_APP_ID)
+#   FACEBOOK_APP_SECRET   — server-only secret (also aliases FB_APP_SECRET)
+#   FACEBOOK_REDIRECT_URI — must EXACTLY match the URL configured in the FB
+#                           App dashboard → Facebook Login → Valid OAuth
+#                           Redirect URIs. Example:
+#                           https://api.tezsandesh.digital/api/auth/facebook/callback
+# Env vars (optional):
+#   FB_GRAPH_VERSION            — defaults to v22.0
+#   FACEBOOK_LOGIN_SUCCESS_URL  — SPA landing page on success (default /dashboard)
+#   FACEBOOK_LOGIN_ERROR_URL    — SPA landing page on failure (default /login)
+def _fb_env(name: str, *aliases: str) -> str:
+    """Read a Facebook env var, checking a primary name and any legacy aliases."""
+    for key in (name, *aliases):
+        val = (os.environ.get(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+@api.get("/auth/facebook/callback")
+async def facebook_oauth_callback(
+    request: Request,
+    code: Optional[str] = Query(None, description="OAuth authorization code from Facebook"),
+    state: Optional[str] = Query(None, description="CSRF token echoed back by Facebook"),
+    error: Optional[str] = Query(None, description="Set by Facebook when the user denies consent"),
+    error_reason: Optional[str] = Query(None),
+    error_description: Optional[str] = Query(None),
+):
+    """Public Facebook OAuth 2.0 callback endpoint.
+
+    Facebook redirects the browser here after the user clicks Continue on the
+    OAuth consent screen. We exchange the authorization code for a short-lived
+    user access token, then fetch the user's profile (id, name, email if the
+    user granted the email scope).
+    """
+    from fastapi.responses import RedirectResponse
+
+    app_id = _fb_env("FACEBOOK_APP_ID", "FB_APP_ID")
+    app_secret = _fb_env("FACEBOOK_APP_SECRET", "FB_APP_SECRET")
+    redirect_uri = _fb_env("FACEBOOK_REDIRECT_URI")
+    graph_v = _fb_env("FB_GRAPH_VERSION") or "v22.0"
+
+    if not app_id or not app_secret or not redirect_uri:
+        raise HTTPException(503, "Facebook OAuth is not configured on this server. "
+                                 "Set FACEBOOK_APP_ID, FACEBOOK_APP_SECRET, and FACEBOOK_REDIRECT_URI.")
+
+    # 1) User denied consent or Facebook returned an error at the auth step.
+    if error:
+        detail = error_description or error_reason or error
+        await audit("facebook_oauth_error", "auth", "-", None,
+                    {"error": error, "reason": error_reason, "description": error_description, "state": state})
+        error_url = _fb_env("FACEBOOK_LOGIN_ERROR_URL") or "/login"
+        sep = "&" if "?" in error_url else "?"
+        return RedirectResponse(url=f"{error_url}{sep}fb_error={httpx.QueryParams({'m': detail})['m']}",
+                                status_code=302)
+
+    if not code:
+        raise HTTPException(400, "Missing 'code' query parameter from Facebook callback")
+
+    # 2) Exchange the authorization code for a user access token.
+    #    Docs: https://developers.facebook.com/docs/facebook-login/guides/access-tokens#usertoken
+    exchange_params = {
+        "client_id": app_id,
+        "client_secret": app_secret,
+        "redirect_uri": redirect_uri,
+        "code": code,
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        tok_r = await client.get(
+            f"https://graph.facebook.com/{graph_v}/oauth/access_token",
+            params=exchange_params,
+        )
+    if tok_r.status_code >= 400:
+        detail = (tok_r.json() or {}).get("error", {}).get("message") or tok_r.text
+        raise HTTPException(400, f"Facebook token exchange failed: {detail}")
+    tok_data = tok_r.json() or {}
+    fb_access_token = tok_data.get("access_token") or ""
+    if not fb_access_token:
+        raise HTTPException(400, "No access_token returned from Facebook")
+    token_expires_in = int(tok_data.get("expires_in") or 0)  # seconds; 0 = long-lived
+
+    # 3) Fetch the user's profile. Only fields we asked scope for are returned.
+    #    `email` is present only if the user granted the `email` permission.
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        me_r = await client.get(
+            f"https://graph.facebook.com/{graph_v}/me",
+            params={"fields": "id,name,email,picture"},
+            headers={"Authorization": f"Bearer {fb_access_token}"},
+        )
+    if me_r.status_code >= 400:
+        detail = (me_r.json() or {}).get("error", {}).get("message") or me_r.text
+        raise HTTPException(400, f"Failed to fetch Facebook user profile: {detail}")
+    me = me_r.json() or {}
+    fb_user_id = str(me.get("id") or "").strip()
+    fb_name = (me.get("name") or "").strip()
+    fb_email = (me.get("email") or "").strip().lower()
+    fb_picture = ((me.get("picture") or {}).get("data") or {}).get("url") or ""
+    if not fb_user_id:
+        raise HTTPException(400, "Facebook profile response missing user id")
+
+    # 4) Persist a lightweight identity record for audit/analytics. We do NOT
+    #    auto-create a platform user here — that decision is left to the SPA
+    #    (which knows the intended flow: link vs. login vs. signup).
+    identity_doc = {
+        "provider": "facebook",
+        "provider_user_id": fb_user_id,
+        "name": fb_name,
+        "email": fb_email,
+        "picture": fb_picture,
+        "access_token_expires_in": token_expires_in,
+        "state": state,
+        "created_at": now_utc().isoformat(),
+    }
+    try:
+        await db.oauth_identities.update_one(
+            {"provider": "facebook", "provider_user_id": fb_user_id},
+            {"$set": identity_doc},
+            upsert=True,
+        )
+    except Exception as e:
+        # Non-fatal: identity persistence should never block the redirect.
+        log.warning("facebook_oauth: failed to persist identity: %s", e)
+
+    await audit("facebook_oauth_callback", "auth", fb_user_id, None,
+                {"email": fb_email, "name": fb_name, "state": state})
+
+    # 5) If the caller expects JSON (e.g. curl / mobile client), return the
+    #    profile inline. Browsers get a redirect back to the SPA carrying the
+    #    Facebook user id + email so the SPA can complete the flow.
+    accept = (request.headers.get("accept") or "").lower()
+    payload = {
+        "ok": True,
+        "provider": "facebook",
+        "user": {
+            "id": fb_user_id,
+            "name": fb_name,
+            "email": fb_email or None,
+            "picture": fb_picture or None,
+        },
+        "state": state,
+    }
+    if "application/json" in accept and "text/html" not in accept:
+        return payload
+
+    success_url = _fb_env("FACEBOOK_LOGIN_SUCCESS_URL") or "/dashboard"
+    qp = httpx.QueryParams({
+        "fb_id": fb_user_id,
+        "fb_name": fb_name,
+        "fb_email": fb_email,
+        "state": state or "",
+    })
+    sep = "&" if "?" in success_url else "?"
+    return RedirectResponse(url=f"{success_url}{sep}{qp}", status_code=302)
+
+
 # ───────────────────────── Users / Team ─────────────────────────
 @api.get("/users")
 async def list_users(user: dict = Depends(current_user)):
