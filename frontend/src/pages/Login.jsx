@@ -143,6 +143,13 @@ export default function Login() {
             </form>
           </CardContent>
         </Card>
+        <nav className="mt-6 flex items-center justify-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground flex-wrap">
+          <Link to="/privacy-policy" className="hover:text-foreground" data-testid="login-privacy-link">Privacy Policy</Link>
+          <span className="opacity-40">·</span>
+          <Link to="/terms" className="hover:text-foreground" data-testid="login-terms-link">Terms &amp; Conditions</Link>
+          <span className="opacity-40">·</span>
+          <Link to="/data-deletion" className="hover:text-foreground" data-testid="login-data-deletion-link">Data Deletion</Link>
+        </nav>
       </div>
     </div>
   );

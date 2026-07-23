@@ -159,6 +159,7 @@ _CSP_DEFAULT = (
     "media-src 'self' blob: https:; "
     "connect-src 'self' ws: wss: https:; "
     "frame-src https://www.facebook.com https://web.facebook.com https://api.razorpay.com https://checkout.razorpay.com; "
+    "frame-ancestors 'self' https://developers.facebook.com https://business.facebook.com https://www.facebook.com; "
     "object-src 'none'; "
     "base-uri 'self'; "
     "form-action 'self'"
@@ -4135,6 +4136,57 @@ async def razorpay_webhook(request: Request):
     await db.razorpay_webhook_events.update_one({"id": event_id},
         {"$set": {"processed": True, "processed_at": iso(now_utc()), "note": "unhandled"}})
     return {"ok": True, "event": event, "note": "unhandled"}
+
+
+# ─────────────────────── Meta App Deauthorize / User Data Deletion ─────────────
+class MetaDataDeletionIn(BaseModel):
+    signed_request: Optional[str] = None
+
+
+@api.post("/webhooks/meta-data-deletion")
+async def meta_user_data_deletion(request: Request):
+    """Meta OAuth "User Data Deletion Callback URL". When a Facebook user removes our
+    app or requests data deletion, Meta POSTs a `signed_request` to this endpoint.
+    We record the request, kick off deletion for any WABA/company linked to the
+    Meta user_id, and return the JSON acknowledgement Meta requires:
+      { "url": "<progress-url>", "confirmation_code": "<opaque>" }
+    Meta docs: https://developers.facebook.com/docs/development/create-an-app/app-dashboard/data-deletion-callback
+    """
+    # Meta sends application/x-www-form-urlencoded with signed_request
+    form = await request.form() if request.headers.get("content-type", "").startswith("application/x-www-form-urlencoded") else {}
+    signed_request = form.get("signed_request") if form else None
+    user_id = None
+    if signed_request and "." in signed_request:
+        # signed_request = <base64_sig>.<base64_payload_json>
+        import base64
+        try:
+            _sig, payload_b64 = signed_request.split(".", 1)
+            # Re-pad for base64.urlsafe_b64decode
+            padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+            data = json.loads(base64.urlsafe_b64decode(padded))
+            user_id = str(data.get("user_id") or "")
+        except Exception as e:
+            log.warning("meta-data-deletion: could not parse signed_request: %s", e)
+    confirmation_code = f"del_{new_id()[:12]}"
+    await db.meta_data_deletion_requests.insert_one({
+        "id": new_id(),
+        "confirmation_code": confirmation_code,
+        "meta_user_id": user_id,
+        "signed_request": signed_request,
+        "received_at": iso(now_utc()),
+        "processed": False,
+        "note": "User invoked Meta data-deletion callback",
+    })
+    # Best-effort: mark any WABA configs owned by this Meta user for asynchronous purge
+    if user_id:
+        await db.company_whatsapp_configs.update_many(
+            {"meta_user_id": user_id},
+            {"$set": {"deletion_requested_at": iso(now_utc()), "is_active": False}})
+    base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+    return {
+        "url": f"{base}/data-deletion?code={confirmation_code}",
+        "confirmation_code": confirmation_code,
+    }
 
 
 # ─────────── WhatsApp Media Inbox (upload → send / receive → GridFS) ───────────

@@ -36,6 +36,9 @@ import Wallet from "@/pages/Wallet";
 import Billing from "@/pages/Billing";
 import ForgotPassword from "@/pages/ForgotPassword";
 import ResetPassword from "@/pages/ResetPassword";
+import PrivacyPolicy from "@/pages/PrivacyPolicy";
+import TermsConditions from "@/pages/TermsConditions";
+import DataDeletion from "@/pages/DataDeletion";
 
 export default function App() {
   return (
@@ -46,6 +49,10 @@ export default function App() {
             <Route path="/login" element={<Login />} />
             <Route path="/forgot-password" element={<ForgotPassword />} />
             <Route path="/reset-password" element={<ResetPassword />} />
+            {/* PUBLIC legal pages — accessible without login (required for Meta App review) */}
+            <Route path="/privacy-policy" element={<PrivacyPolicy />} />
+            <Route path="/terms" element={<TermsConditions />} />
+            <Route path="/data-deletion" element={<DataDeletion />} />
             <Route element={<ProtectedRoute><AppLayout /></ProtectedRoute>}>
               <Route path="/" element={<Navigate to="/dashboard" replace />} />
               <Route path="/dashboard" element={<Dashboard />} />
